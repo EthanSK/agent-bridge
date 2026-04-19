@@ -9,7 +9,7 @@
   },
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
+    "additionalProperties": true,
     "properties": {
       "inboxDir": {
         "type": "string",
