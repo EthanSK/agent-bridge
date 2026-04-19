@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="3.2.0"
+VERSION="3.3.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -43,11 +43,81 @@ if [ ! -d "$CONFIG_DIR" ] && [ -d "$HOME/.claude-bridge" ]; then
 fi
 
 # -- Helpers ------------------------------------------------------------------
-die()  { printf "${RED}  Error: %s${RESET}\n" "$1" >&2; exit 1; }
+die()  { printf "${RED}  Error: %s${RESET}\n" "$1" >&2; log_event error "cli.error" "$1" ""; exit 1; }
 info() { printf "${CYAN}%s${RESET}\n" "$1"; }
 ok()   { printf "${GREEN}  [ok] %s${RESET}\n" "$1"; }
 warn() { printf "${YELLOW}  %s${RESET}\n" "$1"; }
 dim()  { printf "${DIM}  %s${RESET}\n" "$1"; }
+
+# -- Unified NDJSON event log -------------------------------------------------
+# Writes structured events to ~/.agent-bridge/logs/agent-bridge.log so agents
+# and humans can tail one file to see mcp-server + openclaw-plugin + CLI
+# activity end-to-end. Never fails loudly; swallows errors silently.
+#
+# Usage:
+#   log_event <level> <event_name> <msg> [<context_json>]
+# Examples:
+#   log_event info  "cli.pair.start"  "pairing new machine" '{"machine":"MacBook"}'
+#   log_event error "cli.pair.failed" "no pubkey supplied"  '{}'
+#
+# Fields always set: ts, component="cli", machine, event, level, msg.
+# If context is provided it MUST be a valid JSON object or the line is still
+# written without a context field (best-effort).
+AGENT_BRIDGE_LOG_FILE="$HOME/.agent-bridge/logs/agent-bridge.log"
+AGENT_BRIDGE_LOG_MAX_SIZE=$((50 * 1024 * 1024)) # 50 MB
+
+_log_rotate_if_needed() {
+  [ -f "$AGENT_BRIDGE_LOG_FILE" ] || return 0
+  local sz
+  # macOS stat -f, Linux stat -c. Fall back to 0 on error.
+  sz=$(stat -f%z "$AGENT_BRIDGE_LOG_FILE" 2>/dev/null || stat -c%s "$AGENT_BRIDGE_LOG_FILE" 2>/dev/null || printf 0)
+  if [ "$sz" -gt "$AGENT_BRIDGE_LOG_MAX_SIZE" ] 2>/dev/null; then
+    mv "$AGENT_BRIDGE_LOG_FILE" "${AGENT_BRIDGE_LOG_FILE}.1" 2>/dev/null || true
+  fi
+}
+
+log_event() {
+  local level="${1:-info}" event="${2:-cli.unknown}" msg="${3:-}" ctx="${4:-}"
+  local logs_dir="$HOME/.agent-bridge/logs"
+  mkdir -p "$logs_dir" 2>/dev/null || return 0
+  chmod 700 "$logs_dir" 2>/dev/null || true
+  _log_rotate_if_needed
+
+  local ts host
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+  host="$(hostname 2>/dev/null | sed 's/\.local$//' || printf unknown)"
+
+  # JSON-escape msg (strip control chars, escape backslash + double-quote).
+  # This is the full, correct sequence: backslash first, then quote, then
+  # carriage return, newline, tab. If we did quotes before backslashes we'd
+  # double-escape.
+  local msg_esc
+  msg_esc="$msg"
+  msg_esc="${msg_esc//\\/\\\\}"
+  msg_esc="${msg_esc//\"/\\\"}"
+  msg_esc="${msg_esc//$'\r'/}"
+  msg_esc="${msg_esc//$'\n'/ }"
+  msg_esc="${msg_esc//$'\t'/ }"
+
+  # Very light redaction for common secret prefixes. If context contains
+  # secrets the caller should avoid passing them — but we sweep once as
+  # belt-and-suspenders.
+  msg_esc=$(printf '%s' "$msg_esc" | sed -E \
+    -e 's/sk-[A-Za-z0-9_-]{16,}/[REDACTED]/g' \
+    -e 's/xox[baprs]-[A-Za-z0-9-]{10,}/[REDACTED]/g' \
+    -e 's/ghp_[A-Za-z0-9]{30,}/[REDACTED]/g' \
+    -e 's/[Bb]earer [A-Za-z0-9._~+/=-]{8,}/Bearer [REDACTED]/g')
+
+  local line
+  if [ -n "$ctx" ]; then
+    line="{\"ts\":\"$ts\",\"component\":\"cli\",\"machine\":\"$host\",\"event\":\"$event\",\"level\":\"$level\",\"msg\":\"$msg_esc\",\"context\":$ctx}"
+  else
+    line="{\"ts\":\"$ts\",\"component\":\"cli\",\"machine\":\"$host\",\"event\":\"$event\",\"level\":\"$level\",\"msg\":\"$msg_esc\"}"
+  fi
+
+  # Append. Failures are ignored — logging must never break the CLI.
+  printf '%s\n' "$line" >> "$AGENT_BRIDGE_LOG_FILE" 2>/dev/null || true
+}
 
 ensure_config_dir() {
   [ -d "$CONFIG_DIR" ] || mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR"
@@ -1296,6 +1366,7 @@ cmd_pair() {
 
   # Step 4: Save pairing config
   cfg_save "$machine_name" "$host" "$user" "$port" "$keypath"
+  log_event info "cli.pair.done" "paired with $machine_name" "{\"machine\":\"$machine_name\",\"host\":\"$host\",\"user\":\"$user\",\"port\":\"$port\"}"
 
   printf "${GREEN}${BOLD}  [ok] Paired with \"%s\"!${RESET}\n" "$machine_name"
   printf '\n'
@@ -1505,6 +1576,7 @@ cmd_run() {
   [ -n "$internet_host" ] && has_fallback=1
 
   printf "${DIM}  Running command on %s...${RESET}\n" "$machine_name"
+  log_event info "cli.run.start" "running command on $machine_name" "{\"machine\":\"$machine_name\",\"command_length\":${#command}}"
 
   # Cache-informed attempt order (LAN-first when no cache or stale).
   local order
@@ -1573,8 +1645,10 @@ cmd_run() {
   printf '\n'
   if [ "$exit_code" -eq 0 ]; then
     ok "command completed on $machine_name (exit 0)"
+    log_event info "cli.run.done" "command completed on $machine_name" "{\"machine\":\"$machine_name\",\"exit_code\":0}"
   else
     printf "${YELLOW}  command on %s exited with code %d.${RESET}\n" "$machine_name" "$exit_code"
+    log_event warn "cli.run.failed" "command on $machine_name exited non-zero" "{\"machine\":\"$machine_name\",\"exit_code\":$exit_code}"
   fi
 
   exit "$exit_code"
@@ -1731,6 +1805,7 @@ cmd_status() {
         local latency=$((end_time - start_time))
         path_cache_write "$name" "$attempt" 2>/dev/null || true
         printf "${GREEN}  %s${RESET}${DIM} (%s@%s:%s via %s) -- %dms${RESET}\n" "$name" "$user" "$try_host" "$try_port" "$path_label" "$latency"
+        log_event info "cli.status.online" "$name reachable via $path_label" "{\"machine\":\"$name\",\"path\":\"$path_label\",\"host\":\"$try_host\",\"latency_ms\":$latency}"
         return 0
       fi
 
@@ -1738,6 +1813,7 @@ cmd_status() {
         # Non-connection error (e.g. `echo ok` itself failed). Don't bother
         # trying the other path for something that isn't a connectivity issue.
         printf "${RED}  %s${RESET}${DIM} (%s via %s) -- probe exit %d${RESET}\n" "$name" "$try_host" "$path_label" "$probe_exit"
+        log_event warn "cli.status.probe_error" "$name probe non-255 exit" "{\"machine\":\"$name\",\"path\":\"$path_label\",\"exit_code\":$probe_exit}"
         return 1
       fi
     done <<< "$order"
@@ -1747,6 +1823,7 @@ cmd_status() {
     else
       printf "${RED}  %s${RESET}${DIM} (%s) -- unreachable${RESET}\n" "$name" "$host"
     fi
+    log_event warn "cli.status.offline" "$name unreachable" "{\"machine\":\"$name\",\"has_fallback\":$has_fallback}"
     return 1
   }
 
@@ -1863,6 +1940,7 @@ cmd_unpair() {
   fi
 
   cfg_remove "$machine_name"
+  log_event info "cli.unpair.done" "unpaired $machine_name" "{\"machine\":\"$machine_name\"}"
   printf '\n'
   ok "Unpaired \"$machine_name\"."
   printf '\n'

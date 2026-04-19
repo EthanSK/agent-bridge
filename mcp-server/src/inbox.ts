@@ -38,6 +38,7 @@ import {
 } from './config.js';
 import { sshWriteFile } from './ssh.js';
 import { logInfo, logWarn, logError, logDebug } from './logger.js';
+import { logEvent } from './log.js';
 import type { MachineConfig } from './config.js';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -326,13 +327,44 @@ export async function sendMessage(
   const content = JSON.stringify(message, null, 2);
 
   logInfo(`Sending message ${message.id} to ${machine.name}: ${message.type}`);
+  logEvent({
+    event: 'message.send_start',
+    msg: `Sending message ${message.id} to ${machine.name}`,
+    context: {
+      msg_id: message.id,
+      to: machine.name,
+      host: machine.host,
+      type: message.type,
+      content_length: message.content?.length ?? 0,
+      reply_to: message.replyTo ?? undefined,
+      ttl: message.ttl,
+    },
+  });
 
   let result = await sshWriteFile(machine, remotePath, content);
   if (result.exitCode !== 0) {
     logWarn(`First send attempt to ${machine.name} failed, retrying once...`);
+    logEvent({
+      event: 'message.send_retry',
+      level: 'warn',
+      msg: `First send attempt to ${machine.name} failed, retrying`,
+      context: { msg_id: message.id, to: machine.name, stderr: result.stderr },
+    });
     result = await sshWriteFile(machine, remotePath, content);
     if (result.exitCode !== 0) {
       logError(`Send failed after retry to ${machine.name}: ${result.stderr}`);
+      logEvent({
+        event: 'message.send_failed',
+        level: 'error',
+        msg: `Send failed after retry to ${machine.name}`,
+        context: {
+          msg_id: message.id,
+          to: machine.name,
+          host: machine.host,
+          exit_code: result.exitCode,
+          stderr: result.stderr,
+        },
+      });
       throw new Error(
         `Failed to deliver message to ${machine.name}: ${result.stderr}`,
       );
@@ -353,6 +385,11 @@ export async function sendMessage(
   }
 
   logInfo(`Message ${message.id} delivered to ${machine.name}`);
+  logEvent({
+    event: 'message.delivered',
+    msg: `Message ${message.id} delivered to ${machine.name}`,
+    context: { msg_id: message.id, to: machine.name, host: machine.host, type: message.type },
+  });
 }
 
 /**

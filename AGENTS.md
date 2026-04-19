@@ -2,6 +2,55 @@
 
 You are an AI coding agent with agent-bridge installed. This machine is a **peer** in a bidirectional bridge -- it can both send commands to and receive commands from other paired machines.
 
+## Debugging agent-bridge: read this FIRST
+
+**Before investigating any agent-bridge issue — a dropped message, an unreachable machine, a silent OpenClaw, anything — the first thing you do is:**
+
+```bash
+tail -200 ~/.agent-bridge/logs/agent-bridge.log | jq -s '.'
+```
+
+That file is the unified NDJSON event log. Every component — the MCP server, the OpenClaw plugin, the standalone daemon, and the bash CLI — appends to it. Each line has `ts`, `component`, `machine`, `event`, `level`, `msg`, and an optional `context` object.
+
+You can follow a single message end-to-end (send → inbox pickup → delivery → push) by filtering on its `msg_id`:
+
+```bash
+jq -c 'select(.context.msg_id == "msg-abc123")' ~/.agent-bridge/logs/agent-bridge.log
+```
+
+Errors only:
+
+```bash
+jq -c 'select(.level == "error" or .level == "warn")' ~/.agent-bridge/logs/agent-bridge.log
+```
+
+Both machines keep their own copies — when debugging a bidirectional issue, look at the log on **both** sides.
+
+### Common event types and what they mean
+
+- `server.starting` / `server.ready` — the MCP server is coming up on this machine
+- `watcher.started` (backend=fswatch/inotifywait/polling) — the inbox watcher is active
+- `message.send_start` / `message.delivered` — outbound SSH write to the remote inbox succeeded
+- `message.send_retry` / `message.send_failed` — the first SSH attempt failed; if you see `send_failed` without a follow-up success, the message never left this machine
+- `message.received` — the local watcher saw a new inbox file
+- `message.pushed_to_channel` — Claude's running session received the message
+- `message.push_failed` — MCP channel notification failed (usually means Claude's session closed the pipe)
+- `message.resolving` (openclaw-plugin) — route (target agent / channel / chat) resolved
+- `message.delivered` / `message.delivery_failed` (openclaw-plugin) — agent-turn / message-send / log-only outcome
+- `cli.pair.done`, `cli.unpair.done`, `cli.run.start`/`done`/`failed`, `cli.status.online`/`offline` — bash CLI activity
+
+If the unified log is silent for a component you expect, that component either isn't running or never emitted a startup event — check `ps` and the older per-component logs (`~/.agent-bridge/logs/mcp-server.log`, `~/.openclaw/logs/gateway.log`) for bootstrap errors.
+
+### What NOT to do
+
+- **Don't grep three files.** The whole point of this unified log is you don't need to.
+- **Don't assume the log has been created.** On a fresh install it materializes on the first event. Run `bridge_status` from the MCP (or `agent-bridge status`) once to force an entry.
+- **Don't trust `mcp-server.log` as the single source of truth anymore.** It's the pre-v3.3 verbose log, still useful for deep dives but the unified log is the ground truth for structured event analysis.
+
+See the "Debugging & logs" section of the top-level [README](README.md) for full `jq` recipe list.
+
+---
+
 ## When to activate
 
 Activate when the user says things like:

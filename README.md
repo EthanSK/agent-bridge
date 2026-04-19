@@ -736,6 +736,82 @@ The MCP server includes production-grade inbox management:
 
 ---
 
+## Debugging & logs
+
+> **Before investigating any agent-bridge issue, tail the unified event log first.**
+
+agent-bridge ships a single structured event log that every component writes to: the MCP server, the OpenClaw plugin, the standalone daemon, and the bash CLI. This is the first thing you (or an AI agent debugging a problem) should look at. It replaces the old "grep three different files" dance.
+
+| Path | Format | Written by |
+|---|---|---|
+| `~/.agent-bridge/logs/agent-bridge.log` | NDJSON (one JSON object per line) | mcp-server, openclaw-plugin, CLI |
+| `~/.agent-bridge/logs/agent-bridge.log.1` | previous rotation (renamed when > 50 MB) | same |
+| `~/.agent-bridge/logs/mcp-server.log` | plain-text, very verbose | mcp-server (kept for deep dives) |
+| `~/.openclaw/logs/gateway.log` | plain-text | OpenClaw host itself (non agent-bridge traffic) |
+
+Every NDJSON line has this shape:
+
+```json
+{
+  "ts": "2026-04-19T23:45:00.123Z",
+  "component": "mcp-server",
+  "machine": "Ethans-MacBook-Pro",
+  "event": "message.delivered",
+  "level": "info",
+  "msg": "Message msg-abc123 delivered to Mac-Mini",
+  "context": { "msg_id": "msg-abc123", "to": "Mac-Mini", "host": "100.x.y.z", "type": "message" }
+}
+```
+
+### Useful `jq` queries
+
+```bash
+# Pretty-print the last 50 events
+tail -50 ~/.agent-bridge/logs/agent-bridge.log | jq -s '.'
+
+# Only errors / warnings
+jq -c 'select(.level == "error" or .level == "warn")' ~/.agent-bridge/logs/agent-bridge.log
+
+# Follow one specific message end-to-end (send → delivered → pushed)
+jq -c 'select(.context.msg_id == "msg-abc123")' ~/.agent-bridge/logs/agent-bridge.log
+
+# Just watcher lifecycle
+jq -c 'select(.event | startswith("watcher."))' ~/.agent-bridge/logs/agent-bridge.log
+
+# Only this component
+jq -c 'select(.component == "openclaw-plugin")' ~/.agent-bridge/logs/agent-bridge.log
+
+# Live tail, formatted
+tail -f ~/.agent-bridge/logs/agent-bridge.log | jq -c '"\(.ts) [\(.component)] \(.event) — \(.msg)"'
+```
+
+### Event vocabulary (high-signal subset)
+
+| Event | Who emits | When |
+|---|---|---|
+| `server.starting` / `server.ready` / `server.shutdown` | mcp-server | MCP lifecycle |
+| `watcher.started` / `watcher.stopped` | mcp-server, openclaw-plugin | fswatch/inotifywait/polling up or down |
+| `watcher.starting` / `watcher.ready` | openclaw-plugin | plugin startup |
+| `message.received` | mcp-server, openclaw-plugin | inbox file picked up by the watcher |
+| `message.resolving` | openclaw-plugin | delivery mode + route resolved for a message |
+| `message.pushed_to_channel` | mcp-server | message pushed into the running Claude session |
+| `message.push_failed` | mcp-server | channel notification failed |
+| `message.send_start` / `message.send_retry` / `message.delivered` / `message.send_failed` | mcp-server | outbound SSH delivery to a remote inbox |
+| `message.delivered` / `message.delivery_failed` | openclaw-plugin | inbox → agent-turn / message-send / log-only delivery |
+| `tool.bridge_status` / `tool.bridge_run_command` | mcp-server | MCP tool invocation |
+| `cli.pair.done` / `cli.unpair.done` / `cli.run.start` / `cli.run.done` / `cli.run.failed` / `cli.status.online` / `cli.status.offline` | CLI | bash subcommands |
+
+### Safety
+
+- **Secrets are redacted** on the way in: known OpenAI/Anthropic/Slack/GitHub/AWS/Bearer/JWT patterns become `[REDACTED]`. Message *content* is never put in `context` — only metadata (id, from, to, length).
+- Each context string is truncated to ~2000 chars so a single oversized payload can't bloat the log.
+- Writes are POSIX `O_APPEND` — multiple processes can write the same log concurrently (mcp-server + plugin both write to it) without corrupting lines, subject to the PIPE_BUF atomic-append guarantee.
+- Rotation is simple: file > 50 MB → rename to `.log.1`, start a fresh one. No gzip, no multi-generation history.
+
+See [AGENTS.md](AGENTS.md) for the "first thing an agent does when debugging" checklist.
+
+---
+
 ## Security
 
 - **SSH key-based auth only** -- zero passwords in the entire flow

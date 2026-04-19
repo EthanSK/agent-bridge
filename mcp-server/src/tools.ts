@@ -29,6 +29,7 @@ import {
   getInboxStats,
 } from './inbox.js';
 import { logInfo, logError } from './logger.js';
+import { logEvent } from './log.js';
 
 /**
  * Register all agent-bridge tools on the MCP server.
@@ -128,6 +129,11 @@ export function registerTools(server: McpServer): void {
         results.push(
           `${m.name}: ${reachable ? 'ONLINE' : 'OFFLINE'} (${m.user}@${m.host}:${m.port})`,
         );
+        logEvent({
+          event: 'tool.bridge_status',
+          msg: `bridge_status: ${m.name} is ${reachable ? 'ONLINE' : 'OFFLINE'}`,
+          context: { machine: m.name, host: m.host, reachable, bypass_cache: probe === true },
+        });
       }
 
       return {
@@ -318,6 +324,11 @@ export function registerTools(server: McpServer): void {
       }
 
       logInfo(`Running command on ${machineName}: ${command}`);
+      logEvent({
+        event: 'tool.bridge_run_command',
+        msg: `Running command on ${machineName}`,
+        context: { machine: machineName, command, timeout_ms: timeout ?? 30000 },
+      });
 
       try {
         const result = await sshExec(machine, command, timeout ?? 30000);
@@ -339,6 +350,12 @@ export function registerTools(server: McpServer): void {
         const errMsg =
           err instanceof Error ? err.message : String(err);
         logError(`Command failed on ${machineName}: ${errMsg}`);
+        logEvent({
+          event: 'tool.bridge_run_command.failed',
+          level: 'error',
+          msg: `Command failed on ${machineName}`,
+          context: { machine: machineName, command, error: errMsg },
+        });
         return {
           content: [
             {

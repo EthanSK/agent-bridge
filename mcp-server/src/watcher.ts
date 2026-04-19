@@ -18,6 +18,7 @@ import { readdirSync, readFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { INBOX_DIR } from './config.js';
 import { logInfo, logError, logDebug, logWarn } from './logger.js';
+import { logEvent } from './log.js';
 import { invalidateCache, notifyNewFiles, setWatcherStatus, isDelivered, markDelivered } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 
@@ -82,6 +83,18 @@ function emitChannelNotification(fileName: string): void {
       logDebug(`Channel: skipping already-delivered message ${msg.id}`);
       return;
     }
+    logEvent({
+      event: 'message.received',
+      msg: `Inbox message ${msg.id} received from ${msg.from}`,
+      context: {
+        msg_id: msg.id,
+        from: msg.from,
+        to: msg.to,
+        type: msg.type,
+        reply_to: msg.replyTo,
+        content_length: msg.content?.length ?? 0,
+      },
+    });
     savedChannelCallback(msg);
     markDelivered(msg.id);
   } catch (err) {
@@ -139,6 +152,11 @@ function startPolling(callback: MessageCallback): void {
   currentBackend = 'polling';
   setWatcherStatus('polling', true);
   logInfo('Using polling watcher (2s interval)');
+  logEvent({
+    event: 'watcher.started',
+    msg: 'Using polling watcher (2s interval)',
+    context: { backend: 'polling', intervalMs: 2000 },
+  });
   pollInterval = setInterval(() => checkForNewFiles(callback), 2000);
   if (pollInterval.unref) pollInterval.unref();
 }
@@ -360,6 +378,11 @@ export async function startWatcher(
 
     if (proc) {
       logInfo('fswatch watcher started');
+      logEvent({
+        event: 'watcher.started',
+        msg: 'fswatch watcher started',
+        context: { backend: 'fswatch', pid: proc.pid },
+      });
       restartCount = 0; // reset on successful start
       setupFswatchHandler(proc, callback);
       return;
@@ -380,6 +403,11 @@ export async function startWatcher(
 
     if (proc) {
       logInfo('inotifywait watcher started');
+      logEvent({
+        event: 'watcher.started',
+        msg: 'inotifywait watcher started',
+        context: { backend: 'inotifywait', pid: proc.pid },
+      });
       restartCount = 0;
       setupInotifywaitHandler(proc, callback);
       return;
@@ -470,6 +498,11 @@ export function stopWatcher(): void {
   }
   setWatcherStatus(currentBackend, false);
   logInfo('Watcher stopped');
+  logEvent({
+    event: 'watcher.stopped',
+    msg: 'Watcher stopped',
+    context: { backend: currentBackend },
+  });
 }
 
 /**

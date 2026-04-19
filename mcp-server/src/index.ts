@@ -34,6 +34,7 @@ import type { BridgeMessage } from './inbox.js';
 import { registerTools } from './tools.js';
 import { startWatcher, stopWatcher, replayUndeliveredMessages } from './watcher.js';
 import { logInfo, logError } from './logger.js';
+import { logEvent } from './log.js';
 
 // Global error handlers. Most errors are logged and swallowed so the server
 // stays up, BUT broken-pipe errors (EPIPE) mean the parent Claude process
@@ -76,12 +77,17 @@ async function main(): Promise<void> {
 
   const localName = getLocalMachineName();
   logInfo(`agent-bridge MCP server starting on "${localName}"`);
+  logEvent({
+    event: 'server.starting',
+    msg: `agent-bridge MCP server starting on "${localName}"`,
+    context: { machineName: localName, version: '3.3.0', pid: process.pid, nodeVersion: process.version },
+  });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.2.0',
+      version: '3.3.0',
     },
     {
       capabilities: {
@@ -145,6 +151,18 @@ async function main(): Promise<void> {
       // This makes it appear as <channel source="agent-bridge" ...>content</channel>
       // in Claude's conversation — no polling needed.
       logInfo(`Pushing channel notification for message ${message.id} from ${message.from}`);
+      logEvent({
+        event: 'message.pushed_to_channel',
+        msg: `Pushing channel notification for message ${message.id} from ${message.from}`,
+        context: {
+          msg_id: message.id,
+          from: message.from,
+          to: message.to,
+          type: message.type,
+          reply_to: message.replyTo,
+          content_length: message.content?.length ?? 0,
+        },
+      });
 
       server.server.notification({
         method: 'notifications/claude/channel',
@@ -163,6 +181,12 @@ async function main(): Promise<void> {
         },
       }).catch((err) => {
         logError(`Failed to push channel notification for ${message.id}: ${err}`);
+        logEvent({
+          event: 'message.push_failed',
+          level: 'error',
+          msg: `Failed to push channel notification for ${message.id}`,
+          context: { msg_id: message.id, from: message.from, error: String(err) },
+        });
       });
     },
   );
@@ -172,6 +196,11 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   logInfo('agent-bridge MCP server connected and ready (channel mode)');
+  logEvent({
+    event: 'server.ready',
+    msg: 'agent-bridge MCP server connected and ready (channel mode)',
+    context: { machineName: localName },
+  });
 
   // Replay any messages that arrived while Claude was offline.
   // This must happen AFTER server.connect() so channel notifications
@@ -190,6 +219,13 @@ async function main(): Promise<void> {
     shuttingDown = true;
 
     try { logInfo(`Shutting down agent-bridge MCP server (${reason})...`); } catch {}
+    try {
+      logEvent({
+        event: 'server.shutdown',
+        msg: `Shutting down agent-bridge MCP server (${reason})`,
+        context: { reason },
+      });
+    } catch {}
 
     // Hard deadline: whatever state async cleanup is in, die within 2s. Matches
     // the Telegram channel plugin's discipline — no MCP server should ever

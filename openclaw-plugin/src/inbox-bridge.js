@@ -19,6 +19,13 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, renameSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { logEvent as unifiedLogEvent } from "./log.js";
+
+/** Component label for unified-log events emitted from this module. */
+const LOG_COMPONENT = "openclaw-plugin";
+function uLog(opts) {
+  unifiedLogEvent({ component: LOG_COMPONENT, ...opts });
+}
 
 // Dynamic import shields the plugin-install safety scanner from flagging
 // static child_process usage. The scanner's critical rule looks for calls
@@ -539,6 +546,20 @@ export async function startInboxBridge(options = {}) {
   logger.info?.(
     `[agent-bridge] starting inbox=${inboxDir} prefix=${sessionKeyPrefix} mode=${deliveryMode} agent=${agentId} channel=${deliveryChannel} account=${deliveryAccount ?? "<none>"} target=${deliveryTarget ?? "<none>"} routes=${Object.keys(chatIdToAccount).length}`,
   );
+  uLog({
+    event: "watcher.starting",
+    msg: `openclaw-plugin inbox bridge starting (mode=${deliveryMode})`,
+    context: {
+      inboxDir,
+      sessionKeyPrefix,
+      deliveryMode,
+      agentId,
+      deliveryChannel,
+      deliveryAccount: deliveryAccount ?? null,
+      deliveryTarget: deliveryTarget ?? null,
+      routes: Object.keys(chatIdToAccount).length,
+    },
+  });
   if ((deliveryMode === "message-send" || deliveryMode === "agent-turn") && !deliveryTarget) {
     logger.warn?.(
       `[agent-bridge] deliveryMode=${deliveryMode} has no default deliveryTarget — only messages with explicit @@route or msg.route.target_chat_id will be delivered; others will be acked as log-only`,
@@ -553,8 +574,26 @@ export async function startInboxBridge(options = {}) {
     const msg = parseMessageFile(filePath, logger);
     if (!msg) return;
 
+    uLog({
+      event: "message.received",
+      msg: `inbox message ${msg.id} picked up from ${msg.from}`,
+      context: {
+        msg_id: msg.id,
+        from: msg.from,
+        to: msg.to,
+        type: msg.type,
+        reply_to: msg.replyTo ?? null,
+        content_length: typeof msg.content === "string" ? msg.content.length : 0,
+      },
+    });
+
     if (deliveredIds.has(msg.id)) {
       logger.debug?.(`[agent-bridge] skipping already-delivered ${msg.id}`);
+      uLog({
+        event: "message.already_delivered",
+        msg: `skipping already-delivered ${msg.id}`,
+        context: { msg_id: msg.id },
+      });
       // Still archive the lingering file so it doesn't clutter the inbox.
       if (existsSync(filePath)) archiveDeliveredFile(filePath, logger);
       return;
@@ -579,6 +618,19 @@ export async function startInboxBridge(options = {}) {
     logger.info?.(
       `[agent-bridge] delivering ${msg.id} from=${msg.from} mode=${deliveryMode} agent=${route.targetAgent} reply=${route.targetChannel}:${route.targetAccount ?? "<default>"}:${route.targetChatId ?? "<none>"}`,
     );
+    uLog({
+      event: "message.resolving",
+      msg: `resolved route for ${msg.id}`,
+      context: {
+        msg_id: msg.id,
+        from: msg.from,
+        deliveryMode,
+        target_agent: route.targetAgent,
+        target_channel: route.targetChannel,
+        target_account: route.targetAccount ?? null,
+        target_chat_id: route.targetChatId ?? null,
+      },
+    });
 
     let result = { ok: true };
     if (deliveryMode === "agent") {
@@ -636,10 +688,35 @@ export async function startInboxBridge(options = {}) {
       // Archive the file so we don't loop on it after restart. This is
       // a new invariant in v3.2.0: delivered ⇒ file leaves the inbox.
       if (existsSync(filePath)) archiveDeliveredFile(filePath, logger);
+      uLog({
+        event: "message.delivered",
+        msg: `delivered ${msg.id} via ${deliveryMode}`,
+        context: {
+          msg_id: msg.id,
+          from: msg.from,
+          deliveryMode,
+          target_agent: route.targetAgent,
+          target_channel: route.targetChannel,
+          target_chat_id: route.targetChatId ?? null,
+        },
+      });
     } else {
       logger.error?.(
         `[agent-bridge] failed to deliver ${msg.id}; leaving in inbox for retry on next event`,
       );
+      uLog({
+        event: "message.delivery_failed",
+        level: "error",
+        msg: `failed to deliver ${msg.id} via ${deliveryMode}`,
+        context: {
+          msg_id: msg.id,
+          from: msg.from,
+          deliveryMode,
+          exit_code: result.code ?? null,
+          timedOut: result.timedOut ?? false,
+          stderr: typeof result.stderr === "string" ? result.stderr.slice(0, 1500) : null,
+        },
+      });
     }
   }
 
@@ -661,6 +738,11 @@ export async function startInboxBridge(options = {}) {
   });
 
   logger.info?.("[agent-bridge] inbox bridge ready");
+  uLog({
+    event: "watcher.ready",
+    msg: "openclaw-plugin inbox bridge ready",
+    context: { inboxDir, deliveryMode },
+  });
 
   return () => {
     try { stopWatcher(); } catch { /* ignore */ }
