@@ -10,8 +10,16 @@
  *   content: string,
  *   timestamp: 1712345678901,
  *   replyTo?: "msg-<uuid>",
- *   ttl?: 3600
+ *   ttl?: 3600,
+ *   target?: "claude-code",            // where the RECEIVER should deliver this
+ *   fromTarget?: "openclaw/clawdiboi2" // where the SENDER wants replies routed
  * }
+ *
+ * `fromTarget` enables bidirectional round-trips (e.g. OpenClaw ↔ Claude Code):
+ * when OpenClaw's agent replies via `bridge_send_message`, the reply envelope's
+ * `target` is populated from the ORIGINAL incoming message's `fromTarget`
+ * (falling back to "claude-code"). This keeps conversations landing back in
+ * the session that started them instead of always flowing into `claude-code/`.
  */
 
 import { randomUUID } from "node:crypto";
@@ -45,9 +53,34 @@ export function parseBridgeMessage(raw) {
   return obj;
 }
 
-/** Build a reply BridgeMessage envelope. */
-export function buildReply({ fromMachine, toMachine, replyToId, content }) {
-  return {
+/**
+ * Build a reply BridgeMessage envelope.
+ *
+ * Routing resolution order for `target` (refinement 3 — 2026-04-20):
+ *   1. Explicit `target` argument wins (advanced override).
+ *   2. Else if `incoming` is supplied AND `incoming.fromTarget` is present,
+ *      use that — this is the round-trip path. The original sender told us
+ *      where to put replies; honour it.
+ *   3. Else fall back to "claude-code" (the legacy default for the common
+ *      "OpenClaw injects into Telegram, cross-harness reply loops back to
+ *      Claude Code" flow).
+ *
+ * `fromTarget` on the OUTGOING reply is also populated (optional) from the
+ * `ownTarget` argument so the peer on the other end can reply back in turn.
+ */
+export function buildReply({
+  fromMachine,
+  toMachine,
+  replyToId,
+  content,
+  target,
+  incoming,
+  ownTarget,
+}) {
+  const resolvedTarget =
+    target ?? incoming?.fromTarget ?? "claude-code";
+  /** @type {Record<string, unknown>} */
+  const reply = {
     id: newMessageId(),
     from: fromMachine,
     to: toMachine,
@@ -56,5 +89,10 @@ export function buildReply({ fromMachine, toMachine, replyToId, content }) {
     timestamp: Date.now(),
     replyTo: replyToId,
     ttl: 3600,
+    target: resolvedTarget,
   };
+  if (typeof ownTarget === "string" && ownTarget) {
+    reply.fromTarget = ownTarget;
+  }
+  return reply;
 }

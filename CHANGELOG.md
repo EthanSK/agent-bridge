@@ -1,5 +1,93 @@
 # Changelog
 
+## mcp-server 3.4.0 + openclaw-channel 2.1.0 — 2026-04-20
+
+### Per-target inbox routing + OpenClaw session injection
+
+The single global `~/.agent-bridge/inbox/` directory has been split into
+per-harness-per-target subdirs, and the OpenClaw channel plugin now injects
+bridge messages into the already-running Telegram-bound agent session so
+replies land in the SAME Telegram chat the user was already talking in.
+
+**New inbox layout:**
+
+```
+~/.agent-bridge/inbox/
+├── claude-code/              ← Claude Code channel plugin watches this
+├── openclaw/
+│   ├── default/              ← OpenClaw @ClawdStationMiniBot session
+│   ├── clawdiboi2/           ← OpenClaw @Clawdiboi2bot session
+│   └── clordlethird/         ← OpenClaw @ClordLeThirdBot session
+├── .archive/<target>/
+└── .failed/
+    ├── <target>/             ← malformed per target
+    └── _unrouted/            ← legacy / no-target messages, quarantined
+```
+
+**`bridge_send_message` gains a required `target` parameter:**
+
+```jsonc
+bridge_send_message({ machine: "Mac-Mini", message: "hi", target: "claude-code" })
+bridge_send_message({ machine: "Mac-Mini", message: "hi", target: "openclaw/clawdiboi2" })
+```
+
+There is intentionally **no default routing**. Calls without `target` are
+rejected at the sender. Legacy flat files at `inbox/*.json` (pre-3.4.0
+senders) are moved to `inbox/.failed/_unrouted/` on next startup with a
+deprecation log line.
+
+**OpenClaw session injection (v2.1.0):**
+
+The openclaw-channel plugin now watches `inbox/openclaw/<target>/` for each
+configured target. On each inbound message it builds a session key —
+`agent:<agentId>:<openclaw_channel>:<account>:direct:<peer_id>` — and calls
+`enqueueSystemEvent(body, { sessionKey, trusted: false })` to inject the
+message into the matching running session. The session's own `lastChannel`
+drives reply routing, so bridge messages naturally round-trip through
+Telegram instead of spawning a separate "agent-bridge" channel.
+
+`trusted: false` — SSH pairing is not a first-party trust boundary.
+`requestHeartbeatNow` is called after injection when the plugin-sdk exports
+it, to wake idle sessions promptly.
+
+**Config (`openclaw.json`):**
+
+```json
+"channels": {
+  "agent-bridge": {
+    "enabled": true,
+    "config": {
+      "agentId": "main",
+      "targets": {
+        "default":      { "openclaw_channel": "telegram", "account": "default",      "peer_id": "6164541473" },
+        "clawdiboi2":   { "openclaw_channel": "telegram", "account": "clawdiboi2",   "peer_id": "6164541473" },
+        "clordlethird": { "openclaw_channel": "telegram", "account": "clordlethird", "peer_id": "6164541473" }
+      }
+    }
+  }
+}
+```
+
+Listeners are independent processes: each harness (Claude Code, OpenClaw,
+future agents) watches only its own subdir. One crashing doesn't affect
+the others.
+
+**Version bumps:**
+
+- `mcp-server`: 3.3.0 → **3.4.0** (new `target` field on BridgeMessage + tool arg; per-target subdir layout; legacy-file migration)
+- `openclaw-channel`: 2.0.0 → **2.1.0** (multi-target watcher; session-injection; `trusted: false`; heartbeat wake)
+
+**Upgrade notes:**
+
+1. Pull the repo on both machines and `npm run build` in `mcp-server/`.
+2. Add the `targets` map to the `channels["agent-bridge"].config` block in
+   `~/.openclaw/openclaw.json` on the machine(s) running OpenClaw.
+3. Update any scripts / alias that call `bridge_send_message` to pass `target`.
+4. Old messages sitting in `inbox/*.json` (pre-upgrade) will auto-migrate
+   to `.failed/_unrouted/` on first startup of the new mcp-server.
+
+See [docs/PLAN-INBOX-SUBDIRS-AND-SESSION-INJECTION-2026-04-20.md](docs/PLAN-INBOX-SUBDIRS-AND-SESSION-INJECTION-2026-04-20.md) for the design + decision log.
+
 ## 3.0.0 — 2026-04-14
 
 ### BREAKING: remove fresh-spawn agent wrappers — channel mode only

@@ -15,8 +15,60 @@ export const INBOX_DIR = join(BRIDGE_DIR, 'inbox');
 export const OUTBOX_DIR = join(BRIDGE_DIR, 'outbox');
 export const LOGS_DIR = join(BRIDGE_DIR, 'logs');
 export const FAILED_DIR = join(INBOX_DIR, '.failed');
+export const ARCHIVE_DIR = join(INBOX_DIR, '.archive');
+export const UNROUTED_DIR = join(FAILED_DIR, '_unrouted');
 export const PROCESSED_FILE = join(INBOX_DIR, '.processed');
 export const DELIVERED_FILE = join(INBOX_DIR, '.delivered');
+
+/**
+ * Per-harness/per-target subdir under INBOX_DIR. Example targets:
+ *   "claude-code"            — Claude Code's built-in channel plugin watches this
+ *   "openclaw/default"       — OpenClaw @ClawdStationMiniBot
+ *   "openclaw/clawdiboi2"    — OpenClaw @Clawdiboi2bot
+ *   "openclaw/clordlethird"  — OpenClaw @ClordLeThirdBot
+ *
+ * The MCP server (this repo) is concerned only with the `claude-code` branch;
+ * the openclaw-channel plugin owns the `openclaw/*` branch. The target field
+ * on a BridgeMessage is free-form so third-party harnesses can register their
+ * own subdirs without a code change here.
+ */
+export const CLAUDE_CODE_TARGET = 'claude-code';
+
+/** Per-target inbox subdir. */
+export function inboxSubdir(target: string): string {
+  return join(INBOX_DIR, target);
+}
+
+/** Per-target archive subdir (for delivered messages, debug tail). */
+export function archiveSubdir(target: string): string {
+  return join(ARCHIVE_DIR, target);
+}
+
+/** Per-target failed subdir. */
+export function failedSubdir(target: string): string {
+  return join(FAILED_DIR, target);
+}
+
+/**
+ * Validate a target string. Allowed chars: Unicode letters + Unicode digits +
+ * `_`, `.`, `-`, `/`. Control chars, spaces, and filesystem-nasties are
+ * rejected. Must not start or end with a slash, must not contain `..`, must
+ * not contain `//`, must not be empty, and must fit within 256 chars.
+ *
+ * The Unicode-aware regex lets target names carry non-ASCII identifiers
+ * (handy for multilingual harness names) while keeping the subdir layout
+ * predictable and avoiding path traversal via a crafted `target` field on a
+ * BridgeMessage from a paired machine.
+ */
+export function isValidTarget(target: string): boolean {
+  if (!target || typeof target !== 'string') return false;
+  if (target.length > 256) return false;
+  if (target.includes('..')) return false;
+  if (target.startsWith('/') || target.endsWith('/')) return false;
+  if (target.includes('//')) return false;
+  const segmentPattern = /^[\p{L}\p{N}_](?:[\p{L}\p{N}_\.-]*[\p{L}\p{N}_])?$/u;
+  return target.split('/').every(segment => segmentPattern.test(segment));
+}
 
 /** Pruning / TTL settings (overridable via environment variables) */
 export const PRUNE_MAX_AGE_MS = parseInt(
@@ -62,7 +114,16 @@ export interface MachineConfig {
  * Ensure all required directories exist.
  */
 export function ensureDirectories(): void {
-  for (const dir of [BRIDGE_DIR, INBOX_DIR, OUTBOX_DIR, LOGS_DIR, FAILED_DIR]) {
+  for (const dir of [
+    BRIDGE_DIR,
+    INBOX_DIR,
+    OUTBOX_DIR,
+    LOGS_DIR,
+    FAILED_DIR,
+    ARCHIVE_DIR,
+    UNROUTED_DIR,
+    inboxSubdir(CLAUDE_CODE_TARGET),
+  ]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }

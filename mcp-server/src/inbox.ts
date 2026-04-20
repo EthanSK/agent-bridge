@@ -27,6 +27,8 @@ import {
   INBOX_DIR,
   OUTBOX_DIR,
   FAILED_DIR,
+  ARCHIVE_DIR,
+  UNROUTED_DIR,
   PROCESSED_FILE,
   DELIVERED_FILE,
   PROCESSED_FILE_MAX_SIZE,
@@ -35,6 +37,9 @@ import {
   PRUNE_INTERVAL_MS,
   DEFAULT_TTL_SECONDS,
   OUTBOX_MAX_AGE_MS,
+  CLAUDE_CODE_TARGET,
+  inboxSubdir,
+  isValidTarget,
 } from './config.js';
 import { sshWriteFile } from './ssh.js';
 import { logInfo, logWarn, logError, logDebug } from './logger.js';
@@ -47,12 +52,34 @@ export interface BridgeMessage {
   id: string;
   from: string;
   to: string;
-  type: 'message' | 'command' | 'response';
+  type: 'message' | 'command' | 'response' | 'reply';
   content: string;
   timestamp: string;
   replyTo: string | null;
   /** Time-to-live in seconds. 0 = no expiry. Default: 3600 (1 hour). */
   ttl?: number;
+  /**
+   * Slash-delimited routing target. Added in mcp-server 3.4.0 to support the
+   * per-harness/per-session inbox subdir layout. Examples:
+   *   "claude-code"
+   *   "openclaw/default"
+   *   "openclaw/clawdiboi2"
+   * Messages arriving without a target are moved to `.failed/_unrouted/` —
+   * there is intentionally no default routing.
+   */
+  target?: string;
+  /**
+   * Sender's OWN target-ID. Lets the receiver know WHERE to route a reply so
+   * round-trip bridge conversations land back in the session that originated
+   * the message (e.g. OpenClaw @Clawdiboi2bot ↔ Claude Code, not just
+   * one-way injection). Refinement 3 — 2026-04-20.
+   *
+   * Example: a message sent from Claude Code arrives with
+   * `fromTarget: "claude-code"`. When OpenClaw's agent calls
+   * `bridge_send_message`, `buildReply` copies `incoming.fromTarget` into
+   * `reply.target` so the reply lands back in Claude Code's inbox subdir.
+   */
+  fromTarget?: string;
 }
 
 export interface InboxStats {
@@ -90,11 +117,61 @@ let _watcherHealthy = false;
 // ── Directory helpers ────────────────────────────────────────────────────────
 
 export function ensureInboxDirs(): void {
-  for (const dir of [INBOX_DIR, OUTBOX_DIR, FAILED_DIR]) {
+  for (const dir of [
+    INBOX_DIR,
+    OUTBOX_DIR,
+    FAILED_DIR,
+    ARCHIVE_DIR,
+    UNROUTED_DIR,
+    CLAUDE_CODE_INBOX_DIR,
+  ]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
   }
+}
+
+/**
+ * The inbox subdir this mcp-server (Claude Code side) owns. All scanning,
+ * watching and consuming operates on this subdir — the parent `inbox/` is now
+ * a fan-out root shared with the openclaw-channel plugin (and any future
+ * harness) and is not scanned directly.
+ */
+export const CLAUDE_CODE_INBOX_DIR = inboxSubdir(CLAUDE_CODE_TARGET);
+
+/**
+ * One-shot migration: any JSON file at the top level of INBOX_DIR is a legacy
+ * pre-3.4.0 message with no `target` field. It cannot be routed deterministically
+ * — per Ethan's design "no default routing" — so we move it to
+ * `.failed/_unrouted/` with a deprecation log line. This runs on every startup
+ * so the window stays clean even if an old sender keeps writing flat files.
+ */
+export function migrateLegacyFlatFiles(): number {
+  ensureInboxDirs();
+  let moved = 0;
+  try {
+    if (!existsSync(INBOX_DIR)) return 0;
+    const entries = readdirSync(INBOX_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith('.json')) continue;
+      const src = join(INBOX_DIR, entry.name);
+      const dest = join(UNROUTED_DIR, entry.name);
+      try {
+        renameSync(src, dest);
+        moved += 1;
+        logWarn(
+          `Legacy flat-file inbox message moved to .failed/_unrouted/: ${entry.name}. `
+          + `Senders must now set BridgeMessage.target (e.g. "claude-code", "openclaw/clawdiboi2").`,
+        );
+      } catch (err) {
+        logError(`Failed to migrate legacy inbox file ${entry.name}: ${err}`);
+      }
+    }
+  } catch (err) {
+    logWarn(`Legacy-file migration scan failed: ${err}`);
+  }
+  return moved;
 }
 
 // ── Watcher status (set from watcher.ts) ─────────────────────────────────────
@@ -234,8 +311,8 @@ function refreshCacheIfNeeded(): void {
 
   pendingFiles.clear();
   try {
-    if (existsSync(INBOX_DIR)) {
-      const files = readdirSync(INBOX_DIR).filter(
+    if (existsSync(CLAUDE_CODE_INBOX_DIR)) {
+      const files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(
         f => f.endsWith('.json'),
       );
       for (const f of files) {
@@ -243,7 +320,7 @@ function refreshCacheIfNeeded(): void {
       }
     }
   } catch (err) {
-    logError(`Failed to scan inbox directory: ${err}`);
+    logError(`Failed to scan claude-code inbox subdir: ${err}`);
   }
   cacheInitialized = true;
   cacheDirty = false;
@@ -258,12 +335,19 @@ function parseMessageFile(filePath: string): BridgeMessage | null {
     if (!msg.id || !msg.timestamp) {
       throw new Error('Missing required fields: id, timestamp');
     }
+    if (!msg.target || !isValidTarget(msg.target)) {
+      throw new Error(`Missing/invalid target: ${JSON.stringify(msg.target ?? null)}`);
+    }
+    if (msg.target !== CLAUDE_CODE_TARGET) {
+      throw new Error(`Message target ${JSON.stringify(msg.target)} does not match ${CLAUDE_CODE_TARGET}`);
+    }
     return msg;
   } catch (err) {
     const fileName = filePath.split('/').pop() ?? filePath;
-    logWarn(`Malformed message file ${fileName}, moving to .failed/: ${err}`);
+    logWarn(`Malformed message file ${fileName}, moving to .failed/_unrouted/: ${err}`);
     try {
-      const dest = join(FAILED_DIR, fileName);
+      if (!existsSync(UNROUTED_DIR)) mkdirSync(UNROUTED_DIR, { recursive: true, mode: 0o700 });
+      const dest = join(UNROUTED_DIR, fileName);
       renameSync(filePath, dest);
     } catch (moveErr) {
       logError(`Failed to quarantine ${fileName}: ${moveErr}`);
@@ -274,6 +358,24 @@ function parseMessageFile(filePath: string): BridgeMessage | null {
     }
     return null;
   }
+}
+
+function countJsonFilesRecursive(dir: string): number {
+  let count = 0;
+  try {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const child = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        count += countJsonFilesRecursive(child);
+      } else if (entry.isFile() && entry.name.endsWith('.json')) {
+        count += 1;
+      }
+    }
+  } catch {
+    // Ignore unreadable dirs in stats.
+  }
+  return count;
 }
 
 // ── TTL / age check ─────────────────────────────────────────────────────────
@@ -302,8 +404,10 @@ export function createMessage(
   content: string,
   replyTo: string | null = null,
   ttl: number = DEFAULT_TTL_SECONDS,
+  target?: string,
+  fromTarget?: string,
 ): BridgeMessage {
-  return {
+  const msg: BridgeMessage = {
     id: `msg-${randomUUID()}`,
     from,
     to,
@@ -313,17 +417,33 @@ export function createMessage(
     replyTo,
     ttl,
   };
+  if (target) msg.target = target;
+  if (fromTarget) msg.fromTarget = fromTarget;
+  return msg;
 }
 
 /**
  * Send a message to a remote machine by writing it to their inbox via SSH.
  * Retries once on failure before throwing.
+ *
+ * As of mcp-server 3.4.0 the message is written to a per-target subdir of
+ * the remote inbox (`inbox/<target>/<id>.json`) so independent listeners
+ * (Claude Code channel plugin, openclaw-channel plugin, future harnesses)
+ * can watch their own branch without racing for messages that aren't
+ * addressed to them. The caller must set `message.target`; messages without
+ * one are rejected by `bridge_send_message`.
  */
 export async function sendMessage(
   machine: MachineConfig,
   message: BridgeMessage,
 ): Promise<void> {
-  const remotePath = `~/.agent-bridge/inbox/${message.id}.json`;
+  if (!message.target || !isValidTarget(message.target)) {
+    throw new Error(
+      `BridgeMessage.target is required (e.g. "claude-code", "openclaw/clawdiboi2"). `
+      + `Got: ${JSON.stringify(message.target ?? null)}`,
+    );
+  }
+  const remotePath = `~/.agent-bridge/inbox/${message.target}/${message.id}.json`;
   const content = JSON.stringify(message, null, 2);
 
   logInfo(`Sending message ${message.id} to ${machine.name}: ${message.type}`);
@@ -335,6 +455,7 @@ export async function sendMessage(
       to: machine.name,
       host: machine.host,
       type: message.type,
+      target: message.target,
       content_length: message.content?.length ?? 0,
       reply_to: message.replyTo ?? undefined,
       ttl: message.ttl,
@@ -408,7 +529,7 @@ export function readInbox(): BridgeMessage[] {
   // Batch-read all pending files
   const fileNames = Array.from(pendingFiles);
   for (const fileName of fileNames) {
-    const filePath = join(INBOX_DIR, fileName);
+    const filePath = join(CLAUDE_CODE_INBOX_DIR, fileName);
 
     // Skip files that no longer exist (race with external consumers)
     if (!existsSync(filePath)) {
@@ -472,7 +593,7 @@ export function consumeInbox(): BridgeMessage[] {
   const messages = readInbox();
 
   for (const msg of messages) {
-    const filePath = join(INBOX_DIR, `${msg.id}.json`);
+    const filePath = join(CLAUDE_CODE_INBOX_DIR, `${msg.id}.json`);
     try {
       unlinkSync(filePath);
       logDebug(`Consumed message ${msg.id}`);
@@ -501,10 +622,10 @@ export function clearInbox(): number {
   ensureInboxDirs();
   let count = 0;
   try {
-    const files = readdirSync(INBOX_DIR).filter(f => f.endsWith('.json'));
+    const files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(f => f.endsWith('.json'));
     for (const file of files) {
       try {
-        unlinkSync(join(INBOX_DIR, file));
+        unlinkSync(join(CLAUDE_CODE_INBOX_DIR, file));
         count++;
       } catch { /* ignore */ }
     }
@@ -513,7 +634,7 @@ export function clearInbox(): number {
   } catch {
     // Directory might not exist
   }
-  logInfo(`Cleared ${count} message(s) from inbox`);
+  logInfo(`Cleared ${count} message(s) from claude-code inbox`);
   return count;
 }
 
@@ -533,7 +654,7 @@ export function pruneInbox(): number {
 
   let files: string[];
   try {
-    files = readdirSync(INBOX_DIR).filter(f => f.endsWith('.json'));
+    files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(f => f.endsWith('.json'));
   } catch {
     return 0;
   }
@@ -542,7 +663,7 @@ export function pruneInbox(): number {
   const entries: { fileName: string; msg: BridgeMessage; filePath: string }[] = [];
 
   for (const fileName of files) {
-    const filePath = join(INBOX_DIR, fileName);
+    const filePath = join(CLAUDE_CODE_INBOX_DIR, fileName);
     const msg = parseMessageFile(filePath);
     if (!msg) {
       // Already quarantined
@@ -675,11 +796,11 @@ export function getInboxStats(): InboxStats {
   const nowMs = Date.now();
 
   try {
-    const files = readdirSync(INBOX_DIR).filter(f => f.endsWith('.json'));
+    const files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(f => f.endsWith('.json'));
     pendingCount = files.length;
 
     for (const f of files) {
-      const fp = join(INBOX_DIR, f);
+      const fp = join(CLAUDE_CODE_INBOX_DIR, f);
       try {
         const stat = statSync(fp);
         totalSize += stat.size;
@@ -704,7 +825,7 @@ export function getInboxStats(): InboxStats {
 
   try {
     if (existsSync(FAILED_DIR)) {
-      failedCount = readdirSync(FAILED_DIR).filter(f => f.endsWith('.json')).length;
+      failedCount = countJsonFilesRecursive(FAILED_DIR);
     }
   } catch { /* ignore */ }
 
@@ -726,11 +847,18 @@ export function getInboxStats(): InboxStats {
  */
 export function initInbox(): void {
   ensureInboxDirs();
+  const migrated = migrateLegacyFlatFiles();
+  if (migrated > 0) {
+    logWarn(
+      `Migrated ${migrated} legacy flat-file message(s) from ${INBOX_DIR} to `
+      + `${UNROUTED_DIR}. Senders must set BridgeMessage.target.`,
+    );
+  }
   loadProcessedIds();
   loadDeliveredIds();
   refreshCacheIfNeeded();
   startPruneTimer();
-  logInfo('Inbox system initialized');
+  logInfo('Inbox system initialized (target-routed, watching claude-code/)');
 }
 
 /**

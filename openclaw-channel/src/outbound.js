@@ -9,7 +9,7 @@
  * To deliver a reply we:
  *   1. Resolve the remote machine by name via the pairing registry.
  *   2. Write the reply JSON to a temp file under ~/.agent-bridge/outbound/.
- *   3. `scp -i <key> <tmp> <user>@<host>:~/.agent-bridge/inbox/<id>.json`
+ *   3. `scp -i <key> <tmp> <user>@<host>:~/.agent-bridge/inbox/<target>/<id>.json`
  *
  * The remote's inbox-watcher (or Claude Code channel plugin) then picks it up
  * and pushes it into the running session.
@@ -27,7 +27,7 @@ const DEFAULT_CONFIG = join(AGENT_BRIDGE_HOME, "config");
 
 /**
  * Look up a paired machine in ~/.agent-bridge/config.
- * Returns { user, host, port } or null.
+ * Returns { user, host, port, key } or null.
  */
 export function resolvePairedMachine(name, configPath = DEFAULT_CONFIG) {
   if (!existsSync(configPath)) return null;
@@ -41,7 +41,7 @@ export function resolvePairedMachine(name, configPath = DEFAULT_CONFIG) {
   try {
     cfg = JSON.parse(raw);
   } catch {
-    return null;
+    return resolvePairedMachineFromIni(name, raw);
   }
   const machines = cfg?.machines ?? {};
   const entry = machines[name];
@@ -50,11 +50,42 @@ export function resolvePairedMachine(name, configPath = DEFAULT_CONFIG) {
     user: entry.user ?? entry.username ?? "root",
     host: entry.host ?? entry.address ?? null,
     port: entry.port ?? 22,
+    key: entry.key ? expandHome(entry.key) : null,
   };
 }
 
+function resolvePairedMachineFromIni(name, raw) {
+  const targetName = String(name).toLowerCase();
+  let inSection = false;
+  /** @type {Record<string, string>} */
+  const fields = {};
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const section = line.match(/^\[(.+)\]$/);
+    if (section) {
+      inSection = section[1].toLowerCase() === targetName;
+      continue;
+    }
+    if (!inSection) continue;
+    const kv = line.match(/^(\w+)=(.*)$/);
+    if (kv) fields[kv[1]] = kv[2];
+  }
+  if (!fields.host || !fields.user) return null;
+  return {
+    user: fields.user,
+    host: fields.host,
+    port: Number.parseInt(fields.port ?? "22", 10) || 22,
+    key: fields.key ? expandHome(fields.key) : null,
+  };
+}
+
+function expandHome(path) {
+  if (typeof path !== "string") return path;
+  return path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
+
 /**
- * SCP a BridgeMessage to `<remote>:~/.agent-bridge/inbox/<id>.json`.
+ * SCP a BridgeMessage to `<remote>:~/.agent-bridge/inbox/<target>/<id>.json`.
  *
  * @param {object} opts
  * @param {object} opts.message - BridgeMessage envelope
@@ -71,13 +102,18 @@ export async function deliverReply(opts) {
   const configPath = opts.configPath ?? DEFAULT_CONFIG;
   const msg = opts.message;
   const toMachine = opts.toMachine;
+  const targetName = msg.target ?? "claude-code";
+
+  if (!isValidTarget(targetName)) {
+    throw new Error(`invalid BridgeMessage.target: ${JSON.stringify(targetName)}`);
+  }
 
   const target = resolvePairedMachine(toMachine, configPath);
   if (!target || !target.host) {
     throw new Error(`paired machine "${toMachine}" not found in ${configPath}`);
   }
 
-  const keyPath = join(keysDir, `agent-bridge_${toMachine}`);
+  const keyPath = target.key ?? join(keysDir, `agent-bridge_${toMachine}`);
   if (!existsSync(keyPath)) {
     throw new Error(`no SSH key for machine "${toMachine}" at ${keyPath}`);
   }
@@ -86,7 +122,23 @@ export async function deliverReply(opts) {
   const tmpPath = join(outboundDir, `${msg.id}.json`);
   writeFileSync(tmpPath, JSON.stringify(msg, null, 2));
 
-  const remoteInbox = `~/.agent-bridge/inbox/${msg.id}.json`;
+  const remoteDir = `~/.agent-bridge/inbox/${targetName}`;
+  const remoteTmpName = `.${msg.id}.${process.pid}.${Date.now()}.tmp`;
+  const remoteTmp = `${remoteDir}/${remoteTmpName}`;
+  const remoteInbox = `${remoteDir}/${msg.id}.json`;
+  const sshBaseArgs = [
+    "-i",
+    keyPath,
+    "-p",
+    String(target.port ?? 22),
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    `${target.user}@${target.host}`,
+  ];
   const scpArgs = [
     "-i",
     keyPath,
@@ -99,13 +151,21 @@ export async function deliverReply(opts) {
     "-o",
     "ConnectTimeout=10",
     tmpPath,
-    `${target.user}@${target.host}:${remoteInbox}`,
+    `${target.user}@${target.host}:${remoteTmp}`,
   ];
 
   log.debug?.(`scp -> ${target.user}@${target.host}:${remoteInbox}`);
 
   try {
+    await runCommand("ssh", [
+      ...sshBaseArgs,
+      `mkdir -p "$HOME/.agent-bridge/inbox/${targetName}"`,
+    ], log);
     await runCommand("scp", scpArgs, log);
+    await runCommand("ssh", [
+      ...sshBaseArgs,
+      `mv -f "$HOME/.agent-bridge/inbox/${targetName}/${remoteTmpName}" "$HOME/.agent-bridge/inbox/${targetName}/${msg.id}.json"`,
+    ], log);
   } finally {
     try {
       unlinkSync(tmpPath);
@@ -113,6 +173,17 @@ export async function deliverReply(opts) {
       /* ignore */
     }
   }
+}
+
+function isValidTarget(target) {
+  // Mirror of mcp-server/src/config.ts :: isValidTarget — Unicode-aware. Keep in sync.
+  if (typeof target !== "string" || !target) return false;
+  if (target.length > 256) return false;
+  if (target.includes("..")) return false;
+  if (target.startsWith("/") || target.endsWith("/")) return false;
+  if (target.includes("//")) return false;
+  const segmentPattern = /^[\p{L}\p{N}_](?:[\p{L}\p{N}_\.-]*[\p{L}\p{N}_])?$/u;
+  return target.split("/").every((segment) => segmentPattern.test(segment));
 }
 
 function runCommand(cmd, args, log) {

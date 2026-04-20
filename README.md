@@ -707,6 +707,59 @@ No fresh agent is spawned on the remote machine — the message lands in the con
 
 ---
 
+## Message routing / targets
+
+As of **mcp-server 3.4.0** and **openclaw-channel 2.1.0**, every bridge message must be addressed to a specific routing **target**. The target decides which inbox subdir on the receiver the message lands in, and therefore which listener picks it up and which agent session it gets injected into.
+
+```
+~/.agent-bridge/inbox/
+├── claude-code/              ← Claude Code's channel plugin watches ONLY this
+├── openclaw/
+│   ├── default/              ← OpenClaw @ClawdStationMiniBot session
+│   ├── clawdiboi2/           ← OpenClaw @Clawdiboi2bot session
+│   └── clordlethird/         ← OpenClaw @ClordLeThirdBot session
+├── .archive/<target>/        ← delivered messages kept for debug tail
+├── .failed/<target>/         ← malformed messages, quarantined per target
+└── .failed/_unrouted/        ← messages with no `target` or no matching subdir
+```
+
+**Calling `bridge_send_message`:**
+
+```jsonc
+// Talk to Claude Code on the other machine (cross-machine agent-to-agent):
+bridge_send_message({ machine: "Mac-Mini", message: "hi", target: "claude-code" })
+
+// Inject into the OpenClaw @Clawdiboi2bot Telegram session:
+// reply goes back to the Telegram chat, NOT over the bridge
+bridge_send_message({ machine: "Mac-Mini", message: "what's up?", target: "openclaw/clawdiboi2" })
+```
+
+There is **no default routing** — a call without `target` is rejected. Legacy flat files that arrive at the root of `inbox/` (from pre-3.4.0 senders) are moved to `.failed/_unrouted/` on next startup with a deprecation log line. Upgrade your senders.
+
+**OpenClaw target mapping** lives in `openclaw.json`:
+
+```json
+"channels": {
+  "agent-bridge": {
+    "enabled": true,
+    "config": {
+      "agentId": "main",
+      "targets": {
+        "default":      { "openclaw_channel": "telegram", "account": "default",      "peer_id": "6164541473" },
+        "clawdiboi2":   { "openclaw_channel": "telegram", "account": "clawdiboi2",   "peer_id": "6164541473" },
+        "clordlethird": { "openclaw_channel": "telegram", "account": "clordlethird", "peer_id": "6164541473" }
+      }
+    }
+  }
+}
+```
+
+Each entry resolves to an OpenClaw session key of the form `agent:<agentId>:<openclaw_channel>:<account>:direct:<peer_id>`. The openclaw-channel plugin uses that key with `enqueueSystemEvent(body, { sessionKey, trusted: false })` to inject the message into the already-running agent session. Replies travel over whatever channel the session was last talking on (usually the originating Telegram chat) instead of spawning a new `agent-bridge` channel.
+
+Listeners are independent processes: Claude Code's channel plugin and the OpenClaw gateway watch their own subdirs. One crashing doesn't affect the other.
+
+---
+
 ## Inbox management
 
 The MCP server includes production-grade inbox management:

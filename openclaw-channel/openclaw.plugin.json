@@ -11,9 +11,13 @@
     "type": "object",
     "additionalProperties": true,
     "properties": {
+      "inboxRoot": {
+        "type": "string",
+        "description": "Root of the agent-bridge inbox (per-target subdirs live under `<inboxRoot>/openclaw/<target>/`). Defaults to ~/.agent-bridge/inbox."
+      },
       "inboxDir": {
         "type": "string",
-        "description": "Directory to watch for incoming bridge messages. Defaults to ~/.agent-bridge/inbox."
+        "description": "Legacy alias for `inboxRoot` (pre-2.1.0). Still honoured for upgrade compatibility."
       },
       "keysDir": {
         "type": "string",
@@ -28,17 +32,54 @@
         "type": "string",
         "description": "Local machine name used as the 'from' field on outbound BridgeMessages. Defaults to hostname."
       },
+      "agentId": {
+        "type": "string",
+        "description": "OpenClaw agent id to target when building session keys. Defaults to 'main'."
+      },
+      "peer_id": {
+        "type": "string",
+        "description": "Plugin-level default peer id (e.g. Ethan's Telegram user id '6164541473'). Used as a fallback when a target's own peer_id is missing OR when auto-discovery can't resolve one from the OpenClaw config / allowFrom list. Optional."
+      },
+      "targets": {
+        "type": "object",
+        "description": "OPTIONAL: Map of target-name -> routing config. If present, acts as an advanced override — each target name becomes an inbox subdir at `<inboxRoot>/openclaw/<name>/` and identifies which Telegram account/session to inject bridge messages into. If absent or empty (the default), the plugin AUTO-DISCOVERS one target per entry in `channels.telegram.accounts` on the OpenClaw global config. Peer id resolution: explicit `targets.<name>.peer_id` -> `channels.agent-bridge.config.peer_id` -> `meta.user_id` on the global config -> first chat id in `channels.telegram.accounts[<name>].allowFrom`.",
+        "propertyNames": {
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]*$"
+        },
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "openclaw_channel": {
+              "type": "string",
+              "description": "Which OpenClaw channel hosts the target session. Typically 'telegram'."
+            },
+            "account": {
+              "type": "string",
+              "description": "Account id within the chosen channel (e.g. 'default', 'clawdiboi2')."
+            },
+            "peer_id": {
+              "type": "string",
+              "description": "Stable peer id of the direct chat to inject into (e.g. Ethan's Telegram user id '6164541473'). Optional when a plugin-level `peer_id` is configured."
+            },
+            "agent_id": {
+              "type": "string",
+              "description": "Optional per-target override of the top-level `agentId`."
+            }
+          },
+          "required": ["account"]
+        }
+      },
       "fanOutChannel": {
         "type": "string",
-        "description": "When the agent replies, also deliver to this channel id (e.g. 'telegram'). Optional."
+        "description": "Deprecated (v2.0.x) — prefer registering the target session directly via `targets.<name>`. Kept for legacy compatibility."
       },
       "fanOutAccount": {
         "type": "string",
-        "description": "Channel account id for fan-out delivery. Optional."
+        "description": "Deprecated (v2.0.x)."
       },
       "fanOutTarget": {
         "type": "string",
-        "description": "Default chat target for fan-out delivery. Optional."
+        "description": "Deprecated (v2.0.x)."
       }
     }
   }

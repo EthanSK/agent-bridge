@@ -128,20 +128,26 @@ export function createAgentBridgeChannelPlugin(opts) {
         // machine name of the paired peer (e.g. "Ethans-MacBook-Pro"). When
         // the current reply is an in-turn response to an earlier inbound
         // message we prefer the fromMachine we captured on inbound (via
-        // ctx.accountId/threadId -> getReplyTargets).
-        const target = resolveOutboundTarget(ctx, getReplyTargets);
+        // ctx.accountId/threadId -> getReplyTargets). The same lookup also
+        // surfaces the last-seen incoming BridgeMessage so `buildReply`
+        // can route the reply back to the sender's own target-ID for a
+        // proper round-trip (refinement 3 — 2026-04-20).
+        const hit = resolveOutboundTarget(ctx, getReplyTargets);
+        const target = hit?.fromMachine;
         if (!target) {
           throw new Error(
             `agent-bridge outbound: cannot resolve target machine for to="${ctx.to}"`,
           );
         }
+        const pluginCfg = getPluginConfig() ?? {};
         const msg = buildReply({
           fromMachine: localMachineName(),
           toMachine: target,
           replyToId: ctx.replyToId ?? null,
           content: ctx.text ?? "",
+          incoming: hit?.incoming,
+          ownTarget: hit?.ownTarget ?? pluginCfg.defaultOwnTarget,
         });
-        const pluginCfg = getPluginConfig() ?? {};
         await deliverReply({
           message: msg,
           toMachine: target,
@@ -159,7 +165,10 @@ export function createAgentBridgeChannelPlugin(opts) {
 }
 
 function resolveOutboundTarget(ctx, getReplyTargets) {
-  // Prefer the captured fromMachine we stashed for this session.
+  // Prefer the captured fromMachine we stashed for this session. We return
+  // the WHOLE hit object (not just fromMachine) so the caller can read the
+  // captured incoming BridgeMessage and the OpenClaw target's own ID for
+  // round-trip routing (refinement 3 — 2026-04-20).
   const targets = getReplyTargets?.();
   if (targets) {
     const sessionHints = [ctx.threadId, ctx.accountId, ctx.to]
@@ -167,13 +176,13 @@ function resolveOutboundTarget(ctx, getReplyTargets) {
       .map((v) => String(v));
     for (const hint of sessionHints) {
       const hit = targets.get(hint);
-      if (hit?.fromMachine) return hit.fromMachine;
+      if (hit?.fromMachine) return hit;
     }
   }
   // Fallback: treat ctx.to as the machine name directly (bridge messages
-  // often encode that explicitly).
+  // often encode that explicitly). No incoming context in this case.
   if (typeof ctx.to === "string" && ctx.to.trim()) {
-    return ctx.to.trim();
+    return { fromMachine: ctx.to.trim() };
   }
   return null;
 }

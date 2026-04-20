@@ -53,4 +53,4 @@ claude plugin marketplace add EthanSK/agent-bridge
 
 - Bash `agent-bridge` CLI (root of repo) is unchanged except for the 3.0.0 removal of `--claude` / `--codex` / `--agent` from `run`. Still installed via `./install.sh`. Used for pairing, plain remote-shell diagnostics, and SSH transport. Agent-to-agent communication is strictly via `bridge_send_message` (channel mode) — there is no fresh-spawn path.
 - OpenClaw channel plugin (`openclaw-channel/`) is unchanged. Different ecosystem, different manifest format.
-- The Claude Code plugin (this work) only reads from / writes to `~/.agent-bridge/inbox/` and `~/.agent-bridge/keys/` — same shared state the CLI uses.
+- The Claude Code plugin (this work) reads from `~/.agent-bridge/inbox/claude-code/` and writes its outbox / keys the same way. As of mcp-server 3.4.0 the inbox is split into per-harness/per-target subdirs (`inbox/claude-code/`, `inbox/openclaw/<target>/`, …) so multiple listeners on the same machine don't race for messages addressed to different harnesses. See the top-level [README](README.md#message-routing--targets).

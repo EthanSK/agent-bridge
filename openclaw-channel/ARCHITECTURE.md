@@ -52,19 +52,49 @@ Inbound messages are injected into the running agent session via
 API the built-in channels use for out-of-band system injections, and it
 lets us push a message without any CLI shell-out.
 
+As of **v2.1.0** the session key is derived from the per-target config, so
+bridge messages land in the SAME session the user is already talking to on
+Telegram — the agent answers back over Telegram, not back over the bridge.
+
 ```js
-const { enqueueSystemEvent } = await import("openclaw/plugin-sdk/channel-core");
+const { enqueueSystemEvent, requestHeartbeatNow } =
+  await import("openclaw/plugin-sdk/infra-runtime");
+
+// Session key format: agent:<agentId>:<channel>:<account>:direct:<peerId>
+const sessionKey = `agent:${agentId}:${target.openclaw_channel}:${target.account}:direct:${target.peer_id}`;
+
 enqueueSystemEvent(envelopeText, {
-  sessionKey: `agent-bridge:${fromMachine}`,
+  sessionKey,
   contextKey: fromMachine,
-  trusted: true,
+  trusted: false,            // SSH pairing is not a first-party trust boundary
 });
+
+// Wake an idle session so the inbound event is processed now instead of
+// waiting for the next natural heartbeat. Optional — the helper isn't
+// present on every plugin-sdk version.
+requestHeartbeatNow?.({ sessionKey, reason: "agent-bridge:inbound" });
 ```
 
+`deliveryContext` is intentionally omitted — letting the target session's
+own `lastChannel` drive reply routing is simpler and means the bridge
+message round-trips through Telegram naturally.
+
 The envelope is formatted as a `<channel source="agent-bridge" from="..."
-to="..." message_id="..." ts="..." reply_to="...">content</channel>` block.
-This is intentional parity with the Claude Code channel plugin so the agent
-sees the same message shape on both sides of the bridge.
+to="..." target="..." message_id="..." ts="..." reply_to="...">content</channel>`
+block. This is intentional parity with the Claude Code channel plugin so
+the agent sees the same message shape on both sides of the bridge.
+
+### Per-target subdir routing
+
+v2.1.0 watches `~/.agent-bridge/inbox/openclaw/<targetName>/*.json` for
+each entry in the `targets` config map. Subdir name → target config →
+session key → running session. Adding a new Telegram bot means adding one
+entry to `targets` in `openclaw.json`; the gateway hot-reloads and the
+watcher starts polling the new subdir on the next cycle.
+
+Legacy flat-file messages (landing in `inbox/*.json` or `inbox/openclaw/*.json`
+with no subdir) are moved to `inbox/.failed/_unrouted/` on every scan —
+there is no default routing.
 
 ## Outbound replies
 
@@ -83,26 +113,15 @@ When the agent replies in-turn, OpenClaw's reply pipeline calls our
 The remote's file watcher / Claude Code channel plugin picks it up and
 pushes it into its running session. Round-trip complete.
 
-## Fan-out (future work)
+## Fan-out (superseded by session injection in v2.1.0)
 
-The task brief mentioned fan-out to BOTH telegram AND the bridge sender.
-OpenClaw's reply pipeline already supports routing a single reply to
-multiple channels via binding rules — the right way to fan out is a binding
-rule, not a custom adapter. Config shape (not yet wired):
-
-```json
-"bindings": [
-  {
-    "agentId": "main",
-    "match": { "channel": "agent-bridge" },
-    "announce": { "channels": ["telegram:default"] }
-  }
-]
-```
-
-The `fanOutChannel`/`fanOutAccount` config keys are scaffolded in
-`openclaw.plugin.json` so they can be wired once the binding pipeline is
-exposed to channel plugins directly.
+In v2.0.x the plan was to fan-out replies to BOTH Telegram AND the bridge
+sender via OpenClaw's binding rules. v2.1.0 takes a simpler approach:
+inject the inbound message directly into the Telegram-bound session so the
+reply travels back through Telegram on its own. The `fanOutChannel`/
+`fanOutAccount` config keys are still recognised for backward compatibility
+but are considered deprecated — use `targets.<name>` with an
+`openclaw_channel` of `"telegram"` instead.
 
 ## File layout
 

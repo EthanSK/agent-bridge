@@ -18,6 +18,8 @@ import {
   getMachine,
   getLocalMachineName,
   DEFAULT_TTL_SECONDS,
+  CLAUDE_CODE_TARGET,
+  isValidTarget,
 } from './config.js';
 import { sshExec, sshPing } from './ssh.js';
 import {
@@ -148,10 +150,22 @@ export function registerTools(server: McpServer): void {
     {
       title: 'Send Message',
       description:
-        'Send a message to a running agent on another machine. The message is delivered to their inbox via SSH and will be pushed into their conversation automatically (Claude Code channel mode) or available when they call bridge_receive_messages (polling mode).',
+        'Send a message to a running agent on another machine. The message is delivered to their per-target inbox subdir via SSH and pushed into the matching agent harness:\n'
+        + '  • target="claude-code"           — Claude Code channel plugin (default for cross-machine Claude ↔ Claude)\n'
+        + '  • target="openclaw/default"      — OpenClaw @ClawdStationMiniBot running Telegram session\n'
+        + '  • target="openclaw/clawdiboi2"   — OpenClaw @Clawdiboi2bot running Telegram session\n'
+        + '  • target="openclaw/clordlethird" — OpenClaw @ClordLeThirdBot running Telegram session\n'
+        + '  • target="<harness>/<name>"      — any other configured harness\n\n'
+        + 'The target field is REQUIRED as of agent-bridge 3.4.0 — there is intentionally no default routing. '
+        + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup.',
       inputSchema: {
         machine: z.string().describe('Name of the target machine'),
         message: z.string().describe('The message content to send'),
+        target: z
+          .string()
+          .describe(
+            'Required. Slash-delimited routing target, e.g. "claude-code", "openclaw/clawdiboi2". Determines which inbox subdir on the remote the message lands in, and which listener picks it up.',
+          ),
         reply_to: z
           .string()
           .optional()
@@ -164,7 +178,7 @@ export function registerTools(server: McpServer): void {
           ),
       },
     },
-    async ({ machine: machineName, message, reply_to, ttl }) => {
+    async ({ machine: machineName, message, target, reply_to, ttl }) => {
       const machine = getMachine(machineName);
       if (!machine) {
         const all = loadConfig();
@@ -179,6 +193,23 @@ export function registerTools(server: McpServer): void {
         };
       }
 
+      // Validate target up-front so we return a helpful error rather than
+      // letting sendMessage throw deep in the SCP path.
+      if (!target || !isValidTarget(target)) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `Missing/invalid target. The target field is REQUIRED as of agent-bridge 3.4.0 — there is no default routing. `
+                + `Use "claude-code" for Claude Code ↔ Claude Code, or "openclaw/<account>" for an OpenClaw Telegram session. `
+                + `Got: ${JSON.stringify(target ?? null)}.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const localName = getLocalMachineName();
       const msg = createMessage(
         localName,
@@ -187,6 +218,8 @@ export function registerTools(server: McpServer): void {
         message,
         reply_to ?? null,
         ttl ?? DEFAULT_TTL_SECONDS,
+        target,
+        CLAUDE_CODE_TARGET,
       );
 
       try {
@@ -195,19 +228,19 @@ export function registerTools(server: McpServer): void {
           content: [
             {
               type: 'text' as const,
-              text: `Message sent to ${machineName} (id: ${msg.id})`,
+              text: `Message sent to ${machineName} target=${target} (id: ${msg.id})`,
             },
           ],
         };
       } catch (err) {
         const errMsg =
           err instanceof Error ? err.message : String(err);
-        logError(`Failed to send message to ${machineName}: ${errMsg}`);
+        logError(`Failed to send message to ${machineName} target=${target}: ${errMsg}`);
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Failed to send message to ${machineName}: ${errMsg}`,
+              text: `Failed to send message to ${machineName} target=${target}: ${errMsg}`,
             },
           ],
           isError: true,

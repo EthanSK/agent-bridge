@@ -14,9 +14,17 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { readdirSync, readFileSync, existsSync, mkdirSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { join } from 'path';
-import { INBOX_DIR } from './config.js';
+import { CLAUDE_CODE_TARGET, UNROUTED_DIR, inboxSubdir, isValidTarget } from './config.js';
+
+/**
+ * The inbox subdir this watcher owns. As of mcp-server 3.4.0 the watcher
+ * scopes to `inbox/claude-code/` instead of the flat root inbox. Other
+ * harnesses (openclaw-channel etc.) watch their own subdirs independently.
+ */
+const CLAUDE_CODE_INBOX_DIR = inboxSubdir(CLAUDE_CODE_TARGET);
+const INBOX_DIR = CLAUDE_CODE_INBOX_DIR;
 import { logInfo, logError, logDebug, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 import { invalidateCache, notifyNewFiles, setWatcherStatus, isDelivered, markDelivered } from './inbox.js';
@@ -28,7 +36,7 @@ type MessageCallback = (files: string[]) => void;
  * Callback invoked with a parsed BridgeMessage when a new inbox file arrives.
  * Used to push channel notifications into the running Claude session.
  */
-type ChannelNotifyCallback = (message: BridgeMessage) => void;
+type ChannelNotifyCallback = (message: BridgeMessage) => void | Promise<void>;
 
 let watcherProcess: ChildProcess | null = null;
 let pollInterval: ReturnType<typeof setInterval> | null = null;
@@ -66,6 +74,21 @@ let savedChannelCallback: ChannelNotifyCallback | null = null;
  * Marks the message as delivered to avoid re-emitting on next startup.
  * Errors are logged but never thrown — the watcher must keep running.
  */
+function quarantineUnrouted(fileName: string, reason: string): void {
+  const filePath = join(INBOX_DIR, fileName);
+  try {
+    if (!existsSync(UNROUTED_DIR)) {
+      mkdirSync(UNROUTED_DIR, { recursive: true, mode: 0o700 });
+    }
+    renameSync(filePath, join(UNROUTED_DIR, fileName));
+    knownFiles.delete(fileName);
+    invalidateCache();
+    logWarn(`Channel: moved ${fileName} to .failed/_unrouted/: ${reason}`);
+  } catch (err) {
+    logError(`Channel: failed to quarantine ${fileName}: ${err}`);
+  }
+}
+
 function emitChannelNotification(fileName: string): void {
   if (!savedChannelCallback) return;
 
@@ -76,6 +99,14 @@ function emitChannelNotification(fileName: string): void {
     const msg = JSON.parse(raw) as BridgeMessage;
     if (!msg.id || !msg.timestamp || !msg.content) {
       logWarn(`Channel: skipping malformed message file ${fileName}`);
+      return;
+    }
+    if (!msg.target || !isValidTarget(msg.target)) {
+      quarantineUnrouted(fileName, `missing/invalid target ${JSON.stringify(msg.target ?? null)}`);
+      return;
+    }
+    if (msg.target !== CLAUDE_CODE_TARGET) {
+      quarantineUnrouted(fileName, `target ${JSON.stringify(msg.target)} does not match ${CLAUDE_CODE_TARGET}`);
       return;
     }
     // Skip if already delivered in a previous session
@@ -95,8 +126,13 @@ function emitChannelNotification(fileName: string): void {
         content_length: msg.content?.length ?? 0,
       },
     });
-    savedChannelCallback(msg);
-    markDelivered(msg.id);
+    Promise.resolve(savedChannelCallback(msg))
+      .then(() => {
+        markDelivered(msg.id);
+      })
+      .catch((err) => {
+        logError(`Channel: notification callback failed for ${msg.id}: ${err}`);
+      });
   } catch (err) {
     logError(`Channel: failed to emit notification for ${fileName}: ${err}`);
   }
@@ -300,18 +336,22 @@ function setupInotifywaitHandler(
       .split('\n')
       .filter(f => f.endsWith('.json'));
     if (files.length > 0) {
+      const newFiles: string[] = [];
       for (const f of files) {
+        if (knownFiles.has(f)) continue;
         addKnownFile(f);
+        newFiles.push(f);
       }
-      notifyNewFiles(files);
+      if (newFiles.length === 0) return;
+      notifyNewFiles(newFiles);
       invalidateCache();
 
       // Emit channel notifications for each new message
-      for (const f of files) {
+      for (const f of newFiles) {
         emitChannelNotification(f);
       }
 
-      callback(files.map(f => join(INBOX_DIR, f)));
+      callback(newFiles.map(f => join(INBOX_DIR, f)));
     }
   });
 
@@ -373,6 +413,8 @@ export async function startWatcher(
       '-0',
       '--event',
       'Created',
+      '--event',
+      'Renamed',
       INBOX_DIR,
     ]);
 
@@ -395,7 +437,9 @@ export async function startWatcher(
     const proc = await trySpawn('inotifywait', [
       '-m',
       '-e',
-      'create',
+      'moved_to',
+      '-e',
+      'close_write',
       '--format',
       '%f',
       INBOX_DIR,
@@ -429,8 +473,9 @@ export async function startWatcher(
  * Call this AFTER the MCP server is connected so that
  * `notifications/claude/channel` can actually be sent.
  */
-export function replayUndeliveredMessages(): void {
-  if (!savedChannelCallback) {
+export async function replayUndeliveredMessages(): Promise<void> {
+  const channelCallback = savedChannelCallback;
+  if (!channelCallback) {
     logWarn('Replay: no channel callback registered, skipping');
     return;
   }
@@ -450,6 +495,13 @@ export function replayUndeliveredMessages(): void {
         const raw = readFileSync(filePath, 'utf8');
         const msg = JSON.parse(raw) as BridgeMessage;
         if (!msg.id || !msg.timestamp || !msg.content) continue;
+        if (!msg.target || !isValidTarget(msg.target) || msg.target !== CLAUDE_CODE_TARGET) {
+          quarantineUnrouted(
+            fileName,
+            `replay target ${JSON.stringify(msg.target ?? null)} is not ${CLAUDE_CODE_TARGET}`,
+          );
+          continue;
+        }
         if (isDelivered(msg.id)) continue;
         undelivered.push({ fileName, msg });
       } catch {
@@ -472,8 +524,12 @@ export function replayUndeliveredMessages(): void {
 
     for (const { fileName, msg } of undelivered) {
       logInfo(`Replay: pushing message ${msg.id} from ${msg.from} (ts: ${msg.timestamp})`);
-      savedChannelCallback(msg);
-      markDelivered(msg.id);
+      try {
+        await channelCallback(msg);
+        markDelivered(msg.id);
+      } catch (err) {
+        logError(`Replay: failed to push ${fileName}: ${err}`);
+      }
     }
 
     logInfo(`Replay: completed, ${undelivered.length} message(s) delivered`);

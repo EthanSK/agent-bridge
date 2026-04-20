@@ -9,6 +9,7 @@
  */
 
 import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -218,6 +219,15 @@ function sleep(ms: number): Promise<void> {
  * including connection timeouts.
  */
 const RETRY_BACKOFFS_MS = [0, 500, 1500] as const;
+
+function shellDoubleQuotePath(path: string): string {
+  const escapeDoubleQuoted = (value: string): string =>
+    value.replace(/(["\\$`])/g, '\\$1');
+  if (path.startsWith('~/')) {
+    return `"${'${HOME}'}/${escapeDoubleQuoted(path.slice(2))}"`;
+  }
+  return `"${escapeDoubleQuoted(path)}"`;
+}
 
 /**
  * Resolve the endpoint tuple for a given path attempt.
@@ -441,15 +451,20 @@ export async function sshWriteFile(
   // Base64-encode the content to avoid shell escaping issues with quotes,
   // newlines, backslashes, dollar signs, etc. in JSON payloads.
   const b64 = Buffer.from(content, 'utf8').toString('base64');
-  // Replace a leading `~` with `$HOME` so the remote shell expands it correctly.
-  // Single-quoting a path that starts with `~` prevents tilde expansion, causing
-  // files to land in a literal `~/` directory instead of the user's home dir.
-  const expandedPath = remotePath.startsWith('~/')
-    ? `$HOME/${remotePath.slice(2)}`
-    : remotePath;
-  // Use double-quotes around the path so $HOME is expanded by the remote shell.
-  // base64 output only contains [A-Za-z0-9+/=] so single-quoting is safe there.
-  const command = `mkdir -p "$(dirname "${expandedPath}")" && echo '${b64}' | base64 -d > "${expandedPath}"`;
+  const destExpr = shellDoubleQuotePath(remotePath);
+  const tmpName = `.agent-bridge-${randomUUID()}.tmp`;
+  // Write to a hidden temp file in the target directory and atomically rename
+  // it into place. Native watchers listen for *.json creation, so direct writes
+  // can expose partial JSON and lose a message if the watcher quarantines it.
+  const command = [
+    `dest=${destExpr}`,
+    'dir="$(dirname "$dest")"',
+    `tmp="$dir/${tmpName}"`,
+    'mkdir -p "$dir"',
+    'trap \'rm -f "$tmp"\' EXIT',
+    `echo '${b64}' | base64 -d > "$tmp"`,
+    'mv -f "$tmp" "$dest"',
+  ].join(' && ');
   return sshExec(machine, command, timeoutMs);
 }
 

@@ -121,11 +121,16 @@ agent-bridge run MacBook-Pro "brew update && brew upgrade"
 
 ### Talk to the RUNNING remote agent
 
-Use the channel plugin's `bridge_send_message` MCP tool:
+Use the channel plugin's `bridge_send_message` MCP tool. **As of mcp-server 3.4.0, the `target` parameter is required** — there is no default routing:
 
 ```
-bridge_send_message("MacBook-Pro", "review the code in ~/Projects/myapp and suggest improvements")
+bridge_send_message({ machine: "MacBook-Pro", message: "review the code in ~/Projects/myapp and suggest improvements", target: "claude-code" })
 ```
+
+Targets decide which listener on the receiving machine picks up the message:
+- `"claude-code"` — Claude Code channel plugin (cross-machine Claude ↔ Claude)
+- `"openclaw/<account>"` — injects into the OpenClaw Telegram session for `<account>`; replies go back to Telegram, not over the bridge
+- `"<harness>/<name>"` — any other configured harness/subdir
 
 The message is pushed into the running Claude session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event. Its reply comes back the same way. This is the only supported agent-to-agent communication path.
 
@@ -178,10 +183,10 @@ agent-bridge run MacBook-Pro "cd ~/Projects/myapp && git pull && npm install && 
 From inside your agent session (with the channel plugin loaded):
 
 ```
-bridge_send_message("MacBook-Pro", "review the code in ~/Projects/myapp/src/ and suggest improvements")
+bridge_send_message({ machine: "MacBook-Pro", message: "review the code in ~/Projects/myapp/src/ and suggest improvements", target: "claude-code" })
 ```
 
-The running remote agent receives it in-context and replies via `bridge_send_message` back to this machine.
+The running remote agent receives it in-context and replies via `bridge_send_message` back to this machine (also with an explicit `target`).
 
 ### "Check what's running on my other machine"
 ```bash
@@ -214,11 +219,13 @@ No polling needed -- respond using `bridge_send_message`.
 
 ### Messaging workflow (polling mode)
 
-For harnesses without channel support (Codex, Gemini, OpenClaw, etc.):
-1. Machine A's agent calls `bridge_send_message("MacBookPro", "check the test results")`
-2. The message is written to Machine B's `~/.agent-bridge/inbox/` via SSH
+For harnesses without channel support (Codex, Gemini, Aider, etc.):
+1. Machine A's agent calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code" })`
+2. The message is written to Machine B's per-target inbox subdir (e.g. `~/.agent-bridge/inbox/claude-code/<id>.json`) via SSH
 3. Machine B's agent calls `bridge_receive_messages()` to read it
-4. Machine B responds via `bridge_send_message` back to Machine A
+4. Machine B responds via `bridge_send_message` back to Machine A with an explicit `target`
+
+OpenClaw is handled differently — its gateway has the openclaw-channel plugin installed, which watches `inbox/openclaw/<target>/` and injects inbound messages into the matching running Telegram session. See `openclaw-channel/README.md`.
 
 ### MCP server setup
 

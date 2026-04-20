@@ -80,14 +80,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.3.0', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.4.0', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.3.0',
+      version: '3.4.0',
     },
     {
       capabilities: {
@@ -105,7 +105,7 @@ async function main(): Promise<void> {
         'Incoming messages from other machines are PUSHED into this conversation automatically.',
         'They appear as: <channel source="agent-bridge" from="MachineName" message_id="..." ts="...">content</channel>',
         'You do NOT need to poll — messages arrive in real time when the remote agent sends them.',
-        'Respond using the bridge_send_message tool, passing the sender\'s machine name.',
+        'Respond using the bridge_send_message tool, passing the sender\'s machine name and an explicit target. If the incoming message metadata includes from_target, use that as the reply target.',
         '',
         'Available tools:',
         '- bridge_list_machines: List paired machines and their connection details',
@@ -120,7 +120,7 @@ async function main(): Promise<void> {
         '1. Machine A\'s Claude calls bridge_send_message to deliver a message to Machine B via SSH',
         '2. Machine B\'s file watcher detects the new message file',
         '3. Machine B\'s channel plugin pushes the message into the running Claude session',
-        '4. Machine B\'s Claude sees it and responds via bridge_send_message back to Machine A',
+        '4. Machine B\'s Claude sees it and responds via bridge_send_message back to Machine A with target="claude-code"',
         '',
         'All communication is authenticated via SSH keys (managed in ~/.agent-bridge/keys/).',
         'Messages have a TTL (default 1 hour). Expired messages are auto-pruned.',
@@ -128,6 +128,7 @@ async function main(): Promise<void> {
         '',
         'HOW TO TALK TO THE OTHER AGENT:',
         'bridge_send_message is the ONLY supported way to communicate with the running agent on another machine. When your user says "ask Claude on <machine>", "talk to <machine>", "check in with the other agent", "have a conversation", or anything in that spirit — they mean send a NATURAL-LANGUAGE message via bridge_send_message, as if you were speaking to a colleague. NOT a structured ping, status probe, or machine-readable payload. Write the message in English (or whatever language the conversation is in) the same way you would answer the user directly.',
+        'As of agent-bridge 3.4.0, bridge_send_message requires target. Use an incoming from_target value when present; otherwise use target="claude-code" for Claude Code on the remote machine, or target="openclaw/<account>" for an OpenClaw Telegram session.',
         'There is NO other mechanism for agent-to-agent communication in this system. Do not attempt to shell out to `claude --print`, `codex exec`, `agent-bridge run <machine> "..." --claude`, or any other command that spawns a fresh non-interactive agent session on the remote machine. Those fresh-spawn wrappers were intentionally removed in agent-bridge 3.0.0 — they defeat the entire purpose of this plugin, which is to connect EXISTING, already-running agent sessions.',
         'Use bridge_run_command ONLY for plain shell diagnostics (check a process, read a file, look at a log, run `git status`) — never as a substitute for asking the remote agent a question, and never to invoke an agent CLI like `claude`, `codex`, or `aider` on the remote machine.',
         'Use bridge_status / bridge_inbox_stats ONLY when the user is asking about connectivity or queue health — never instead of actually asking the other agent how things are going.',
@@ -164,7 +165,7 @@ async function main(): Promise<void> {
         },
       });
 
-      server.server.notification({
+      return server.server.notification({
         method: 'notifications/claude/channel',
         params: {
           content: message.content,
@@ -172,6 +173,8 @@ async function main(): Promise<void> {
             from: message.from,
             to: message.to,
             message_id: message.id,
+            ...(message.target ? { target: message.target } : {}),
+            ...(message.fromTarget ? { from_target: message.fromTarget } : {}),
             type: message.type,
             ts: message.timestamp,
             ...(message.replyTo ? { reply_to: message.replyTo } : {}),
@@ -187,6 +190,7 @@ async function main(): Promise<void> {
           msg: `Failed to push channel notification for ${message.id}`,
           context: { msg_id: message.id, from: message.from, error: String(err) },
         });
+        throw err;
       });
     },
   );
@@ -205,7 +209,7 @@ async function main(): Promise<void> {
   // Replay any messages that arrived while Claude was offline.
   // This must happen AFTER server.connect() so channel notifications
   // can actually be delivered to the client.
-  replayUndeliveredMessages();
+  void replayUndeliveredMessages();
 
   // Clean shutdown. Triggered by:
   //   - SIGINT / SIGTERM / SIGHUP (explicit signals from parent)

@@ -39,13 +39,19 @@ agent-bridge pair --name "<name>" --host "<ip>" --port <port> --user "<user>" --
 
 ## Talking to the running remote agent
 
-Use `bridge_send_message` from the MCP server:
+Use `bridge_send_message` from the MCP server. **As of mcp-server 3.4.0 the `target` parameter is REQUIRED** — there is no default routing:
 
 ```
-bridge_send_message("MacBook", "fix the failing tests in ~/Projects/myapp")
+bridge_send_message({ machine: "MacBook", message: "fix the failing tests", target: "claude-code" })
+bridge_send_message({ machine: "MacBook", message: "what's up?",            target: "openclaw/clawdiboi2" })
 ```
 
-The message is delivered to `~/.agent-bridge/inbox/` on the remote machine over SSH. The running agent's file watcher picks it up and pushes it into the live session as a `<channel source="agent-bridge" ...>` event — no new agent is spawned.
+Each target maps to a subdir under `~/.agent-bridge/inbox/` on the remote (`inbox/claude-code/`, `inbox/openclaw/clawdiboi2/`, …) and a specific listener picks it up:
+
+- `target: "claude-code"` → Claude Code channel plugin pushes the message into the running Claude session as a `<channel source="agent-bridge" ...>` event.
+- `target: "openclaw/<account>"` → openclaw-channel plugin injects the message into the OpenClaw Telegram session for `<account>` via `enqueueSystemEvent`. Replies land in the matching Telegram chat (e.g. @Clawdiboi2bot) because the session's `lastChannel` is Telegram, not the bridge.
+
+Calls without `target` are rejected. Legacy flat-file messages that land at the root of `inbox/` are moved to `inbox/.failed/_unrouted/` on next startup.
 
 There is no fresh-spawn / `--print` equivalent. The old `agent-bridge run ... --claude` flag was removed in 3.0.0.
 
@@ -54,7 +60,12 @@ There is no fresh-spawn / `--print` equivalent. The old `agent-bridge run ... --
 - Config directory: `~/.agent-bridge/`
 - Config file: `~/.agent-bridge/config` (INI-style, one `[section]` per machine)
 - Keys: `~/.agent-bridge/keys/` (ED25519, mode 600)
-- Inbox: `~/.agent-bridge/inbox/` (incoming messages, JSON files)
+- Inbox: `~/.agent-bridge/inbox/` — per-harness/per-target subdirs (3.4.0+):
+  - `inbox/claude-code/` — watched by the Claude Code channel plugin
+  - `inbox/openclaw/<target>/` — watched by the openclaw-channel plugin
+  - `inbox/.archive/<target>/` — delivered messages retained for debug
+  - `inbox/.failed/<target>/` — malformed messages, per target
+  - `inbox/.failed/_unrouted/` — messages with no `target` field, quarantined
 - Outbox: `~/.agent-bridge/outbox/` (copies of sent messages)
 - Logs: `~/.agent-bridge/logs/` (MCP server logs, auto-rotated)
 - No cloud, no dependencies -- pure bash over SSH
@@ -166,6 +177,13 @@ All messages are delivered via SSH with key-based authentication. The `authentic
   "content": "The tests are passing now.",
   "timestamp": "2026-04-13T01:15:00Z",
   "replyTo": null,
-  "ttl": 3600
+  "ttl": 3600,
+  "target": "claude-code"
 }
 ```
+
+The `target` field (added in 3.4.0) decides which inbox subdir on the receiver the message lands in, and therefore which listener consumes it.
+
+### Claude Code per-session targets (future work)
+
+Ideally each Claude Code session would identify itself with a flag (e.g. `claude --agent-bridge-target laptop-main`) so its channel plugin could watch a tighter subdir like `inbox/claude-code/laptop-main/`. That requires upstream support in `anthropics/claude-plugins-official/telegram` and is tracked as future work — for now all Claude Code sessions on a given machine share the `inbox/claude-code/` subdir.
