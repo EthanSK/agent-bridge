@@ -34,7 +34,14 @@ export function parseBridgeMessage(raw) {
   for (const k of required) {
     if (typeof obj[k] !== "string" || !obj[k]) return null;
   }
-  if (obj.timestamp != null && typeof obj.timestamp !== "number") return null;
+  // timestamp is permitted as a number (epoch ms) or an ISO-8601 string.
+  if (
+    obj.timestamp != null &&
+    typeof obj.timestamp !== "number" &&
+    typeof obj.timestamp !== "string"
+  ) {
+    return null;
+  }
   return obj;
 }
 
