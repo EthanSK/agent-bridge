@@ -1,6 +1,30 @@
 /**
  * OpenClaw plugin entry point for @agent-bridge/openclaw-channel.
  *
+ * v2.3.0 — replyVia mode (2026-04-20)
+ * ------------------------------------
+ * Inbound bridge messages can now be dispatched into EITHER of two session
+ * topologies depending on `target.replyVia` (or the plugin-level default):
+ *
+ *   replyVia: "telegram" (default) — the original v2.2.x behaviour. Inbound
+ *     message injects into `agent:main:telegram:<account>:direct:<peerId>`
+ *     with Provider/OriginatingChannel=telegram, so the agent's reply flows
+ *     back through the live Telegram outbound and Ethan's phone pings.
+ *
+ *   replyVia: "agent-bridge" — peer-to-peer back-channel. Inbound message
+ *     injects into `agent:main:agent-bridge:default:direct:<senderMachine>`
+ *     with Provider/OriginatingChannel=agent-bridge, so the agent's reply
+ *     flows back through the NATIVE agent-bridge channel (channel-plugin.js
+ *     :: sendText), which SCPs a BridgeMessage to the sender machine. No
+ *     Telegram traffic is generated. Use for agent-to-agent conversations
+ *     that should be invisible to Ethan's phone.
+ *
+ *   Precedence: per-target override > plugin-level `replyVia` > "telegram".
+ *   Per-message override: an inbound BridgeMessage can include
+ *   `replyVia: "agent-bridge"` | `"telegram"` to flip the mode for a single
+ *   message without reconfiguring the target. Sender-controlled overrides
+ *   are sometimes useful for quick back-channel probes.
+ *
  * v2.2.0 — Architectural correction (2026-04-20)
  * ------------------------------------------------
  * STOP using `enqueueSystemEvent`. It's pure queueing: it prepends a
@@ -17,25 +41,19 @@
  * native IRC and Nextcloud Talk channel plugins use, and which drives the
  * same `dispatchReplyFromConfig` path the native telegram bot drives.
  * This actually runs a synchronous agent turn for our synthetic
- * ctxPayload, and replies are routed back through the live telegram
- * outbound because we set `Provider: "telegram"` + `OriginatingChannel:
- * "telegram"` + `OriginatingTo: "telegram:<peerId>"` on the ctxPayload
- * (see `route-reply-CQe8rYFT.js:17-23` docstring re: originating-channel
- * priority).
+ * ctxPayload, and replies are routed back through the originating channel
+ * because we set `Provider` + `OriginatingChannel` + `OriginatingTo` on
+ * the ctxPayload (see `route-reply-CQe8rYFT.js:17-23` docstring re:
+ * originating-channel priority).
  *
  * References:
  * - Dispatch primitive source: `plugin-sdk/inbound-reply-dispatch-0KQ4b86b.js:29-65`
  * - IRC reference impl: `extensions/irc/src/inbound.ts:278-362`
  * - sessionKey shape (for dmScope=per-account-channel-peer):
- *   `agent:main:telegram:<account>:direct:<peerId>`
+ *   `agent:main:<channel>:<account>:direct:<peerId>`
  *   (built automatically by `runtime.channel.routing.resolveAgentRoute`
  *   via `plugin-sdk/session-key-CbP51u9x.js:175` — do NOT hand-build it;
  *   Ethan's live dmScope setting might change)
- *
- * Cross-machine agent-bridge outbound (when a paired peer is ALSO
- * agent-bridge-aware rather than going via telegram) still uses the
- * separately-registered `agent-bridge` channel + SCP outbound — see
- * `channel-plugin.js`. That path is retained for completeness.
  */
 
 import { homedir } from "node:os";
@@ -179,15 +197,22 @@ export default {
             const body = formatInboundBody(msg);
             const rawContent = String(msg.content ?? "");
 
-            const targetChannel = target.config.openclaw_channel ?? "telegram";
-            const account = target.config.account ?? target.name;
-            const peerId = target.config.peer_id;
+            // Resolve replyVia mode. Precedence:
+            //   1. Per-message `msg.replyVia` (sender-controlled override).
+            //   2. Per-target `target.config.replyVia`.
+            //   3. Plugin-level `pluginCfg.replyVia`.
+            //   4. Default: "telegram".
+            const replyVia = normalizeReplyVia(
+              msg.replyVia
+                ?? target.config.replyVia
+                ?? pluginCfg.replyVia
+                ?? "telegram",
+              log,
+              target.name,
+            );
 
-            if (!peerId) {
-              throw new Error(
-                `target "${target.name}" has no peer_id — cannot resolve session`,
-              );
-            }
+            const account = target.config.account ?? target.name;
+            const telegramPeerId = target.config.peer_id;
 
             // Legacy: targets flagged as legacy_session bypass session
             // injection and rely purely on the native agent-bridge channel.
@@ -208,13 +233,42 @@ export default {
               return;
             }
 
+            // Figure out the targetChannel + peer identity to inject as.
+            //   telegram mode:    channel=telegram, peer=<Ethan's telegram id>
+            //   agent-bridge mode: channel=agent-bridge, peer=<sender machine>
+            let targetChannel;
+            let peerId;
+            if (replyVia === "agent-bridge") {
+              targetChannel = AGENT_BRIDGE_CHANNEL_ID; // "agent-bridge"
+              peerId = String(fromMachine);
+              if (!peerId || peerId === "unknown") {
+                throw new Error(
+                  `replyVia=agent-bridge target="${target.name}": cannot resolve sender machine from msg.from — refusing to dispatch`,
+                );
+              }
+            } else {
+              targetChannel = target.config.openclaw_channel ?? "telegram";
+              peerId = telegramPeerId;
+              if (!peerId) {
+                throw new Error(
+                  `target "${target.name}" has no peer_id — cannot resolve session`,
+                );
+              }
+            }
+
             // Resolve the canonical agent route. This uses the SDK's
             // dmScope-aware session-key builder (session-key-CbP51u9x.js:175),
             // so we don't need to hand-build the key.
+            //
+            // In agent-bridge mode the `accountId` parameter is our native
+            // channel's implicit "default" account (see channel-plugin.js ::
+            // DEFAULT_ACCOUNT_ID), not the OpenClaw target name.
+            const routeAccountId =
+              replyVia === "agent-bridge" ? "default" : account;
             const route = runtime.channel.routing.resolveAgentRoute({
               cfg: hostCfg,
               channel: targetChannel,
-              accountId: account,
+              accountId: routeAccountId,
               peer: {
                 kind: "direct",
                 id: String(peerId),
@@ -228,8 +282,9 @@ export default {
 
             // Build the synthetic inbound ctxPayload. Provider/Surface and
             // OriginatingChannel/OriginatingTo steer the reply back through
-            // the live telegram outbound — exactly how a real inbound
-            // telegram message looks to dispatchReplyFromConfig.
+            // the chosen outbound (Telegram's or our native agent-bridge
+            // channel's) — same mechanism either way, just different
+            // targetChannel.
             const ctxPayload = runtime.channel.reply.finalizeInboundContext({
               Body: body,
               RawBody: rawContent,
@@ -256,9 +311,15 @@ export default {
               // content is untrusted, so we don't flip it on.
             });
 
-            // Track reply target in case the agent DOES reply through the
-            // native agent-bridge channel (cross-harness flows).
-            const ownTarget = `${AGENT_BRIDGE_CHANNEL_ID.includes("openclaw") ? "" : "openclaw/"}${target.name}`;
+            // Track reply target so the outbound adapters can route correctly:
+            //  - In telegram mode, our native agent-bridge channel is NOT on
+            //    the outbound path; this map entry is a belt-and-braces hint
+            //    in case the agent replies via our channel tool by hand.
+            //  - In agent-bridge mode, our channel-plugin.js :: sendText
+            //    consults this map (via ctx.threadId/accountId/to hints) to
+            //    resolve `fromMachine` for the SCP destination. The key
+            //    MUST include the sessionKey AND the sender machine, which
+            //    registerReplyTarget already does.
             registerReplyTarget(replyTargets, {
               sessionKey: route.sessionKey,
               fromMachine,
@@ -268,7 +329,7 @@ export default {
             });
 
             log.info(
-              `about to dispatch ${msg.id} from ${fromMachine} target=${target.name} `
+              `about to dispatch ${msg.id} from ${fromMachine} target=${target.name} replyVia=${replyVia} `
               + `route.sessionKey=${route.sessionKey} channel=${targetChannel} accountId=${route.accountId}`,
             );
 
@@ -283,10 +344,11 @@ export default {
                 core: runtime,
                 deliver: async (payload) => {
                   // For targetChannel="telegram" we delegate to the live
-                  // telegram outbound registered on the host. `payload.text`
-                  // is the streamed reply text. Media goes through
-                  // telegram's attachment url list but we intentionally
-                  // keep this to text-only for bridge replies.
+                  // telegram outbound registered on the host. For
+                  // targetChannel="agent-bridge" we delegate to our own
+                  // registered channel's sendText (channel-plugin.js), which
+                  // SCPs a BridgeMessage back to the sender machine. Either
+                  // way it goes through runtime.channel.outbound.loadAdapter.
                   const deliverFn = resolveProviderDeliver({
                     runtime,
                     targetChannel,
@@ -299,6 +361,10 @@ export default {
                   const text = payload?.text ?? "";
                   if (!text.trim()) return;
                   await deliverFn({
+                    // For telegram, `peerId` is the numeric Telegram user id.
+                    // For agent-bridge, `peerId` is the sender machine name,
+                    // which is exactly what channel-plugin.js :: sendText
+                    // expects on ctx.to.
                     to: String(peerId),
                     text,
                     cfg: hostCfg,
@@ -490,11 +556,16 @@ function normalizeExplicitTargets(pluginCfg, log) {
       log.warn(`target "${name}" has no config object — skipping`);
       continue;
     }
+    // Allow agent-bridge replyVia to skip the peer_id requirement — peer
+    // identity comes from the sender machine at message time, not from
+    // config. Telegram replyVia (the default) still needs a peer_id so the
+    // Telegram outbound knows which chat to answer in.
+    const targetReplyVia = cfg.replyVia ?? pluginCfg.replyVia ?? "telegram";
     const peerId = cfg.peer_id ?? pluginPeerId ?? null;
-    if (!peerId) {
+    if (!peerId && targetReplyVia !== "agent-bridge") {
       log.warn(
         `target "${name}" missing peer_id (and no plugin-level fallback `
-        + `pluginConfig.peer_id is set) — skipping`,
+        + `pluginConfig.peer_id is set) — skipping. Either add peer_id or set replyVia="agent-bridge".`,
       );
       continue;
     }
@@ -503,6 +574,7 @@ function normalizeExplicitTargets(pluginCfg, log) {
       account: cfg.account ?? name,
       peer_id: peerId,
       agent_id: cfg.agent_id ?? null,
+      replyVia: cfg.replyVia ?? null,
     };
   }
   return out;
@@ -563,10 +635,32 @@ function autoDiscoverFromTelegram({ pluginCfg, openclawGlobalCfg, log }) {
       account: accountName,
       peer_id: String(peerId),
       agent_id: null,
+      // Auto-discovered targets inherit the plugin-level replyVia default
+      // (which falls back to "telegram" at the onMessage boundary). We
+      // don't attempt per-account replyVia discovery — OpenClaw's Telegram
+      // account config doesn't have a natural place for that, and if Ethan
+      // wants per-account back-channel routing he can switch to an
+      // explicit `targets` map.
+      replyVia: null,
       auto_discovered: true,
     };
   }
   return out;
+}
+
+/**
+ * Coerce a replyVia value to a known mode. Unknown values fall back to
+ * "telegram" with a warn log so misconfigurations don't silently reroute.
+ */
+function normalizeReplyVia(raw, log, targetName) {
+  if (raw == null) return "telegram";
+  const v = String(raw).toLowerCase().trim();
+  if (v === "telegram" || v === "agent-bridge") return v;
+  log?.warn?.(
+    `replyVia="${raw}" on target "${targetName}" is not a known mode — `
+    + `falling back to "telegram". Valid values: "telegram", "agent-bridge".`,
+  );
+  return "telegram";
 }
 
 /**

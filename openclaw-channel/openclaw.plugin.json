@@ -40,6 +40,11 @@
         "type": "string",
         "description": "Plugin-level default peer id (e.g. Ethan's Telegram user id '6164541473'). Used as a fallback when a target's own peer_id is missing OR when auto-discovery can't resolve one from the OpenClaw config / allowFrom list. Optional."
       },
+      "replyVia": {
+        "type": "string",
+        "enum": ["telegram", "agent-bridge"],
+        "description": "Plugin-level default reply routing for inbound bridge messages. 'telegram' (default) routes the agent's reply back through the same Telegram chat that injected the session (visible to Ethan's phone). 'agent-bridge' routes the reply back to the SENDER machine via agent-bridge SCP (invisible to Telegram) — use for agent-to-agent back-channel conversations. Per-target overrides win over this default."
+      },
       "targets": {
         "type": "object",
         "description": "OPTIONAL: Map of target-name -> routing config. If present, acts as an advanced override — each target name becomes an inbox subdir at `<inboxRoot>/openclaw/<name>/` and identifies which Telegram account/session to inject bridge messages into. If absent or empty (the default), the plugin AUTO-DISCOVERS one target per entry in `channels.telegram.accounts` on the OpenClaw global config. Peer id resolution: explicit `targets.<name>.peer_id` -> `channels.agent-bridge.config.peer_id` -> `meta.user_id` on the global config -> first chat id in `channels.telegram.accounts[<name>].allowFrom`.",
@@ -64,6 +69,11 @@
             "agent_id": {
               "type": "string",
               "description": "Optional per-target override of the top-level `agentId`."
+            },
+            "replyVia": {
+              "type": "string",
+              "enum": ["telegram", "agent-bridge"],
+              "description": "Override plugin-level `replyVia` for this target. 'telegram' = reply goes out through Telegram (Ethan's phone pings). 'agent-bridge' = reply is SCP'd back to the sender machine as a BridgeMessage (no Telegram traffic). Default: inherits plugin-level, falling back to 'telegram'."
             }
           },
           "required": ["account"]

@@ -1,5 +1,60 @@
 # Changelog
 
+## openclaw-channel 2.3.0 — 2026-04-20
+
+### `replyVia` mode — agent-bridge back-channel for silent agent-to-agent replies
+
+Previously every inbound bridge message that injected into an OpenClaw
+session had its reply routed back through Telegram (so Ethan's phone
+pinged on every agent-to-agent exchange). v2.3.0 introduces a `replyVia`
+routing option that also supports agent-bridge itself as the return
+channel — useful for back-channel conversations that should stay
+invisible to Telegram.
+
+**Config.** Three layers, precedence top-down:
+
+1. Per-message: `BridgeMessage.replyVia = "telegram" | "agent-bridge"`.
+2. Per-target: `channels["agent-bridge"].config.targets.<name>.replyVia`.
+3. Plugin-level default: `channels["agent-bridge"].config.replyVia`.
+4. Fallback: `"telegram"` (preserves v2.2.x semantics exactly).
+
+Unknown `replyVia` values fall back to `"telegram"` with a warn log.
+
+**`replyVia: "telegram"` (default)** — unchanged from v2.2.x. Inbound
+message injects into `agent:main:telegram:<account>:direct:<peerId>`;
+reply flows through the live Telegram outbound; Ethan's phone pings.
+
+**`replyVia: "agent-bridge"`** — inbound message injects into
+`agent:main:agent-bridge:default:direct:<senderMachine>` with
+`Provider`/`OriginatingChannel = "agent-bridge"`. The reply is routed
+through the native `agent-bridge` channel's `sendText` outbound
+(channel-plugin.js), which SCPs a BridgeMessage back to the sender
+machine's inbox. No Telegram traffic is generated.
+
+- `peer_id` becomes optional on agent-bridge-only targets — peer identity
+  comes from `msg.from` at message time, not from config. Telegram-mode
+  targets still require `peer_id`.
+- The registered `replyTargets` hint map already indexes by
+  `sessionKey`, `fromMachine`, and target name, so outbound delivery via
+  our own channel finds the right `{fromMachine}` hit without any extra
+  wiring.
+
+**No changes to `channel-plugin.js`, `outbound.js`, or `envelope.js`
+(beyond docstring updates noting the optional per-message `replyVia`
+field).** The dispatch primitive (`dispatchInboundReplyWithBase`) does
+the heavy lifting by switching the `channel` + `accountId` parameters
+— the rest of the pipeline doesn't need to know which mode it's in.
+
+## agent-bridge repo — 2026-04-20 (infra)
+
+- Added top-level `scripts/update.sh` one-shot updater (git pull → rebuild
+  mcp-server → optional OpenClaw gateway restart → optional Claude Code
+  `/reload-plugins` via the `self-reload-plugins` skill). Idempotent,
+  prompt-guarded, safe to re-run.
+- Added "Updating" section to the top-level `README.md` documenting the
+  three moving parts (CLI script, MCP server, OpenClaw plugin), the helper
+  script, and the manual update path.
+
 ## openclaw-channel 2.2.0 — 2026-04-20
 
 ### Architectural correction — replace `enqueueSystemEvent` with `dispatchInboundReplyWithBase`

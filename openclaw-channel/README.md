@@ -7,6 +7,12 @@ built-in Telegram / Slack / iMessage channels — so cross-machine messages
 flow through OpenClaw's normal inbound/outbound pipelines instead of the
 v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 
+## What's new in v2.3.0
+
+- **`replyVia` per-target routing.** Inbound bridge messages can now route their reply either back through the Telegram chat (default — visible on Ethan's phone) or back over agent-bridge as a BridgeMessage to the sender machine (silent peer-to-peer back-channel). Set it plugin-level (`channels["agent-bridge"].config.replyVia`), per-target (`targets.<name>.replyVia`), or per-message (add `replyVia` to the BridgeMessage JSON). Valid modes: `"telegram"` | `"agent-bridge"`. Unknown values fall back to `"telegram"` with a warn log.
+  - When `replyVia: "agent-bridge"`, peer identity switches from `<telegram-peer-id>` to `<sender-machine-name>` and the session key becomes `agent:main:agent-bridge:default:direct:<sender-machine>`. Replies come back via the native `agent-bridge` channel's outbound SCP adapter (channel-plugin.js :: sendText) instead of the Telegram outbound. No Telegram traffic is generated.
+  - Use-case: a Claude session on one machine asking a Claude session on another for context without Ethan's phone pinging.
+
 ## What's new in v2.2.0
 
 - **Correct dispatch via `dispatchInboundReplyWithBase`.** v2.1.x tried to inject bridge messages with `enqueueSystemEvent`, but that function only prepends a `System:` line to the NEXT naturally-scheduled turn — it does NOT trigger a turn. Every bridge message was silently swallowed unless Ethan happened to DM the real Telegram bot afterwards. v2.2.0 calls `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` — the SAME dispatch primitive the native IRC and Nextcloud Talk channels use — which drives `dispatchReplyFromConfig` exactly like a real Telegram inbound message. Full analysis in [`docs/ACTUAL-SESSION-INJECTION-RESEARCH-2026-04-20.md`](docs/ACTUAL-SESSION-INJECTION-RESEARCH-2026-04-20.md).

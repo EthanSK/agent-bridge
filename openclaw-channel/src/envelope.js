@@ -11,8 +11,12 @@
  *   timestamp: 1712345678901,
  *   replyTo?: "msg-<uuid>",
  *   ttl?: 3600,
- *   target?: "claude-code",            // where the RECEIVER should deliver this
- *   fromTarget?: "openclaw/clawdiboi2" // where the SENDER wants replies routed
+ *   target?: "claude-code",              // where the RECEIVER should deliver this
+ *   fromTarget?: "openclaw/clawdiboi2",  // where the SENDER wants replies routed
+ *   replyVia?: "telegram" | "agent-bridge" // per-message override for how the
+ *                                          // openclaw target should route its
+ *                                          // reply (v2.3.0+). Ignored by the
+ *                                          // claude-code receiver.
  * }
  *
  * `fromTarget` enables bidirectional round-trips (e.g. OpenClaw ↔ Claude Code):
@@ -20,6 +24,14 @@
  * `target` is populated from the ORIGINAL incoming message's `fromTarget`
  * (falling back to "claude-code"). This keeps conversations landing back in
  * the session that started them instead of always flowing into `claude-code/`.
+ *
+ * `replyVia` (v2.3.0+, openclaw-channel-specific) lets the sender force the
+ * replyVia mode on a single incoming message — handy for quick back-channel
+ * probes without reconfiguring the receiver's target. Valid values are
+ * "telegram" (reply goes back through the Telegram chat — Ethan's phone
+ * pings) and "agent-bridge" (reply is SCP'd back as a BridgeMessage, no
+ * Telegram traffic). Unrecognised values fall back to the target's configured
+ * default.
  */
 
 import { randomUUID } from "node:crypto";
