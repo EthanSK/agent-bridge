@@ -56,8 +56,14 @@ As of **v2.1.0** the session key is derived from the per-target config, so
 bridge messages land in the SAME session the user is already talking to on
 Telegram — the agent answers back over Telegram, not back over the bridge.
 
+We use `enqueueSystemEvent` alone, matching the built-in telegram channel's
+pattern. No heartbeat call needed — the event loop picks up queued events
+automatically. (Earlier drafts called `requestHeartbeatNow` after enqueueing;
+verified via direct SDK read on 2026-04-20 that the built-in telegram channel
+doesn't do this, so we dropped it too.)
+
 ```js
-const { enqueueSystemEvent, requestHeartbeatNow } =
+const { enqueueSystemEvent } =
   await import("openclaw/plugin-sdk/infra-runtime");
 
 // Session key format: agent:<agentId>:<channel>:<account>:direct:<peerId>
@@ -68,11 +74,6 @@ enqueueSystemEvent(envelopeText, {
   contextKey: fromMachine,
   trusted: false,            // SSH pairing is not a first-party trust boundary
 });
-
-// Wake an idle session so the inbound event is processed now instead of
-// waiting for the next natural heartbeat. Optional — the helper isn't
-// present on every plugin-sdk version.
-requestHeartbeatNow?.({ sessionKey, reason: "agent-bridge:inbound" });
 ```
 
 `deliveryContext` is intentionally omitted — letting the target session's
@@ -87,14 +88,41 @@ the agent sees the same message shape on both sides of the bridge.
 ### Per-target subdir routing
 
 v2.1.0 watches `~/.agent-bridge/inbox/openclaw/<targetName>/*.json` for
-each entry in the `targets` config map. Subdir name → target config →
-session key → running session. Adding a new Telegram bot means adding one
-entry to `targets` in `openclaw.json`; the gateway hot-reloads and the
-watcher starts polling the new subdir on the next cycle.
+each resolved target. Subdir name → target config → session key → running
+session. Adding a new Telegram bot usually means adding an entry under
+`channels.telegram.accounts` (no `targets` edit required — see auto-
+discovery below); the gateway hot-reloads and the watcher starts polling
+the new subdir on the next cycle.
 
 Legacy flat-file messages (landing in `inbox/*.json` or `inbox/openclaw/*.json`
 with no subdir) are moved to `inbox/.failed/_unrouted/` on every scan —
 there is no default routing.
+
+### Target auto-discovery
+
+If `channels["agent-bridge"].config.targets` is absent or empty, the
+plugin auto-discovers one target per entry in the OpenClaw global config's
+`channels.telegram.accounts` map. Each account name becomes a target
+routing to `telegram:<account>`. Peer ID resolution order per target:
+
+1. `targets.<name>.peer_id` (when the explicit override block is present).
+2. `channels["agent-bridge"].config.peer_id` (plugin-level default).
+3. `meta.user_id` / `meta.owner_id` / `meta.telegram_user_id` on the global config.
+4. First numeric `chat_id` in `channels.telegram.accounts[<name>].allowFrom`.
+
+When none of the above resolves, the target is skipped with a loud warn
+log rather than silently routing to the wrong chat.
+
+### Round-trip replies (fromTarget)
+
+`BridgeMessage` carries an optional `fromTarget` field — the sender's own
+target-id. When OpenClaw replies over the bridge (cross-harness flows
+where the peer isn't a Telegram session), `envelope.buildReply(...)`
+populates the outgoing `target` from `incoming.fromTarget` so the reply
+lands back in the session that started the conversation. The in-memory
+`replyTargets` map now stashes the whole incoming message + the target's
+own `ownTarget = "openclaw/<name>"` so `channel-plugin.js :: sendText`
+can write a correct `{ target, fromTarget }` pair on the reply envelope.
 
 ## Outbound replies
 

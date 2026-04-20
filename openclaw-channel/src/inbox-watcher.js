@@ -28,6 +28,7 @@ import { parseBridgeMessage } from "./envelope.js";
 const DEFAULT_POLL_MS = 2000;
 const DEFAULT_INBOX_ROOT = join(homedir(), ".agent-bridge", "inbox");
 const DEFAULT_LEDGER = join(homedir(), ".agent-bridge", ".openclaw-v2-delivered");
+const DEFAULT_ARCHIVE_ROOT = join(homedir(), ".agent-bridge", "archive", "openclaw");
 const OPENCLAW_HARNESS_PREFIX = "openclaw";
 
 /**
@@ -52,6 +53,7 @@ const OPENCLAW_HARNESS_PREFIX = "openclaw";
 export function startInboxWatcher(opts) {
   const inboxRoot = opts.inboxRoot ?? DEFAULT_INBOX_ROOT;
   const ledgerPath = opts.ledgerPath ?? DEFAULT_LEDGER;
+  const archiveRoot = opts.archiveRoot ?? DEFAULT_ARCHIVE_ROOT;
   const pollMs = Math.max(500, opts.pollIntervalMs ?? DEFAULT_POLL_MS);
   const log = opts.logger ?? console;
   const onMessage = opts.onMessage;
@@ -65,6 +67,7 @@ export function startInboxWatcher(opts) {
   mkdirSync(join(inboxRoot, OPENCLAW_HARNESS_PREFIX), { recursive: true });
   mkdirSync(dirname(ledgerPath), { recursive: true });
   mkdirSync(unroutedDir, { recursive: true });
+  mkdirSync(archiveRoot, { recursive: true });
 
   /** @type {TargetSpec[]} */
   const targets = Object.keys(targetsMap).flatMap((name) => {
@@ -134,14 +137,30 @@ export function startInboxWatcher(opts) {
       }
       if (delivered.has(msg.id)) continue;
 
+      let deliveredOk;
       try {
-        const deliveredOk = await onMessage(msg, { filePath: fullPath, target });
-        if (deliveredOk === false) continue;
-        delivered.add(msg.id);
-        appendLedger(ledgerPath, msg.id);
+        deliveredOk = await onMessage(msg, { filePath: fullPath, target });
       } catch (err) {
         log.error?.(`inbox: dispatch failed for ${target.name}/${msg.id}: ${err?.stack || err}`);
+        // Move to .failed/ so we don't re-process this message every poll.
+        quarantine(fullPath, target.name, failedRoot);
+        continue;
       }
+      if (deliveredOk === false) {
+        // Handler chose to retry later — leave file in place, don't ledger.
+        continue;
+      }
+      // Dispatch succeeded: move file to archive FIRST, then ledger. If the
+      // archive move fails, treat as a failed dispatch (quarantine + don't
+      // ledger) so we don't end up with a ledgered-but-still-present file
+      // that re-blocks the slot.
+      const moved = archiveFile(fullPath, target.name, archiveRoot, log);
+      if (!moved) {
+        quarantine(fullPath, target.name, failedRoot);
+        continue;
+      }
+      delivered.add(msg.id);
+      appendLedger(ledgerPath, msg.id);
     }
   }
 
@@ -251,6 +270,25 @@ function isValidTargetName(name) {
   );
 }
 
+function archiveFile(filePath, targetName, archiveRoot, log) {
+  try {
+    const archiveDir = join(archiveRoot, targetName);
+    mkdirSync(archiveDir, { recursive: true });
+    const base = filePath.split("/").pop();
+    // Prefix with timestamp so multiple processings of the same id never
+    // collide (e.g. after a ledger reset) and to make chronological tailing
+    // trivial.
+    const stamped = `${new Date().toISOString().replace(/[:.]/g, "-")}_${base}`;
+    renameSync(filePath, join(archiveDir, stamped));
+    return true;
+  } catch (err) {
+    log?.warn?.(
+      `inbox: failed to archive ${targetName}/${filePath}: ${err?.message ?? err}`,
+    );
+    return false;
+  }
+}
+
 function quarantine(filePath, targetName, failedRoot) {
   try {
     const failedDir = join(failedRoot, `${OPENCLAW_HARNESS_PREFIX}__${targetName}`);
@@ -270,6 +308,7 @@ function quarantine(filePath, targetName, failedRoot) {
 export const __testing = {
   DEFAULT_INBOX_ROOT,
   DEFAULT_LEDGER,
+  DEFAULT_ARCHIVE_ROOT,
   UNROUTED_SUBDIR: unroutedSubdir(DEFAULT_INBOX_ROOT),
   OPENCLAW_HARNESS_PREFIX,
 };

@@ -1,5 +1,39 @@
 # Changelog
 
+## openclaw-channel 2.1.1 — 2026-04-20
+
+### Logger fix — restore visibility of plugin log bodies
+
+OpenClaw's logger sink renders only the first positional argument and drops
+the rest. `src/log.js` was passing `"[agent-bridge/v2]"` as arg[0] and the
+real message body as arg[1+], so every plugin log line showed up in
+`gateway.log` as just `[plugins] [agent-bridge/v2]` with no content.
+Concatenate the tag INTO the message string so the body is always visible.
+
+This unblocks debugging of the session-injection path — `watching N target(s)`,
+`session-injection mode`, `inbox: dispatch failed`, etc. now actually render.
+
+### Inbox file archival after successful dispatch
+
+`inbox-watcher.js` now moves processed files to
+`~/.agent-bridge/archive/openclaw/<target>/` on successful dispatch
+(ledger-marked afterwards) and to `~/.agent-bridge/inbox/.failed/openclaw__<target>/`
+if `onMessage` throws. Previously files stayed in the target subdir forever;
+only the delivery ledger prevented re-processing, and any ledger reset led
+to duplicate injections. Archived filenames are prefixed with an ISO-ish
+timestamp to avoid collisions after ledger rotation.
+
+### Pre-inject diagnostics + hardened try/catch around enqueueSystemEvent
+
+Before calling `enqueueSystemEvent` we now log the resolved `sessionKey`
+and a best-effort probe result (exists / missing(will-create) /
+unknown(no-lookup-api)) using any session-lookup helper the plugin-sdk
+happens to expose. The try/catch around `enqueueSystemEvent` now logs
+`err.message` and `err.stack` explicitly, then re-throws so the watcher
+quarantines the file to `.failed/` instead of re-processing it on every
+poll. Messages rejected with `ok === false` (no active session) are
+likewise quarantined with a clear reason.
+
 ## mcp-server 3.4.0 + openclaw-channel 2.1.0 — 2026-04-20
 
 ### Per-target inbox routing + OpenClaw session injection

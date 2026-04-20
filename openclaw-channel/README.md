@@ -10,6 +10,8 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 ## What's new in v2.1.0
 
 - **Per-target inbox subdirs.** Watches `~/.agent-bridge/inbox/openclaw/<target>/*.json` instead of the single flat `inbox/`. Each subdir name maps to one configured target in `openclaw.json`.
+- **Auto-discovery of targets from `channels.telegram.accounts`.** In the common case you don't have to write a `targets` block at all — the plugin inspects the OpenClaw global config's `channels.telegram.accounts` map and creates one bridge target per account, routing to `telegram:<account>`. An explicit `targets` block is still accepted as an advanced override. Peer-id resolution walks `targets.<name>.peer_id` → `config.peer_id` → `meta.user_id` → first numeric `chat_id` in `channels.telegram.accounts[<name>].allowFrom`.
+- **Round-trip bridge replies (`fromTarget`).** Inbound BridgeMessages carry an optional `fromTarget` telling the receiver where to put replies. When the agent answers back over the bridge (cross-harness flows), `buildReply(...)` populates the outgoing `target` from `incoming.fromTarget` so the conversation lands in the session that originated it — e.g. OpenClaw ↔ Claude Code works both directions.
 - **Running-session injection.** Builds an OpenClaw session key of the form `agent:<agentId>:<channel>:<account>:direct:<peer_id>` and injects with `enqueueSystemEvent(body, { sessionKey, trusted: false })` so a bridge message arriving for a specific Telegram bot lands in the SAME chat session the user was already talking in. Replies go back to Telegram via the session's own `lastChannel`, not over the bridge.
 - **`trusted: false` on injection.** SSH pairing is not a first-party trust boundary — inbound bridge content is third-party input.
 - **Optional heartbeat wake.** When the plugin-sdk exports `requestHeartbeatNow`, the watcher wakes an idle session after injection.
@@ -27,8 +29,44 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 
 ## Install
 
+### Minimal (auto-discovery — recommended)
+
 ```json
 // In ~/.openclaw/openclaw.json:
+{
+  "channels": {
+    "agent-bridge": {
+      "enabled": true,
+      "config": {
+        "agentId": "main",
+        "peer_id": "6164541473"
+      }
+    },
+    "telegram": {
+      "accounts": {
+        "default":      { "token": "...", "allowFrom": ["6164541473"] },
+        "clawdiboi2":   { "token": "...", "allowFrom": ["6164541473"] },
+        "clordlethird": { "token": "...", "allowFrom": ["6164541473"] }
+      }
+    }
+  },
+  "plugins": {
+    "load": {
+      "paths": [
+        "/path/to/agent-bridge/openclaw-channel"
+      ]
+    }
+  }
+}
+```
+
+The plugin auto-discovers one bridge target per `channels.telegram.accounts` entry — you don't need to repeat them under `targets`. Peer ID resolution walks `targets.<name>.peer_id` → `channels["agent-bridge"].config.peer_id` → `meta.user_id` → first numeric `chat_id` in `channels.telegram.accounts[<name>].allowFrom`.
+
+### Explicit overrides (advanced)
+
+Add a `targets` block only when you need to override auto-discovery (different peer per bot, custom session mapping, extra non-Telegram targets, etc.):
+
+```json
 {
   "channels": {
     "agent-bridge": {
@@ -41,13 +79,6 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
           "clordlethird": { "openclaw_channel": "telegram", "account": "clordlethird", "peer_id": "6164541473" }
         }
       }
-    }
-  },
-  "plugins": {
-    "load": {
-      "paths": [
-        "/path/to/agent-bridge/openclaw-channel"
-      ]
     }
   }
 }

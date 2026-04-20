@@ -736,7 +736,33 @@ bridge_send_message({ machine: "Mac-Mini", message: "what's up?", target: "openc
 
 There is **no default routing** — a call without `target` is rejected. Legacy flat files that arrive at the root of `inbox/` (from pre-3.4.0 senders) are moved to `.failed/_unrouted/` on next startup with a deprecation log line. Upgrade your senders.
 
-**OpenClaw target mapping** lives in `openclaw.json`:
+Target strings accept Unicode letters/digits plus `_`, `.`, `-`, `/` (no `..`, no leading/trailing `/`, no `//`, ≤256 chars) so multilingual harness names are allowed.
+
+**OpenClaw target mapping** — the happy path is now **auto-discovery** in `openclaw.json`: each entry under `channels.telegram.accounts` is automatically registered as a bridge target of the same name, routing to `telegram:<account>`. You only need a `targets` block if you want to override that (different peer per bot, non-Telegram target, etc.).
+
+```json
+// Auto-discovery (recommended): no `targets` block needed.
+"channels": {
+  "agent-bridge": {
+    "enabled": true,
+    "config": {
+      "agentId": "main",
+      "peer_id": "6164541473"
+    }
+  },
+  "telegram": {
+    "accounts": {
+      "default":      { "token": "...", "allowFrom": ["6164541473"] },
+      "clawdiboi2":   { "token": "...", "allowFrom": ["6164541473"] },
+      "clordlethird": { "token": "...", "allowFrom": ["6164541473"] }
+    }
+  }
+}
+```
+
+Peer ID is resolved per target from (in order): explicit `targets.<name>.peer_id` → plugin-level `channels["agent-bridge"].config.peer_id` → `meta.user_id` on the global config → first numeric `chat_id` in `channels.telegram.accounts[<name>].allowFrom`. When no peer can be resolved, the target is skipped with a loud warn log rather than injected to the wrong chat.
+
+Explicit `targets` blocks (advanced override, still fully supported):
 
 ```json
 "channels": {
@@ -755,6 +781,8 @@ There is **no default routing** — a call without `target` is rejected. Legacy 
 ```
 
 Each entry resolves to an OpenClaw session key of the form `agent:<agentId>:<openclaw_channel>:<account>:direct:<peer_id>`. The openclaw-channel plugin uses that key with `enqueueSystemEvent(body, { sessionKey, trusted: false })` to inject the message into the already-running agent session. Replies travel over whatever channel the session was last talking on (usually the originating Telegram chat) instead of spawning a new `agent-bridge` channel.
+
+**Round-trip bridge replies.** `BridgeMessage` carries an optional `fromTarget` field — the sender's OWN target-id. When an agent replies back over the bridge (cross-harness agent ↔ agent flows), `fromTarget` is copied into the reply's `target` field so the reply lands back in the session that started the conversation instead of always defaulting to `claude-code`. This makes OpenClaw ↔ Claude Code work both directions, not just inbound.
 
 Listeners are independent processes: Claude Code's channel plugin and the OpenClaw gateway watch their own subdirs. One crashing doesn't affect the other.
 

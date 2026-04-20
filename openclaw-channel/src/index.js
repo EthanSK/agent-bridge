@@ -14,8 +14,9 @@
  *   so the target's own `lastChannel` state drives reply routing.
  * - `trusted: false` on injected events — SSH-pairing is not a first-party
  *   trust boundary, so we treat inbound bridge content as third-party input.
- * - Calls `requestHeartbeatNow` (when exported by the plugin-sdk) after
- *   injection to wake an idle session.
+ * - Uses `enqueueSystemEvent` alone (no heartbeat call) — matches the built-in
+ *   telegram channel's pattern. The event loop picks up queued events
+ *   automatically, so no explicit session wake-up is needed.
  *
  * The previous v2.0.x `registerChannel` flow is retained for the rare case
  * where a paired peer is also an agent-bridge-aware harness (e.g. a cross-
@@ -130,7 +131,6 @@ export default {
     loadSystemEvents(log)
       .then((runtime) => {
         const enqueueSystemEvent = runtime.enqueueSystemEvent;
-        const requestHeartbeatNow = runtime.requestHeartbeatNow; // may be undefined on older hosts
 
         const inboxRoot = pluginCfg.inboxRoot
           ?? pluginCfg.inboxDir // legacy field name, v2.0.x
@@ -190,40 +190,46 @@ export default {
               contextKey: fromMachine,
               trusted: false,
             };
+
+            // Pre-inject diagnostics: log sessionKey + any session-lookup
+            // hint before the enqueueSystemEvent call so, if the call hangs
+            // or the session doesn't exist, we at least see what we tried.
+            // OpenClaw's plugin-sdk currently exposes no `hasSession` /
+            // `getSession` helper to us, so we log the resolved key plus a
+            // note that existence is confirmed by the boolean return.
+            const sessionProbe = probeSession(api, sessionKey);
+            log.info(
+              `about to inject ${msg.id} from ${fromMachine} target=${target.name} `
+              + `sessionKey=${sessionKey} probe=${sessionProbe}`,
+            );
+
             let ok = false;
             try {
               ok = enqueueSystemEvent(body, enqueueOpts);
             } catch (err) {
+              // Bug 3: surface the exception with full context, then rethrow
+              // so the watcher moves the file to .failed/ rather than
+              // re-processing it on every poll.
               log.error(
-                `enqueueSystemEvent threw for ${msg.id} target=${target.name}: ${err?.stack || err}`,
+                `enqueueSystemEvent threw for ${msg.id} sessionKey=${sessionKey} `
+                + `target=${target.name}: ${err?.message ?? err} — `
+                + `stack: ${err?.stack ?? "(no stack)"}`,
               );
               throw err;
             }
             if (!ok) {
               log.warn(
                 `inbound ${msg.id} from ${fromMachine} target=${target.name} was NOT enqueued `
-                + `(host rejected, possibly no active session for sessionKey=${sessionKey}) — file preserved at ${ctx.filePath}`,
+                + `(host rejected, possibly no active session for sessionKey=${sessionKey}) — `
+                + `file will be moved to .failed/`,
               );
-              throw new Error(`enqueueSystemEvent rejected ${msg.id} for session ${sessionKey}`);
+              throw new Error(
+                `enqueueSystemEvent rejected ${msg.id} for session ${sessionKey}`,
+              );
             }
             log.info(
               `inbound ${msg.id} from ${fromMachine} target=${target.name} injected into session ${sessionKey}`,
             );
-
-            // Wake the session if idle. `requestHeartbeatNow` is optional;
-            // older plugin-sdks don't export it — silent noop in that case.
-            if (typeof requestHeartbeatNow === "function") {
-              try {
-                requestHeartbeatNow({
-                  sessionKey,
-                  reason: "agent-bridge:inbound",
-                });
-              } catch (err) {
-                log.warn(
-                  `requestHeartbeatNow failed for ${sessionKey}: ${err?.message || err}`,
-                );
-              }
-            }
           },
         });
       })
@@ -436,13 +442,44 @@ function buildSessionKey({ agentId, channel, account, peerId }) {
 }
 
 /**
+ * Best-effort peek at host-side session existence for the given sessionKey.
+ * OpenClaw's plugin-sdk doesn't currently expose a stable lookup API, so we
+ * probe a few plausible names and fall back to "unknown" without throwing.
+ * Used purely for diagnostic logging.
+ */
+function probeSession(api, sessionKey) {
+  if (!api || typeof sessionKey !== "string") return "unknown(no-api)";
+  const candidates = [
+    api.hasSession,
+    api.getSession,
+    api.lookupSession,
+    api.sessions && api.sessions.has ? api.sessions.has.bind(api.sessions) : null,
+    api.sessions && api.sessions.get ? api.sessions.get.bind(api.sessions) : null,
+  ];
+  for (const fn of candidates) {
+    if (typeof fn !== "function") continue;
+    try {
+      const r = fn(sessionKey);
+      if (r === true) return "exists";
+      if (r === false) return "missing(will-create)";
+      if (r && typeof r === "object") return "exists";
+      if (r == null) return "missing(will-create)";
+      return `unknown(${typeof r})`;
+    } catch (err) {
+      return `probe-error(${err?.message ?? err})`;
+    }
+  }
+  return "unknown(no-lookup-api)";
+}
+
+/**
  * Dynamically import the plugin-sdk dispatch API. We import lazily so that
  * `node --check src/index.js` succeeds even when the plugin-sdk isn't on the
  * resolver path (e.g. in CI or during local type-check).
  *
- * Returns `{ enqueueSystemEvent, requestHeartbeatNow? }`. The heartbeat
- * helper is optional — older plugin-sdks don't export it and we tolerate
- * that at call-time.
+ * Returns `{ enqueueSystemEvent }`. Matches the built-in telegram channel's
+ * pattern — enqueueSystemEvent alone is sufficient; the event loop picks up
+ * queued events automatically.
  */
 async function loadSystemEvents(log) {
   // enqueueSystemEvent is re-exported from several plugin-sdk subpaths
@@ -457,10 +494,6 @@ async function loadSystemEvents(log) {
 
   const mergeExports = (mod) => ({
     enqueueSystemEvent: mod.enqueueSystemEvent,
-    requestHeartbeatNow:
-      mod.requestHeartbeatNow
-      ?? mod.requestHeartbeat
-      ?? mod.scheduleHeartbeatNow,
   });
 
   // Strategy 1: direct `openclaw/...` ESM import. Works when the plugin is
@@ -472,13 +505,7 @@ async function loadSystemEvents(log) {
     try {
       const mod = await import(spec);
       if (typeof mod.enqueueSystemEvent === "function") {
-        const exports = mergeExports(mod);
-        if (typeof exports.requestHeartbeatNow !== "function") {
-          log.debug?.(
-            `plugin-sdk ${spec} exports enqueueSystemEvent but no heartbeat helper — sessions injected into idle sessions may take up to their normal poll cycle to wake.`,
-          );
-        }
-        return exports;
+        return mergeExports(mod);
       }
       errors.push(`${spec}: loaded but missing enqueueSystemEvent`);
     } catch (err) {
