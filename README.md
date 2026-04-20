@@ -77,7 +77,7 @@ agent-bridge lets Claude Code sessions on different machines talk to each other 
 | Agent Harness | Status | Integration |
 |---------------|--------|-------------|
 | **Claude Code** | ✅ **Tested end-to-end**, both machines confirmed | Channel plugin + MCP server — push-based, `<channel source="agent-bridge">` events auto-surface in the running session |
-| OpenClaw | 🟡 Scaffolded, not exercised yet | Companion plugin in [`openclaw-plugin/`](openclaw-plugin/README.md) + MCP server |
+| OpenClaw | ✅ First-class channel | Native channel plugin in [`openclaw-channel/`](openclaw-channel/README.md) + MCP server |
 | Codex CLI (OpenAI) | 🟡 Scaffolded, not exercised yet | MCP server + skill file at `AGENTS.md` — would poll via `bridge_receive_messages` |
 | Gemini CLI | 🟡 Scaffolded, not exercised yet | MCP server + skill file at `GEMINI.md` |
 | Aider / other MCP hosts | 🟡 Scaffolded, not exercised yet | MCP server + skill file at `INSTRUCTIONS.md` |
@@ -337,7 +337,7 @@ v2 adds an MCP server that enables running AI agent sessions to communicate dire
 
 | Delivery mode | How it works | Harness support |
 |---------------|--------------|-----------------|
-| **Push** (channel) | Incoming messages are pushed into the conversation as `<channel source="agent-bridge" ...>` tags. No polling needed. | Claude Code (channel plugin), OpenClaw ([plugin/daemon](openclaw-plugin/README.md)) |
+| **Push** (channel) | Incoming messages are pushed into the conversation as `<channel source="agent-bridge" ...>` tags. No polling needed. | Claude Code (channel plugin), OpenClaw ([channel plugin](openclaw-channel/README.md)) |
 | **Polling** | Agent calls `bridge_receive_messages` periodically to check the inbox. | Codex, Gemini CLI, any MCP client |
 
 ### MCP tools
@@ -454,7 +454,7 @@ cp -r skills/openclaw ~/.openclaw/workspace/skills/agent-bridge
 
 **Step 3 -- enable push delivery (pick one):**
 
-*Option A — v2 native channel plugin (recommended, `openclaw-channel-v2/`):*
+Install the native OpenClaw channel plugin (`openclaw-channel/`):
 ```json
 // ~/.openclaw/openclaw.json
 {
@@ -463,43 +463,20 @@ cp -r skills/openclaw ~/.openclaw/workspace/skills/agent-bridge
   },
   "plugins": {
     "load": {
-      "paths": [ "/absolute/path/to/agent-bridge/openclaw-channel-v2" ]
-    },
-    "entries": {
-      "agent-bridge": { "enabled": false }
+      "paths": [ "/absolute/path/to/agent-bridge/openclaw-channel" ]
     }
   }
 }
 ```
-Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegram) via `api.registerChannel()`. Inbound messages dispatch through `enqueueSystemEvent` from the plugin-sdk — no CLI shell-out, no scanner bypass. Outbound replies SCP a `BridgeMessage` back to the sender. See [`openclaw-channel-v2/README.md`](openclaw-channel-v2/README.md) and [`openclaw-channel-v2/ARCHITECTURE.md`](openclaw-channel-v2/ARCHITECTURE.md).
+Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegram) via `api.registerChannel()`. Inbound messages dispatch through `enqueueSystemEvent` from the plugin-sdk — no CLI shell-out, no scanner bypass. Outbound replies SCP a `BridgeMessage` back to the sender. See [`openclaw-channel/README.md`](openclaw-channel/README.md) and [`openclaw-channel/ARCHITECTURE.md`](openclaw-channel/ARCHITECTURE.md).
 
-*Option B — v1.3.0 extension plugin (deprecated, `openclaw-plugin/`):*
-```bash
-openclaw plugins install --link /absolute/path/to/agent-bridge/openclaw-plugin \
-  --dangerously-force-unsafe-install
-openclaw gateway restart
-```
-The `--dangerously-force-unsafe-install` flag is required because v1 shells out to `openclaw agent` via `child_process`, which the plugin scanner flags as critical. v1 is kept for backward compatibility with existing installs; prefer v2 for new setups.
+> **Migrating from v1.3.0 (`openclaw-plugin/`)?** That extension plugin has been removed as of v2.0.0. Delete any `plugins.entries["agent-bridge"]` block from your config and point `plugins.load.paths` at the new `openclaw-channel/` directory. The gateway hot-reloads on config change.
 
-*Option C — standalone daemon (no plugin system, no scanner bypass):*
-```bash
-node /absolute/path/to/agent-bridge/openclaw-plugin/bin/agent-bridge-openclaw-inbox.js
-```
-For persistence, wire it into launchd or systemd. A launchd plist template lives in `openclaw-plugin/README.md`.
-
-**How OpenClaw push delivery works (v1.2.0+):**
+**How OpenClaw push delivery works:**
 1. Peer's `bridge_send_message` writes a JSON file to `~/.agent-bridge/inbox/` via SSH
-2. The plugin/daemon's file watcher sees the new file
-3. The plugin resolves per-message routing (top-level `route` field, inline `@@route` header, or plugin defaults — see [`openclaw-plugin/ROUTING.md`](openclaw-plugin/ROUTING.md))
-4. It dispatches based on `deliveryMode`:
-   - `log-only` (default): parse + archive only; bidirectional comms still work via the MCP tools
-   - `message-send`: shells `openclaw message send --channel <ch> --account <acc> --target <chat>` to relay the envelope into a chat (no agent turn)
-   - `agent-turn`: shells `openclaw agent --agent <id> --message <envelope> --deliver --reply-channel <ch> --reply-account <acc> --reply-to <chat>` so the agent actually responds and posts its reply back into the chat
-5. On success, the message ID is appended to `~/.agent-bridge/.openclaw-delivered` and the file is moved to `~/.agent-bridge/inbox/.openclaw-delivered/` to dedupe restarts
-
-`agent-turn` mode supports per-message routing so a single watcher can serve multiple Telegram bots / chats / agents — set `target_chat_id` / `target_account` / `target_agent` either in the message JSON or via an `@@route` header on the first line of the body. Full rationale + config schema in [`openclaw-plugin/README.md`](openclaw-plugin/README.md) and [`openclaw-plugin/ROUTING.md`](openclaw-plugin/ROUTING.md).
-
-**Why shell out?** A real channel plugin per OpenClaw's SDK would require implementing DM policy, pairing flows, outbound send, threading, mention gating, etc. -- overkill for a local file-inbox. The `openclaw agent --deliver` and `openclaw message send` CLIs are the stable, documented primitives. See `openclaw-plugin/README.md` for the full rationale.
+2. The channel plugin's file watcher sees the new file
+3. The plugin calls `enqueueSystemEvent` to push a `<channel source="agent-bridge" ...>` block into the running agent session
+4. When the agent replies via the channel's outbound adapter, the plugin SCPs a reply `BridgeMessage` back to the sender's inbox
 
 ### Codex (OpenAI) (MCP server -- polling)
 
@@ -759,14 +736,14 @@ The MCP server includes production-grade inbox management:
 
 > **Before investigating any agent-bridge issue, tail the unified event log first.**
 
-agent-bridge ships a single structured event log that every component writes to: the MCP server, the OpenClaw plugin, the standalone daemon, and the bash CLI. This is the first thing you (or an AI agent debugging a problem) should look at. It replaces the old "grep three different files" dance.
+agent-bridge ships a single structured event log that every component writes to: the MCP server and the bash CLI. This is the first thing you (or an AI agent debugging a problem) should look at. It replaces the old "grep three different files" dance. (The OpenClaw channel plugin emits through `api.logger`, which lands in the gateway log — see below.)
 
 | Path | Format | Written by |
 |---|---|---|
-| `~/.agent-bridge/logs/agent-bridge.log` | NDJSON (one JSON object per line) | mcp-server, openclaw-plugin, CLI |
+| `~/.agent-bridge/logs/agent-bridge.log` | NDJSON (one JSON object per line) | mcp-server, CLI |
 | `~/.agent-bridge/logs/agent-bridge.log.1` | previous rotation (renamed when > 50 MB) | same |
 | `~/.agent-bridge/logs/mcp-server.log` | plain-text, very verbose | mcp-server (kept for deep dives) |
-| `~/.openclaw/logs/gateway.log` | plain-text | OpenClaw host itself (non agent-bridge traffic) |
+| `~/.openclaw/logs/gateway.log` | plain-text | OpenClaw host (including the agent-bridge channel plugin's `api.logger` output) |
 
 Every NDJSON line has this shape:
 
@@ -798,7 +775,7 @@ jq -c 'select(.context.msg_id == "msg-abc123")' ~/.agent-bridge/logs/agent-bridg
 jq -c 'select(.event | startswith("watcher."))' ~/.agent-bridge/logs/agent-bridge.log
 
 # Only this component
-jq -c 'select(.component == "openclaw-plugin")' ~/.agent-bridge/logs/agent-bridge.log
+jq -c 'select(.component == "mcp-server")' ~/.agent-bridge/logs/agent-bridge.log
 
 # Live tail, formatted
 tail -f ~/.agent-bridge/logs/agent-bridge.log | jq -c '"\(.ts) [\(.component)] \(.event) — \(.msg)"'
@@ -809,14 +786,11 @@ tail -f ~/.agent-bridge/logs/agent-bridge.log | jq -c '"\(.ts) [\(.component)] \
 | Event | Who emits | When |
 |---|---|---|
 | `server.starting` / `server.ready` / `server.shutdown` | mcp-server | MCP lifecycle |
-| `watcher.started` / `watcher.stopped` | mcp-server, openclaw-plugin | fswatch/inotifywait/polling up or down |
-| `watcher.starting` / `watcher.ready` | openclaw-plugin | plugin startup |
-| `message.received` | mcp-server, openclaw-plugin | inbox file picked up by the watcher |
-| `message.resolving` | openclaw-plugin | delivery mode + route resolved for a message |
+| `watcher.started` / `watcher.stopped` | mcp-server | fswatch/inotifywait/polling up or down |
+| `message.received` | mcp-server | inbox file picked up by the watcher |
 | `message.pushed_to_channel` | mcp-server | message pushed into the running Claude session |
 | `message.push_failed` | mcp-server | channel notification failed |
 | `message.send_start` / `message.send_retry` / `message.delivered` / `message.send_failed` | mcp-server | outbound SSH delivery to a remote inbox |
-| `message.delivered` / `message.delivery_failed` | openclaw-plugin | inbox → agent-turn / message-send / log-only delivery |
 | `tool.bridge_status` / `tool.bridge_run_command` | mcp-server | MCP tool invocation |
 | `cli.pair.done` / `cli.unpair.done` / `cli.run.start` / `cli.run.done` / `cli.run.failed` / `cli.status.online` / `cli.status.offline` | CLI | bash subcommands |
 

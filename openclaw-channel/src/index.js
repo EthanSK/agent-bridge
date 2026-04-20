@@ -1,5 +1,5 @@
 /**
- * OpenClaw plugin entry point for @agent-bridge/openclaw-channel-v2.
+ * OpenClaw plugin entry point for @agent-bridge/openclaw-channel.
  *
  * Registers "agent-bridge" as a first-class OpenClaw channel via
  * `api.registerChannel()` (new in the plugin-sdk). Dispatches inbound

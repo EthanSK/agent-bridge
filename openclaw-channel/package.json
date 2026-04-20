@@ -1,6 +1,6 @@
 {
-  "name": "@agent-bridge/openclaw-channel-v2",
-  "version": "2.0.0-alpha.1",
+  "name": "@agent-bridge/openclaw-channel",
+  "version": "2.0.0",
   "description": "First-class OpenClaw channel plugin for agent-bridge. Registers `agent-bridge` as a native channel (same tier as telegram) via the plugin-sdk registerChannel API, replacing the v1.3.0 CLI shell-out approach.",
   "type": "module",
   "main": "./src/index.js",
@@ -12,7 +12,7 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/EthanSK/agent-bridge.git",
-    "directory": "openclaw-channel-v2"
+    "directory": "openclaw-channel"
   },
   "author": "EthanSK",
   "license": "MIT"

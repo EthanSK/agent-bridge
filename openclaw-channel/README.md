@@ -1,4 +1,4 @@
-# @agent-bridge/openclaw-channel-v2
+# @agent-bridge/openclaw-channel
 
 A first-class OpenClaw channel plugin for [agent-bridge](https://github.com/EthanSK/agent-bridge).
 
@@ -7,20 +7,21 @@ built-in Telegram / Slack / iMessage channels — so cross-machine messages
 flow through OpenClaw's normal inbound/outbound pipelines instead of the
 v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 
-## How it differs from v1.3.0
+## How it works
 
-| | v1.3.0 (`openclaw-plugin/`) | v2 (this module) |
-| --- | --- | --- |
-| Registration | Extension plugin only | `ChannelPlugin` via `api.registerChannel()` |
-| Inbound delivery | `spawn("openclaw agent --to ... --message ...")` per message | `enqueueSystemEvent(...)` from the plugin-sdk |
-| Outbound replies | Hijacks the configured `deliveryChannel` (e.g. telegram) | Native `ChannelOutboundAdapter.sendText` that SCPs a reply BridgeMessage back to the sender |
-| Appears in `openclaw channels list` | No | Yes |
-| Fan-out to Telegram + bridge sender | Config-level kludge | Core routing handles it |
+| | This module (v2) |
+| --- | --- |
+| Registration | `ChannelPlugin` via `api.registerChannel()` |
+| Inbound delivery | `enqueueSystemEvent(...)` from the plugin-sdk |
+| Outbound replies | Native `ChannelOutboundAdapter.sendText` that SCPs a reply BridgeMessage back to the sender |
+| Appears in `openclaw channels list` | Yes |
+| Fan-out to Telegram + bridge sender | Core routing handles it |
 
-v1.3.0 is kept intact at `../openclaw-plugin/` so existing installs keep
-working during migration. When v2 is enabled the user should set
-`plugins.entries["agent-bridge"].enabled = false` so the v1 CLI shell-out
-stops running.
+This module supersedes the pre-2.0 extension-plugin approach (which shelled
+out to `openclaw agent --to ... --message ...` per message). The v1 plugin
+has been removed from the repo; if you're migrating, delete any
+`plugins.entries["agent-bridge"]` block from your `openclaw.json` and
+point `plugins.load.paths` at this directory instead.
 
 ## Install
 
@@ -31,12 +32,9 @@ stops running.
     "agent-bridge": { "enabled": true }
   },
   "plugins": {
-    "entries": {
-      "agent-bridge": { "enabled": false }
-    },
     "load": {
       "paths": [
-        "/path/to/agent-bridge/openclaw-channel-v2"
+        "/path/to/agent-bridge/openclaw-channel"
       ]
     }
   }

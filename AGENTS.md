@@ -35,9 +35,11 @@ Both machines keep their own copies — when debugging a bidirectional issue, lo
 - `message.received` — the local watcher saw a new inbox file
 - `message.pushed_to_channel` — Claude's running session received the message
 - `message.push_failed` — MCP channel notification failed (usually means Claude's session closed the pipe)
-- `message.resolving` (openclaw-plugin) — route (target agent / channel / chat) resolved
-- `message.delivered` / `message.delivery_failed` (openclaw-plugin) — agent-turn / message-send / log-only outcome
 - `cli.pair.done`, `cli.unpair.done`, `cli.run.start`/`done`/`failed`, `cli.status.online`/`offline` — bash CLI activity
+
+The OpenClaw channel plugin (`openclaw-channel/`) logs via the host's
+`api.logger`, which lands in `~/.openclaw/logs/gateway.log` rather than the
+NDJSON unified log above.
 
 If the unified log is silent for a component you expect, that component either isn't running or never emitted a startup event — check `ps` and the older per-component logs (`~/.agent-bridge/logs/mcp-server.log`, `~/.openclaw/logs/gateway.log`) for bootstrap errors.
 

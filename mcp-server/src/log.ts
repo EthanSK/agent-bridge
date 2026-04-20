@@ -4,7 +4,7 @@
  * Writes NDJSON (one JSON object per line) to
  *   ~/.agent-bridge/logs/agent-bridge.log
  *
- * Every component (mcp-server, openclaw-plugin, CLI) appends to the SAME file
+ * Every component (mcp-server, CLI) appends to the SAME file
  * so an operator or AI agent can tail one log and see the full end-to-end
  * picture. See AGENTS.md in the repo root for query patterns.
  *

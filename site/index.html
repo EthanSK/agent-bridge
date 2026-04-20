@@ -321,7 +321,7 @@
 }</pre>
           </div>
           <p class="panel-note">
-            Without the Claude Code channel, harnesses run in <strong>polling mode</strong>: the agent calls <code>bridge_receive_messages</code> at natural breakpoints to drain the inbox. Companion instruction files ship in the repo: <code>AGENTS.md</code> (Codex), <code>GEMINI.md</code> (Gemini), <code>INSTRUCTIONS.md</code> (generic), and an <code>openclaw-plugin/</code> companion for OpenClaw push delivery.
+            Without the Claude Code channel, harnesses run in <strong>polling mode</strong>: the agent calls <code>bridge_receive_messages</code> at natural breakpoints to drain the inbox. Companion instruction files ship in the repo: <code>AGENTS.md</code> (Codex), <code>GEMINI.md</code> (Gemini), <code>INSTRUCTIONS.md</code> (generic), and an <code>openclaw-channel/</code> native channel plugin for OpenClaw push delivery.
           </p>
         </div>
       </section>
@@ -446,8 +446,8 @@
               </span>
               OpenClaw
             </div>
-            <div class="compat-status" role="cell"><span class="pill pill--scaffold">scaffolded</span></div>
-            <div class="compat-desc" role="cell">MCP tools out of the box. The <code>openclaw-plugin/</code> companion adds push-style delivery by shelling <code>openclaw agent --to ... --message ...</code> when a new inbox file arrives. Not yet exercised end-to-end on v3.0.0 &mdash; empirical reports welcome.</div>
+            <div class="compat-status" role="cell"><span class="pill pill--ready">ready</span></div>
+            <div class="compat-desc" role="cell">MCP tools out of the box. The <code>openclaw-channel/</code> native channel plugin registers <code>agent-bridge</code> as a first-class OpenClaw channel (same tier as Telegram) via <code>api.registerChannel()</code>, pushing inbound messages into the running agent session via <code>enqueueSystemEvent</code>.</div>
           </div>
 
           <div class="compat-row" role="row">

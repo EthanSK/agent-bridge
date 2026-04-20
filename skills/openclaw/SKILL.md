@@ -54,19 +54,26 @@ If the agent-bridge MCP server is registered, these tools are available directly
 
 **Delivery mode:** If the OpenClaw agent-bridge plugin (or the standalone daemon) is installed, incoming messages are **pushed** into your running session automatically as a new user turn formatted `<channel source="agent-bridge" from="..." ...>content</channel>` — no polling required. If the plugin/daemon is NOT installed, fall back to polling with `bridge_receive_messages` at natural breakpoints. Messages persist in the inbox until consumed (default TTL: 1 hour).
 
-### Install the OpenClaw push plugin (recommended)
+### Install the OpenClaw push channel plugin (recommended)
 
-```bash
-# Option A — install as OpenClaw plugin (requires scanner bypass for child_process use)
-openclaw plugins install --link ~/Projects/agent-bridge/openclaw-plugin \
-  --dangerously-force-unsafe-install
-openclaw gateway restart
+Add to `~/.openclaw/openclaw.json`:
 
-# Option B — run as a standalone daemon (no plugin install)
-node ~/Projects/agent-bridge/openclaw-plugin/bin/agent-bridge-openclaw-inbox.js
+```json
+{
+  "channels": {
+    "agent-bridge": { "enabled": true }
+  },
+  "plugins": {
+    "load": {
+      "paths": [ "/absolute/path/to/agent-bridge/openclaw-channel" ]
+    }
+  }
+}
 ```
 
-See `openclaw-plugin/README.md` in the agent-bridge repo for a launchd plist template and full configuration reference.
+The gateway hot-reloads on config change — no restart needed. See
+`openclaw-channel/README.md` and `openclaw-channel/ARCHITECTURE.md` in the
+agent-bridge repo for the full reference.
 
 ## Pairing from a photo
 

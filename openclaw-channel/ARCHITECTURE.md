@@ -1,4 +1,4 @@
-# Architecture — openclaw-channel-v2
+# Architecture — openclaw-channel
 
 This doc captures the SDK research + design choices behind the v2 channel
 plugin. If you need to extend it, start here.
@@ -107,7 +107,7 @@ exposed to channel plugins directly.
 ## File layout
 
 ```
-openclaw-channel-v2/
+openclaw-channel/
 ├── package.json            # openclaw.extensions points at src/index.js
 ├── openclaw.plugin.json    # plugin manifest + configSchema
 ├── README.md
@@ -124,13 +124,14 @@ openclaw-channel-v2/
 Zero dependencies — pure Node builtins. `openclaw` itself is a peer /
 runtime dep provided by the host.
 
-## Coexistence with v1.3.0
+## Migration from v1.3.0
 
-`../openclaw-plugin/` (v1.3.0) remains untouched on disk. To migrate:
+The previous extension plugin (formerly at `../openclaw-plugin/`) has been
+removed from the repo as of v2.0.0. To migrate an existing install:
 
 1. Add this module's path to `plugins.load.paths` in `~/.openclaw/openclaw.json`.
 2. Add `channels["agent-bridge"] = { enabled: true }`.
-3. Flip `plugins.entries["agent-bridge"].enabled = false` so the v1
-   watcher + CLI shell-out stops running.
+3. Delete any `plugins.entries["agent-bridge"]` block and any path entry
+   pointing at the old `openclaw-plugin/` directory.
 
 The gateway hot-reloads on config change.
