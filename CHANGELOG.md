@@ -1,5 +1,11 @@
 # Changelog
 
+## openclaw-channel 2.3.1 — 2026-04-21
+
+Sender-derived replyVia default — reply on the channel the message arrived
+on (agent-bridge if `fromTarget` present, else telegram). Still overridable
+per-message / per-target / plugin-level.
+
 ## agent-bridge 3.4.2 — 2026-04-21
 
 ### Fix: prefer `internet_host` (Tailscale) over LAN when configured — no fallback

@@ -1,14 +1,25 @@
 /**
  * OpenClaw plugin entry point for @agent-bridge/openclaw-channel.
  *
+ * v2.3.1 — sender-derived replyVia default (2026-04-21)
+ * ------------------------------------------------------
+ * The replyVia fallback no longer hardcodes "telegram" when nothing else is
+ * configured. Instead it mirrors the arrival channel: if `msg.fromTarget`
+ * is present (stamped by agent-bridge outbound senders as e.g.
+ * "claude-code" or "openclaw/<acct>") the message arrived via agent-bridge,
+ * so the reply goes back via agent-bridge. Otherwise fall back to
+ * "telegram". This gives "reply on the channel it came in on" semantics
+ * with zero config. Explicit per-message / per-target / plugin-level
+ * settings still win — see precedence block at the resolution site.
+ *
  * v2.3.0 — replyVia mode (2026-04-20)
  * ------------------------------------
  * Inbound bridge messages can now be dispatched into EITHER of two session
  * topologies depending on `target.replyVia` (or the plugin-level default):
  *
- *   replyVia: "telegram" (default) — the original v2.2.x behaviour. Inbound
- *     message injects into `agent:main:telegram:<account>:direct:<peerId>`
- *     with Provider/OriginatingChannel=telegram, so the agent's reply flows
+ *   replyVia: "telegram" — the original v2.2.x behaviour. Inbound message
+ *     injects into `agent:main:telegram:<account>:direct:<peerId>` with
+ *     Provider/OriginatingChannel=telegram, so the agent's reply flows
  *     back through the live Telegram outbound and Ethan's phone pings.
  *
  *   replyVia: "agent-bridge" — peer-to-peer back-channel. Inbound message
@@ -19,11 +30,11 @@
  *     Telegram traffic is generated. Use for agent-to-agent conversations
  *     that should be invisible to Ethan's phone.
  *
- *   Precedence: per-target override > plugin-level `replyVia` > "telegram".
- *   Per-message override: an inbound BridgeMessage can include
- *   `replyVia: "agent-bridge"` | `"telegram"` to flip the mode for a single
- *   message without reconfiguring the target. Sender-controlled overrides
- *   are sometimes useful for quick back-channel probes.
+ *   Precedence: per-message `msg.replyVia` > per-target override >
+ *   plugin-level `replyVia` > sender-derived (agent-bridge if fromTarget
+ *   present, else telegram). Per-message override lets an inbound
+ *   BridgeMessage flip the mode without reconfiguring the target — useful
+ *   for quick back-channel probes.
  *
  * v2.2.0 — Architectural correction (2026-04-20)
  * ------------------------------------------------
@@ -201,12 +212,23 @@ export default {
             //   1. Per-message `msg.replyVia` (sender-controlled override).
             //   2. Per-target `target.config.replyVia`.
             //   3. Plugin-level `pluginCfg.replyVia`.
-            //   4. Default: "telegram".
+            //   4. Sender-derived default: if `msg.fromTarget` is present the
+            //      inbound hop was via agent-bridge (outbound senders stamp
+            //      it as e.g. "claude-code" or "openclaw/<acct>"), so mirror
+            //      the arrival channel and reply back over agent-bridge.
+            //      Otherwise assume the message arrived via Telegram (or
+            //      platform default) and reply via Telegram. This gives
+            //      "reply on the channel it came in on" semantics with no
+            //      config required.
+            //   5. Absolute fallback: "telegram" (unreachable as a literal —
+            //      senderDerived already covers both branches — but kept
+            //      inside normalizeReplyVia for unknown-value coercion).
+            const senderDerived = msg.fromTarget ? "agent-bridge" : "telegram";
             const replyVia = normalizeReplyVia(
               msg.replyVia
                 ?? target.config.replyVia
                 ?? pluginCfg.replyVia
-                ?? "telegram",
+                ?? senderDerived,
               log,
               target.name,
             );
