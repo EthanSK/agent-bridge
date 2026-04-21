@@ -742,6 +742,8 @@ key=~/.agent-bridge/keys/agent-bridge_MacBookPro
 internet_host=100.115.165.121
 ```
 
+Once the alias exists, reply routing resolves again and back-and-forth bridge messaging resumes.
+
 ---
 
 ## How pairing works
@@ -1363,7 +1365,7 @@ tail -200 ~/.openclaw/logs/gateway.log | grep -E "$ALIAS|paired machine|agent-br
 grep -nE "^\[$BASE\]$|^\[$ALIAS\]$|^(host|user|port|key|internet_host)=" ~/.agent-bridge/config
 ```
 
-If the alias section is missing, add it and mirror the canonical entry fields. Use the same pattern for MagicDNS hostnames too (for example `[macbookpro.tail52aa3c.ts.net]`).
+If the alias section is missing, add it and mirror the canonical entry fields. Use the same pattern for MagicDNS hostnames too (for example `[macbookpro.tail52aa3c.ts.net]`). After adding the alias, resend the message and replies should flow both directions again.
 
 ### MCP server won't start
 
