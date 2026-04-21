@@ -41,6 +41,34 @@ Changed:
   retained as no-ops for backwards compatibility.
 - Versions: CLI `3.3.0 → 3.4.2`, `mcp-server 3.4.1 → 3.4.2`.
 
+### Fix: parent-PID liveness check — exit when Claude dies (prevents zombie MCPs)
+
+When a Claude Code session exits ungracefully (terminal killed, laptop
+sleep, crash), the MCP child can get reparented to launchd (`ppid=1`)
+while still holding a live file watcher. It keeps receiving inbox files
+and calling `markDelivered()` on them — but there's no Claude to push
+the channel into. Result: messages silently disappear into the zombie.
+On 2026-04-21 a 10-hour-old zombie (Claude PID 29834 → child MCP 29854)
+ate every inbound bridge push on MBP.
+
+3.4.2 adds a 5-second parent-liveness watchdog on top of the existing
+stdio-close shutdown path:
+
+- Captures `process.ppid` at boot and logs `parent.detected`.
+- Every 5s: if `process.ppid !== parentPid` (reparent), log
+  `parent.orphaned` and shut down; if `process.kill(parentPid, 0)`
+  throws `ESRCH` (parent gone), log `parent.dead` and shut down.
+  `EPERM` is treated as "still alive" — we just can't signal it.
+- `clearInterval` is called in every shutdown path so the timer can't
+  fire a stale tick mid-teardown (no race with `stdin end` / SIGTERM).
+- Opt-out: `AGENT_BRIDGE_DISABLE_PARENT_CHECK=1` skips the check and
+  logs `parent.check.disabled` — for diagnostic detachment scenarios.
+
+Changed:
+
+- `mcp-server/src/index.ts`: replaced the old orphan-watchdog with the
+  new parent-liveness check + structured events.
+
 ## mcp-server 3.4.1 — 2026-04-20
 
 ### Fix: orphan mcp-server instances race on `inbox/claude-code/` causing delivery starvation

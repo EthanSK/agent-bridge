@@ -258,13 +258,21 @@ async function main(): Promise<void> {
   // Clean shutdown. Triggered by:
   //   - SIGINT / SIGTERM / SIGHUP (explicit signals from parent)
   //   - stdin end / close / error (MCP stdio transport hung up, i.e. parent gone)
-  //   - orphan watchdog (parent died without closing stdio cleanly — we got reparented to init)
+  //   - parent-liveness watchdog (parent reparented to init, or parent PID gone)
   //   - EPIPE detected in the global error handlers above (exits directly)
   // The force-exit timer below guarantees we die within 2s even if server.close() hangs.
   let shuttingDown = false;
+  let parentWatchdog: NodeJS.Timeout | null = null;
   const shutdown = (reason: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
+
+    // Stop the parent-liveness timer immediately so it can't fire again during
+    // async shutdown (would log a spurious second shutdown reason).
+    if (parentWatchdog) {
+      try { clearInterval(parentWatchdog); } catch {}
+      parentWatchdog = null;
+    }
 
     try { logInfo(`Shutting down agent-bridge MCP server (${reason})...`); } catch {}
     try {
@@ -314,20 +322,86 @@ async function main(): Promise<void> {
     shutdown(`stdin error: ${err}`);
   });
 
-  // Orphan watchdog: stdin events don't reliably fire when the parent chain
-  // (wrapper → shell → us) is severed by a hard crash (SIGKILL, terminal
-  // close). Poll every 5s: if our parent has changed (we've been reparented
-  // to init = pid 1) or stdin is destroyed, self-terminate. This is the
-  // same technique the Telegram channel plugin uses.
-  const bootPpid = process.ppid;
-  const watchdog = setInterval(() => {
-    const reparented = process.platform !== 'win32' && process.ppid !== bootPpid;
-    const stdinDead = process.stdin.destroyed || (process.stdin as { readableEnded?: boolean }).readableEnded;
-    if (reparented || stdinDead) {
-      shutdown(reparented ? `orphaned (ppid changed ${bootPpid} -> ${process.ppid})` : 'stdin dead');
-    }
-  }, 5000);
-  watchdog.unref();
+  // Parent-PID liveness watchdog.
+  //
+  // Motivation (2026-04-21 zombie incident): when a Claude Code session exits
+  // ungracefully (terminal killed, laptop sleep, crash), the stdio 'end'/
+  // 'close' events don't always fire on the MCP child. The child gets
+  // reparented to launchd (ppid=1) and keeps running indefinitely. If the
+  // file watcher is still active, it continues to receive inbox files and
+  // markDelivered() them — but there's no Claude to push the channel into.
+  // Result: messages silently disappear. A 10-hour-old zombie ate every
+  // bridge push on MBP that morning.
+  //
+  // Fix: every 5s, verify the parent is (a) still our parent (not reparented)
+  // and (b) actually alive (signal-0 check). On either failure, shutdown.
+  //
+  // Opt-out: set AGENT_BRIDGE_DISABLE_PARENT_CHECK=1 for diagnostic scenarios
+  // where ppid-watching doesn't make sense (e.g. intentional detachment).
+  const parentCheckDisabled = process.env.AGENT_BRIDGE_DISABLE_PARENT_CHECK === '1';
+  if (parentCheckDisabled) {
+    logInfo('Parent-PID liveness check disabled via AGENT_BRIDGE_DISABLE_PARENT_CHECK=1');
+    logEvent({
+      event: 'parent.check.disabled',
+      msg: 'Parent-PID liveness check disabled via AGENT_BRIDGE_DISABLE_PARENT_CHECK=1',
+      context: { pid: process.pid, parentPid: process.ppid },
+    });
+  } else {
+    const parentPid = process.ppid;
+    logEvent({
+      event: 'parent.detected',
+      msg: `Parent process detected (ppid=${parentPid})`,
+      context: { parentPid, pid: process.pid },
+    });
+
+    parentWatchdog = setInterval(() => {
+      if (shuttingDown) return;
+
+      // (1) Reparent check — if our ppid changed, the original parent is gone
+      // and the OS handed us to init (pid 1) or some other supervisor.
+      if (process.platform !== 'win32' && process.ppid !== parentPid) {
+        const currentPpid = process.ppid;
+        logEvent({
+          event: 'parent.orphaned',
+          level: 'warn',
+          msg: `Parent process changed — orphaned (was ${parentPid}, now ${currentPpid})`,
+          context: { original_ppid: parentPid, current_ppid: currentPpid, pid: process.pid },
+        });
+        shutdown(`orphaned (ppid changed ${parentPid} -> ${currentPpid})`);
+        return;
+      }
+
+      // (2) Liveness check — kill(pid, 0) on a live process is a no-op; on a
+      // dead process it throws ESRCH. EPERM means the process exists but we
+      // can't signal it, which still tells us it's alive — do nothing. Any
+      // other error is unexpected; treat conservatively as "still alive" so
+      // we don't false-positive ourselves into shutdown.
+      try {
+        process.kill(parentPid, 0);
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code === 'ESRCH') {
+          logEvent({
+            event: 'parent.dead',
+            level: 'warn',
+            msg: `Parent process ${parentPid} is gone (ESRCH)`,
+            context: { parentPid, pid: process.pid },
+          });
+          shutdown(`parent dead (pid ${parentPid} gone)`);
+          return;
+        }
+        // EPERM or anything else — parent still exists from our POV, keep running.
+      }
+
+      // (3) Also cover the stdin-dead case the old watchdog handled; some
+      // terminal-close scenarios kill stdio before ppid flips.
+      const stdinDead = process.stdin.destroyed || (process.stdin as { readableEnded?: boolean }).readableEnded;
+      if (stdinDead) {
+        shutdown('stdin dead');
+      }
+    }, 5000);
+    parentWatchdog.unref();
+  }
 }
 
 main().catch((err) => {
