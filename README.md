@@ -283,6 +283,72 @@ Do this on **both** paired machines so they stay in sync — the SCP envelope fo
 
 ---
 
+## Windows prerequisites
+
+agent-bridge's CLI handles most Windows platform differences automatically (IP detection via `Get-NetIPAddress`, key ACL lockdown via `icacls`, `administrators_authorized_keys` routing for admin accounts, MSYS path normalization in the config file). Three environment concerns still need to be applied manually on Windows targets because they live outside this repo.
+
+### 1. Windows OpenSSH Server default shell
+
+Windows OpenSSH dispatches remote commands to `cmd.exe` by default. agent-bridge's message-delivery path uses bash syntax (variable assignments, pipes) which cmd.exe tokenizes incorrectly. Configure `DefaultShell` to bash:
+
+```powershell
+New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' `
+  -Value 'C:\Program Files\Git\bin\bash.exe' -PropertyType String -Force
+
+New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShellCommandOption' `
+  -Value '-lc' -PropertyType String -Force
+
+Restart-Service sshd
+```
+
+Notes:
+- Use `Git\bin\bash.exe` (the MSYS wrapper), **not** `Git\usr\bin\bash.exe` (the raw binary). The wrapper sets MSYS environment before exec'ing real bash.
+- `DefaultShellCommandOption` must be `-lc` (concatenated single-char flags) — Windows OpenSSH passes this value as one atomic argv element, so the space-separated `-l -c` form is parsed by bash as `"-l -c"` and errors with `- : invalid option`. `-lc` is equivalent to `-l -c` but survives the single-argv passing.
+- `-l` (login shell) is required so `/etc/profile` loads `/usr/bin/` onto PATH — otherwise `base64`, `dirname`, and other MinGW coreutils aren't resolvable during delivery.
+
+Equivalent PowerShell + WSL path:
+```powershell
+-Value 'C:\Windows\System32\bash.exe'     # WSL bash
+```
+Works, but `$HOME` resolves to WSL's filesystem, not Windows' — messages would land in WSL's `~/.agent-bridge/inbox/` which the MCP server on Windows can't see. Use Git Bash unless you have reason to run the MCP server from WSL.
+
+### 2. Claude Code channel plugin launch flag (Claude Code users only)
+
+The `--dangerously-load-development-channels plugin:agent-bridge@agent-bridge` flag must be applied at every Claude Code launch, not via a `.bashrc` alias — Windows shortcuts, VS Code terminals, and start-menu launches bypass bashrc.
+
+**If Claude Code was installed via npm:** patch the three npm shims to inject the flag. Edit each of:
+```
+C:\Users\<user>\AppData\Roaming\npm\claude.cmd
+C:\Users\<user>\AppData\Roaming\npm\claude
+C:\Users\<user>\AppData\Roaming\npm\claude.ps1
+```
+and add `--dangerously-load-development-channels plugin:agent-bridge@agent-bridge` before the argument passthrough (`%*` / `"$@"` / `$args`).
+
+**If Claude Code was installed as a native exe** (e.g., at `C:\Users\<user>\.local\bin\claude.exe`): the auto-updater may restore `claude.exe` after rename. Instead of renaming, place a wrapper `.cmd` in a directory that's **earlier in PATH** than the install dir:
+
+```batch
+@echo off
+"C:\Users\<user>\.local\bin\claude.exe" --dangerously-load-development-channels plugin:agent-bridge@agent-bridge %*
+```
+
+Common earlier-PATH locations: `C:\Users\<user>\.cargo\bin\claude.cmd`, or any dir you prepend to PATH.
+
+### 3. Verification
+
+After applying the prerequisites, verify the flag reached the running process:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Where-Object { $_.CommandLine -like '*claude-code*' } |
+  Select-Object -ExpandProperty CommandLine
+```
+
+You should see `--dangerously-load-development-channels plugin:agent-bridge@agent-bridge` in the command line. If it's missing, the launcher wasn't patched for the context you used to start Claude Code.
+
+If a sent message delivers successfully (no MCP error) but never surfaces as a `<channel>` event in the receiving conversation, the receiver's flag wasn't applied — double-check cmdline on that side.
+
+---
+
 ## Setup guide
 
 ### On each machine you want to bridge:
