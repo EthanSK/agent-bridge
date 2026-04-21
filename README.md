@@ -716,6 +716,32 @@ paired_at=2026-04-09T12:00:00Z
 
 `internet_host` and `internet_port` are optional. When present, SSH/SCP tries `host:port` first (3s timeout), then falls back to `internet_host:internet_port`. The recommended `internet_host` value is a [Tailscale](#internet-connectivity-tailscale) `100.x.y.z` IP.
 
+### Hostname variants (`.lan` / MagicDNS) and safe aliases
+
+The config section name must match the machine label used by the route. If replies are routed to `MacBookPro.lan` but your config only has `[MacBookPro]`, delivery fails with:
+
+```text
+paired machine "MacBookPro.lan" not found in ~/.agent-bridge/config
+```
+
+Safe fix: keep your canonical section, then add mirrored alias sections for any routed variants (`.lan`, MagicDNS hostname, etc.). Mirror `host`, `user`, `port`, `key`, and `internet_host` (if present).
+
+```ini
+[MacBookPro]
+host=192.168.1.208
+user=ethan
+port=22
+key=~/.agent-bridge/keys/agent-bridge_MacBookPro
+internet_host=100.115.165.121
+
+[MacBookPro.lan]
+host=192.168.1.208
+user=ethan
+port=22
+key=~/.agent-bridge/keys/agent-bridge_MacBookPro
+internet_host=100.115.165.121
+```
+
 ---
 
 ## How pairing works
@@ -1320,6 +1346,24 @@ tailscale ip -4
 3. Check inbox contents: `ls ~/.agent-bridge/inbox/`
 4. Check for quarantined messages: `ls ~/.agent-bridge/inbox/.failed/`
 5. The watcher polls the inbox every 2 s — no external dependencies (fswatch/inotifywait removed in 3.4.3)
+
+### `paired machine "..." not found` (label mismatch)
+
+This usually means the sender routed to a hostname variant (for example `MacBookPro.lan` or a MagicDNS name), but that exact label is missing in `~/.agent-bridge/config`.
+
+```bash
+# On the receiving machine
+BASE="MacBookPro"
+ALIAS="MacBookPro.lan"
+
+# Confirm the error in OpenClaw logs (if using openclaw-channel)
+tail -200 ~/.openclaw/logs/gateway.log | grep -E "$ALIAS|paired machine|agent-bridge/v2"
+
+# Check config sections + connection fields
+grep -nE "^\[$BASE\]$|^\[$ALIAS\]$|^(host|user|port|key|internet_host)=" ~/.agent-bridge/config
+```
+
+If the alias section is missing, add it and mirror the canonical entry fields. Use the same pattern for MagicDNS hostnames too (for example `[macbookpro.tail52aa3c.ts.net]`).
 
 ### MCP server won't start
 

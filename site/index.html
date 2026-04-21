@@ -294,8 +294,28 @@
 <span class="t-comment"># Plain remote shell on a paired machine (diagnostics only)</span>
 <span class="t-prompt"></span>agent-bridge run MacBook-Pro <span class="t-str">"cd ~/Projects/myapp &amp;&amp; git status"</span></pre>
           </div>
+          <div class="step-block">
+            <div class="step-block-head">
+              <span class="lbl">hostname alias mismatch quick fix</span>
+            </div>
+<pre><span class="t-comment"># Symptom (OpenClaw logs):</span>
+<span class="t-comment"># paired machine "MacBookPro.lan" not found in ~/.agent-bridge/config</span>
+
+<span class="t-prompt"></span><span class="t-var">BASE</span>=<span class="t-str">"MacBookPro"</span>
+<span class="t-prompt"></span><span class="t-var">ALIAS</span>=<span class="t-str">"MacBookPro.lan"</span>
+
+<span class="t-comment"># Check route label + config sections</span>
+<span class="t-prompt"></span>tail -200 ~/.openclaw/logs/gateway.log | grep -E <span class="t-str">"$ALIAS|paired machine|agent-bridge/v2"</span>
+<span class="t-prompt"></span>grep -nE <span class="t-str">"^\[$BASE\]$|^\[$ALIAS\]$|^(host|user|port|key|internet_host)="</span> ~/.agent-bridge/config
+
+<span class="t-comment"># If missing, add [MacBookPro.lan] mirroring [MacBookPro].</span>
+<span class="t-comment"># Same idea for MagicDNS names, e.g. [macbookpro.tail52aa3c.ts.net]</span></pre>
+          </div>
           <p class="panel-note">
             <strong>Note.</strong> <code>agent-bridge run</code> is a plain SSH remote-shell utility &mdash; it does NOT invoke an agent. To talk to the running agent on the other machine, use the plugin&rsquo;s <code>bridge_send_message</code> MCP tool. The old <code>--claude</code> / <code>--codex</code> / <code>--agent</code> flags that spawned a fresh non-interactive agent session on the remote machine were removed in 3.0.0.
+          </p>
+          <p class="panel-note">
+            <strong>Routing labels must match config sections.</strong> If your sender uses a hostname variant (<code>.lan</code> or MagicDNS), add a mirrored alias section so back-and-forth replies keep working.
           </p>
         </div>
 
