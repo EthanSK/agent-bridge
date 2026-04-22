@@ -10,7 +10,7 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 ## What's new in v2.3.0
 
 - **`replyVia` per-target routing.** Inbound bridge messages can now route their reply either back through the Telegram chat (default — visible on Ethan's phone) or back over agent-bridge as a BridgeMessage to the sender machine (silent peer-to-peer back-channel). Set it plugin-level (`channels["agent-bridge"].config.replyVia`), per-target (`targets.<name>.replyVia`), or per-message (add `replyVia` to the BridgeMessage JSON). Valid modes: `"telegram"` | `"agent-bridge"`. Unknown values fall back to `"telegram"` with a warn log.
-  - When `replyVia: "agent-bridge"`, peer identity switches from `<telegram-peer-id>` to `<sender-machine-name>` and the session key becomes `agent:main:agent-bridge:default:direct:<sender-machine>`. Replies come back via the native `agent-bridge` channel's outbound SCP adapter (channel-plugin.js :: sendText) instead of the Telegram outbound. No Telegram traffic is generated.
+  - When `replyVia: "agent-bridge"`, peer identity switches from `<telegram-peer-id>` to `<sender-machine-name>` and the session key becomes `agent:main:agent-bridge:<account>:direct:<sender-machine>`. Keeping the real OpenClaw account there is important: it prevents multiple Telegram accounts on the same machine from collapsing onto one shared back-channel session. Replies come back via the native `agent-bridge` channel's outbound SCP adapter (channel-plugin.js :: sendText) instead of the Telegram outbound. No Telegram traffic is generated.
   - Use-case: a Claude session on one machine asking a Claude session on another for context without Ethan's phone pinging.
 
 ## What's new in v2.2.0
@@ -23,7 +23,7 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 
 - **Per-target inbox subdirs.** Watches `~/.agent-bridge/inbox/openclaw/<target>/*.json` instead of the single flat `inbox/`. Each subdir name maps to one configured target in `openclaw.json`.
 - **Auto-discovery of targets from `channels.telegram.accounts`.** In the common case you don't have to write a `targets` block at all — the plugin inspects the OpenClaw global config's `channels.telegram.accounts` map and creates one bridge target per account, routing to `telegram:<account>`. An explicit `targets` block is still accepted as an advanced override. Peer-id resolution walks `targets.<name>.peer_id` → `config.peer_id` → `meta.user_id` → first numeric `chat_id` in `channels.telegram.accounts[<name>].allowFrom`.
-- **Round-trip bridge replies (`fromTarget`).** Inbound BridgeMessages carry an optional `fromTarget` telling the receiver where to put replies. When the agent answers back over the bridge (cross-harness flows), `buildReply(...)` populates the outgoing `target` from `incoming.fromTarget` so the conversation lands in the session that originated it — e.g. OpenClaw ↔ Claude Code works both directions.
+- **Round-trip bridge replies (`fromTarget`).** Inbound BridgeMessages carry an optional `fromTarget` telling the receiver where to put replies. When the agent answers back over the bridge (cross-harness flows), `buildReply(...)` populates the outgoing `target` from `incoming.fromTarget` so the conversation lands in the session that originated it. There is no implicit fallback to `claude-code` or any other shared back-channel target.
 
 ## How it works
 

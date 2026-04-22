@@ -18,7 +18,6 @@ import {
   getMachine,
   getLocalMachineName,
   DEFAULT_TTL_SECONDS,
-  CLAUDE_CODE_TARGET,
   isValidTarget,
 } from './config.js';
 import { sshExec, sshPingDetailed } from './ssh.js';
@@ -166,14 +165,26 @@ export function registerTools(server: McpServer): void {
         + '  • target="openclaw/clordlethird" — OpenClaw @ClordLeThirdBot running Telegram session\n'
         + '  • target="<harness>/<name>"      — any other configured harness\n\n'
         + 'The target field is REQUIRED as of agent-bridge 3.4.0 — there is intentionally no default routing. '
-        + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup.',
-      inputSchema: {
+        + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup. '
+        + '`from_target` / `fromTarget` is optional only for one-way sends. If you expect the remote agent to reply over agent-bridge, set it explicitly to your own local target-id (for example `claude-code`, `openclaw/default`, or `openclaw/clawdiboi2`). There is no implicit back-channel default.',      inputSchema: {
         machine: z.string().describe('Name of the target machine'),
         message: z.string().describe('The message content to send'),
         target: z
           .string()
           .describe(
             'Required. Slash-delimited routing target, e.g. "claude-code", "openclaw/clawdiboi2". Determines which inbox subdir on the remote the message lands in, and which listener picks it up.',
+          ),
+        from_target: z
+          .string()
+          .optional()
+          .describe(
+            'Optional sender-side reply target for one-way sends, but REQUIRED for explicit round-trip routing. Set this to your own local target-id (for example `claude-code`, `openclaw/default`, or `openclaw/clawdiboi2`) when you expect replies to come back over agent-bridge. There is no implicit default back-channel target.',
+          ),
+        fromTarget: z
+          .string()
+          .optional()
+          .describe(
+            'CamelCase alias for `from_target`. Same meaning: your own local target-id for return routing.',
           ),
         reply_to: z
           .string()
@@ -187,7 +198,7 @@ export function registerTools(server: McpServer): void {
           ),
       },
     },
-    async ({ machine: machineName, message, target, reply_to, ttl }) => {
+    async ({ machine: machineName, message, target, from_target, fromTarget, reply_to, ttl }) => {
       const machine = getMachine(machineName);
       if (!machine) {
         const all = loadConfig();
@@ -219,6 +230,39 @@ export function registerTools(server: McpServer): void {
         };
       }
 
+      let resolvedFromTarget: string | undefined;
+      try {
+        resolvedFromTarget = resolveFromTargetArg({
+          from_target,
+          fromTarget,
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Invalid from_target/fromTarget: ${errMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (resolvedFromTarget && !isValidTarget(resolvedFromTarget)) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `Missing/invalid from_target. When provided it must be a valid target like `
+                + `"claude-code" or "openclaw/<account>". `
+                + `Got: ${JSON.stringify(resolvedFromTarget)}.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const localName = getLocalMachineName();
       const msg = createMessage(
         localName,
@@ -228,7 +272,7 @@ export function registerTools(server: McpServer): void {
         reply_to ?? null,
         ttl ?? DEFAULT_TTL_SECONDS,
         target,
-        CLAUDE_CODE_TARGET,
+        resolvedFromTarget,
       );
 
       try {
@@ -462,6 +506,22 @@ export function registerTools(server: McpServer): void {
       };
     },
   );
+}
+
+function resolveFromTargetArg(params: {
+  from_target?: string;
+  fromTarget?: string;
+}): string | undefined {
+  const snake = params.from_target?.trim();
+  const camel = params.fromTarget?.trim();
+
+  if (snake && camel && snake !== camel) {
+    throw new Error(
+      `Conflicting from_target/fromTarget values: ${JSON.stringify(snake)} !== ${JSON.stringify(camel)}`,
+    );
+  }
+
+  return snake || camel || undefined;
 }
 
 function formatBytes(bytes: number): string {

@@ -104,10 +104,10 @@ export async function deliverReply(opts) {
   const configPath = opts.configPath ?? DEFAULT_CONFIG;
   const msg = opts.message;
   const toMachine = opts.toMachine;
-  const targetName = msg.target ?? "claude-code";
+  const targetName = msg.target;
 
   if (!isValidTarget(targetName)) {
-    throw new Error(`invalid BridgeMessage.target: ${JSON.stringify(targetName)}`);
+    throw new Error(`BridgeMessage.target is required for agent-bridge delivery and must be explicit. Got: ${JSON.stringify(targetName ?? null)}`);
   }
 
   const target = resolvePairedMachine(toMachine, configPath);

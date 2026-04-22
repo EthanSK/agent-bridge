@@ -132,7 +132,7 @@ Targets decide which listener on the receiving machine picks up the message:
 - `"openclaw/<account>"` — injects into the OpenClaw Telegram session for `<account>`. If the openclaw side runs the openclaw-channel plugin ≥ 2.1.0, each account under `channels.telegram.accounts` is auto-discovered as a target, so you can address them directly without an extra `targets` block in `openclaw.json`. Replies from the Telegram-bound agent go back via Telegram, not over the bridge.
 - `"<harness>/<name>"` — any other configured harness/subdir. Target names may contain Unicode letters / digits plus `_`, `.`, `-`, `/` (no `..`, no leading/trailing `/`, no `//`, ≤256 chars).
 
-For bidirectional flows across harnesses, set `fromTarget` on outbound messages to your own target-id (e.g. `fromTarget: "openclaw/clawdiboi2"`). The receiver copies that into `reply.target` so the reply round-trips back to the session that originated it instead of defaulting to `claude-code`.
+For bidirectional flows across harnesses, set `fromTarget` (or MCP tool arg `from_target`) on outbound messages to your own target-id (e.g. `fromTarget: "openclaw/clawdiboi2"`). The receiver copies that into `reply.target` so the reply round-trips back to the session that originated it. There is no implicit fallback to `claude-code` or any other shared back-channel target. For OpenClaw-originated sends, always use the CURRENT Telegram account's target-id (`openclaw/default`, `openclaw/clawdiboi2`, etc.) so replies stay isolated per account.
 
 The message is pushed into the running Claude session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event. Its reply comes back the same way. This is the only supported agent-to-agent communication path.
 

@@ -21,9 +21,11 @@
  *
  * `fromTarget` enables bidirectional round-trips (e.g. OpenClaw ↔ Claude Code):
  * when OpenClaw's agent replies via `bridge_send_message`, the reply envelope's
- * `target` is populated from the ORIGINAL incoming message's `fromTarget`
- * (falling back to "claude-code"). This keeps conversations landing back in
- * the session that started them instead of always flowing into `claude-code/`.
+ * `target` is populated from the ORIGINAL incoming message's `fromTarget`.
+ * There is no implicit back-channel fallback target. If the original sender
+ * did not state where replies should go, the reply envelope is emitted without
+ * a bridge target and the outbound path will fail loudly instead of silently
+ * routing to some shared default inbox.
  *
  * `replyVia` (v2.3.0+, openclaw-channel-specific) lets the sender force the
  * replyVia mode on a single incoming message — handy for quick back-channel
@@ -68,14 +70,13 @@ export function parseBridgeMessage(raw) {
 /**
  * Build a reply BridgeMessage envelope.
  *
- * Routing resolution order for `target` (refinement 3 — 2026-04-20):
+ * Routing resolution order for `target`:
  *   1. Explicit `target` argument wins (advanced override).
  *   2. Else if `incoming` is supplied AND `incoming.fromTarget` is present,
  *      use that — this is the round-trip path. The original sender told us
  *      where to put replies; honour it.
- *   3. Else fall back to "claude-code" (the legacy default for the common
- *      "OpenClaw injects into Telegram, cross-harness reply loops back to
- *      Claude Code" flow).
+ *   3. Else leave `target` unset. Agent-bridge reply delivery is explicit-only
+ *      and must fail loudly when no return target was provided.
  *
  * `fromTarget` on the OUTGOING reply is also populated (optional) from the
  * `ownTarget` argument so the peer on the other end can reply back in turn.
@@ -89,8 +90,7 @@ export function buildReply({
   incoming,
   ownTarget,
 }) {
-  const resolvedTarget =
-    target ?? incoming?.fromTarget ?? "claude-code";
+  const resolvedTarget = target ?? incoming?.fromTarget;
   /** @type {Record<string, unknown>} */
   const reply = {
     id: newMessageId(),
@@ -101,8 +101,10 @@ export function buildReply({
     timestamp: Date.now(),
     replyTo: replyToId,
     ttl: 3600,
-    target: resolvedTarget,
   };
+  if (typeof resolvedTarget === "string" && resolvedTarget) {
+    reply.target = resolvedTarget;
+  }
   if (typeof ownTarget === "string" && ownTarget) {
     reply.fromTarget = ownTarget;
   }

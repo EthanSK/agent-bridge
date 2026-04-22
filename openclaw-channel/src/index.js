@@ -23,7 +23,7 @@
  *     back through the live Telegram outbound and Ethan's phone pings.
  *
  *   replyVia: "agent-bridge" — peer-to-peer back-channel. Inbound message
- *     injects into `agent:main:agent-bridge:default:direct:<senderMachine>`
+ *     injects into `agent:main:agent-bridge:<account>:direct:<senderMachine>`
  *     with Provider/OriginatingChannel=agent-bridge, so the agent's reply
  *     flows back through the NATIVE agent-bridge channel (channel-plugin.js
  *     :: sendText), which SCPs a BridgeMessage to the sender machine. No
@@ -282,11 +282,15 @@ export default {
             // dmScope-aware session-key builder (session-key-CbP51u9x.js:175),
             // so we don't need to hand-build the key.
             //
-            // In agent-bridge mode the `accountId` parameter is our native
-            // channel's implicit "default" account (see channel-plugin.js ::
-            // DEFAULT_ACCOUNT_ID), not the OpenClaw target name.
-            const routeAccountId =
-              replyVia === "agent-bridge" ? "default" : account;
+            // In agent-bridge mode we STILL keep the originating OpenClaw
+            // account id (for example default vs clawdiboi2) in the session
+            // route. That preserves per-account isolation when multiple
+            // Telegram accounts on the same machine talk to the same remote
+            // machine over the back-channel. Collapsing everything into the
+            // native channel's implicit "default" account would merge those
+            // conversations onto the same sessionKey and make reply-target
+            // hints overwrite each other.
+            const routeAccountId = account;
             const route = runtime.channel.routing.resolveAgentRoute({
               cfg: hostCfg,
               channel: targetChannel,
@@ -347,7 +351,8 @@ export default {
               fromMachine,
               incoming: msg,
               target,
-              ownTarget: `openclaw/${target.name}`,
+              accountId: account,
+              ownTarget: `openclaw/${account}`,
             });
 
             log.info(
@@ -446,9 +451,11 @@ export default {
  * plausible lookup shapes so the outbound adapter can find the origin
  * machine regardless of which ctx field the host passes through.
  */
-function registerReplyTarget(replyTargets, { sessionKey, fromMachine, incoming, target, ownTarget }) {
-  const hit = { fromMachine, incoming, ownTarget };
+function registerReplyTarget(replyTargets, { sessionKey, fromMachine, incoming, target, accountId, ownTarget }) {
+  const hit = { fromMachine, incoming, ownTarget, accountId };
   if (sessionKey) replyTargets.set(sessionKey, hit);
+  if (accountId) replyTargets.set(String(accountId), hit);
+  if (ownTarget) replyTargets.set(String(ownTarget), hit);
   if (fromMachine) replyTargets.set(String(fromMachine), hit);
   if (fromMachine) {
     replyTargets.set(`${AGENT_BRIDGE_CHANNEL_ID}:${fromMachine}`, hit);
