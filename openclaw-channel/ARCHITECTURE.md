@@ -167,24 +167,30 @@ log rather than silently routing to the wrong chat.
 target-id. When OpenClaw replies over the bridge (cross-harness flows
 where the peer isn't a Telegram session), `envelope.buildReply(...)`
 populates the outgoing `target` from `incoming.fromTarget` so the reply
-lands back in the session that started the conversation. The in-memory
-`replyTargets` map now stashes the whole incoming message + the target's
-own `ownTarget = "openclaw/<name>"` so `channel-plugin.js :: sendText`
-can write a correct `{ target, fromTarget }` pair on the reply envelope.
+lands back in the session that started the conversation. In
+`replyVia="agent-bridge"` mode, the OpenClaw peer id encodes both
+`msg.from` and `msg.fromTarget`; the return target is part of the session
+identity, not just an in-memory hint. That keeps separate sender targets on
+the same machine from collapsing onto one session and survives gateway
+restarts. The in-memory `replyTargets` map remains a fast-path for the
+current dispatch and carries the incoming message id for `replyTo`.
 
 ## Outbound replies
 
 When the agent replies in-turn, OpenClaw's reply pipeline calls our
 `outbound.sendText(ctx)`. We:
 
-1. Resolve the target machine — prefer the `fromMachine` we captured on
-   inbound (stored in an in-memory `replyTargets` Map keyed by
-   `agent-bridge:<machine>`), fall back to `ctx.to`.
+1. Resolve the target machine and return target — decode the persisted
+   agent-bridge peer id from `ctx.to`, then merge any current-process
+   `replyTargets` hit for the incoming message id.
 2. Build a `BridgeMessage` envelope with `type: "reply"` and the correct
    `replyTo` id.
-3. Write it to `~/.agent-bridge/outbound/<id>.json`.
+3. Stage it temporarily at `~/.agent-bridge/outbound/<id>.json`.
 4. `scp -i ~/.agent-bridge/keys/agent-bridge_<remote> <tmp>
-   <user>@<host>:~/.agent-bridge/inbox/<id>.json`.
+   <user>@<host>:~/.agent-bridge/inbox/<target>/<id>.json`.
+5. Remove the local staging file after success or failure. On the receiver,
+   the target watcher moves successfully consumed inbox files to its archive
+   directory; archive is a processed-message trace, not the live queue.
 
 The remote's file watcher / Claude Code channel plugin picks it up and
 pushes it into its running session. Round-trip complete.

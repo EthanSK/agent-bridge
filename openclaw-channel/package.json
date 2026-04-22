@@ -1,6 +1,6 @@
 {
   "name": "@agent-bridge/openclaw-channel",
-  "version": "2.3.1",
+  "version": "2.3.3",
   "description": "First-class OpenClaw channel plugin for agent-bridge. Registers `agent-bridge` as a native channel (same tier as telegram) via the plugin-sdk registerChannel API, with per-target replyVia routing so replies can go back over Telegram (phone ping) or over the agent-bridge back-channel (silent peer-to-peer).",
   "type": "module",
   "main": "./src/index.js",

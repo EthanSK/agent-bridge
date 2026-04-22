@@ -33,7 +33,7 @@ import { initInbox, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 import { registerTools } from './tools.js';
 import { startWatcher, stopWatcher, replayUndeliveredMessages } from './watcher.js';
-import { logInfo, logError } from './logger.js';
+import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 
 // Global error handlers. Most errors are logged and swallowed so the server
@@ -80,14 +80,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.4.2', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.4.4', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.4.2',
+      version: '3.4.4',
     },
     {
       capabilities: {
@@ -140,30 +140,17 @@ async function main(): Promise<void> {
   // Register all tools
   registerTools(server);
 
-  // Watcher-gate (3.4.1): when multiple mcp-server instances run on the same
-  // machine (e.g. Claude Code + every OpenClaw agent that lists agent-bridge
-  // under `mcp.servers`), they all race to watch `inbox/claude-code/` and
-  // `markDelivered` the same files. Whichever wins the race poisons the
-  // shared `.delivered` bookkeeping so the OTHER instance — the one actually
-  // wired to a running Claude Code session via stdio — hits the
-  // `isDelivered` short-circuit in watcher.ts and never pushes the channel
-  // notification. The user-visible symptom is "messages take 60 min to show
-  // up" (really: never, until the process restarts and drops the in-memory
-  // delivered set).
-  //
-  // Any host that spawns mcp-server purely for its OUTBOUND tools (send,
-  // run_command, status) and does NOT consume the channel notification
-  // stream should set `AGENT_BRIDGE_DISABLE_WATCHER=1`. Typical example:
-  //   "mcp": { "servers": { "agent-bridge": {
-  //       "command": "node",
-  //       "args": ["/…/mcp-server/build/index.js"],
-  //       "env":  { "AGENT_BRIDGE_DISABLE_WATCHER": "1" }
-  //   } } }
-  // Claude Code's own mcp.json leaves the variable unset so its single
-  // instance keeps watching inbox/claude-code/ and owns delivery.
+  // Watcher ownership (3.4.4): only the process that is ACTUALLY meant to
+  // push `notifications/claude/channel` should watch `inbox/claude-code/` and
+  // call markDelivered(). Tool-only hosts (for example OpenClaw using this MCP
+  // server only for outbound bridge_* tools) must disable watching entirely.
+  // We now support explicit roles plus a single-owner lease with stale-lock
+  // recovery so a crashed/zombie session cannot permanently block the next run.
+  const bridgeRole = process.env.AGENT_BRIDGE_ROLE?.trim() || '';
   const watcherDisabled =
     process.env.AGENT_BRIDGE_DISABLE_WATCHER === '1'
-    || process.env.AGENT_BRIDGE_ROLE === 'tools-only';
+    || bridgeRole === 'tools-only';
+  let watcherStarted = false;
 
   if (watcherDisabled) {
     logInfo(
@@ -174,65 +161,92 @@ async function main(): Promise<void> {
       event: 'watcher.disabled',
       msg: 'Watcher disabled (tools-only mode)',
       context: {
-        reason: process.env.AGENT_BRIDGE_ROLE === 'tools-only' ? 'role=tools-only' : 'disable_watcher=1',
+        reason: bridgeRole === 'tools-only' ? 'role=tools-only' : 'disable_watcher=1',
         pid: process.pid,
       },
     });
   } else {
+    if (!bridgeRole) {
+      logWarn(
+        'Watcher enabled in legacy auto mode. Prefer AGENT_BRIDGE_ROLE=channel-owner '
+        + 'for the real Claude Code plugin and AGENT_BRIDGE_ROLE=tools-only everywhere else.',
+      );
+      logEvent({
+        event: 'watcher.role_implicit',
+        level: 'warn',
+        msg: 'Watcher running with implicit auto role',
+        context: { pid: process.pid },
+      });
+    }
+
     // Start the inbox file watcher with channel notification callback.
     // When new messages arrive, we push them into Claude's conversation
     // via the MCP channel notification protocol.
-    await startWatcher(
-    (newFiles) => {
-      logInfo(`New messages detected: ${newFiles.length} file(s)`);
-    },
-    (message: BridgeMessage) => {
-      // Push the message into the running Claude session via channel notification.
-      // This makes it appear as <channel source="agent-bridge" ...>content</channel>
-      // in Claude's conversation — no polling needed.
-      logInfo(`Pushing channel notification for message ${message.id} from ${message.from}`);
-      logEvent({
-        event: 'message.pushed_to_channel',
-        msg: `Pushing channel notification for message ${message.id} from ${message.from}`,
-        context: {
-          msg_id: message.id,
-          from: message.from,
-          to: message.to,
-          type: message.type,
-          reply_to: message.replyTo,
-          content_length: message.content?.length ?? 0,
-        },
-      });
-
-      return server.server.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: message.content,
-          meta: {
+    watcherStarted = await startWatcher(
+      (newFiles) => {
+        logInfo(`New messages detected: ${newFiles.length} file(s)`);
+      },
+      (message: BridgeMessage) => {
+        // Push the message into the running Claude session via channel notification.
+        // This makes it appear as <channel source="agent-bridge" ...>content</channel>
+        // in Claude's conversation — no polling needed.
+        logInfo(`Pushing channel notification for message ${message.id} from ${message.from}`);
+        logEvent({
+          event: 'message.pushed_to_channel',
+          msg: `Pushing channel notification for message ${message.id} from ${message.from}`,
+          context: {
+            msg_id: message.id,
             from: message.from,
             to: message.to,
-            message_id: message.id,
-            ...(message.target ? { target: message.target } : {}),
-            ...(message.fromTarget ? { from_target: message.fromTarget } : {}),
             type: message.type,
-            ts: message.timestamp,
-            ...(message.replyTo ? { reply_to: message.replyTo } : {}),
-            ...(message.ttl !== undefined ? { ttl: String(message.ttl) } : {}),
-            authenticated: 'ssh-key',
+            reply_to: message.replyTo,
+            content_length: message.content?.length ?? 0,
           },
-        },
-      }).catch((err) => {
-        logError(`Failed to push channel notification for ${message.id}: ${err}`);
-        logEvent({
-          event: 'message.push_failed',
-          level: 'error',
-          msg: `Failed to push channel notification for ${message.id}`,
-          context: { msg_id: message.id, from: message.from, error: String(err) },
         });
-        throw err;
-      });
-    },
+
+        return server.server.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: message.content,
+            meta: {
+              from: message.from,
+              to: message.to,
+              message_id: message.id,
+              ...(message.target ? { target: message.target } : {}),
+              ...(message.fromTarget ? { from_target: message.fromTarget } : {}),
+              type: message.type,
+              ts: message.timestamp,
+              ...(message.replyTo ? { reply_to: message.replyTo } : {}),
+              ...(message.ttl !== undefined ? { ttl: String(message.ttl) } : {}),
+              authenticated: 'ssh-key',
+            },
+          },
+        }).catch((err) => {
+          logError(`Failed to push channel notification for ${message.id}: ${err}`);
+          logEvent({
+            event: 'message.push_failed',
+            level: 'error',
+            msg: `Failed to push channel notification for ${message.id}`,
+            context: { msg_id: message.id, from: message.from, error: String(err) },
+          });
+          throw err;
+        });
+      },
+      { role: bridgeRole || 'auto' },
     );
+
+    if (!watcherStarted) {
+      logWarn(
+        'Watcher not started because another process already owns claude-code inbox delivery. '
+        + 'This process remains tools-capable but will not push inbound channel messages.',
+      );
+      logEvent({
+        event: 'watcher.standby',
+        level: 'warn',
+        msg: 'Watcher standby: another process owns claude-code inbox delivery',
+        context: { pid: process.pid, role: bridgeRole || 'auto' },
+      });
+    }
   }
 
   // Connect to stdio transport
@@ -248,10 +262,10 @@ async function main(): Promise<void> {
 
   // Replay any messages that arrived while Claude was offline.
   // This must happen AFTER server.connect() so channel notifications
-  // can actually be delivered to the client. Skipped in tools-only mode
-  // (see watcherDisabled above) — replay would otherwise markDelivered the
-  // entire backlog and starve the real Claude Code instance.
-  if (!watcherDisabled) {
+  // can actually be delivered to the client. Only the active watcher owner
+  // may replay; a standby or tools-only process must leave backlog ownership
+  // untouched for the real Claude session.
+  if (watcherStarted) {
     void replayUndeliveredMessages();
   }
 

@@ -308,7 +308,7 @@ export function registerTools(server: McpServer): void {
     {
       title: 'Receive Messages',
       description:
-        'Check for and consume incoming messages from other machines. Messages are removed from the inbox after reading. Use peek=true to check without consuming. Messages are returned in chronological order, deduplicated, and TTL-expired messages are auto-pruned.',
+        'Manual inbox inspection fallback. In normal Claude Code channel-owner mode, incoming messages are pushed automatically; use this tool mainly for diagnostics, tools-only setups, or explicit manual consumption. Messages are removed from the inbox after reading unless peek=true. Results are chronological, deduplicated, and TTL-expired messages are auto-pruned.',
       inputSchema: {
         peek: z
           .boolean()

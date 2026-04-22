@@ -6,7 +6,7 @@
 
 import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { homedir, hostname } from 'os';
-import { join } from 'path';
+import { basename, join } from 'path';
 
 export const BRIDGE_DIR = join(homedir(), '.agent-bridge');
 export const CONFIG_FILE = join(BRIDGE_DIR, 'config');
@@ -14,6 +14,9 @@ export const KEYS_DIR = join(BRIDGE_DIR, 'keys');
 export const INBOX_DIR = join(BRIDGE_DIR, 'inbox');
 export const OUTBOX_DIR = join(BRIDGE_DIR, 'outbox');
 export const LOGS_DIR = join(BRIDGE_DIR, 'logs');
+export const LOCKS_DIR = join(BRIDGE_DIR, 'locks');
+export const MACHINE_NAME_FILE = join(BRIDGE_DIR, 'machine-name');
+export const IDENTITY_FILE = join(BRIDGE_DIR, '.identity');
 export const FAILED_DIR = join(INBOX_DIR, '.failed');
 export const ARCHIVE_DIR = join(INBOX_DIR, '.archive');
 export const UNROUTED_DIR = join(FAILED_DIR, '_unrouted');
@@ -119,6 +122,7 @@ export function ensureDirectories(): void {
     INBOX_DIR,
     OUTBOX_DIR,
     LOGS_DIR,
+    LOCKS_DIR,
     FAILED_DIR,
     ARCHIVE_DIR,
     UNROUTED_DIR,
@@ -215,11 +219,39 @@ export function getMachine(name: string): MachineConfig | undefined {
  * Falls back to hostname.
  */
 export function getLocalMachineName(): string {
-  // Check if there's a local name file
-  const nameFile = join(BRIDGE_DIR, 'machine-name');
-  if (existsSync(nameFile)) {
-    return readFileSync(nameFile, 'utf8').trim();
+  const override = process.env.AGENT_BRIDGE_MACHINE_NAME?.trim();
+  if (override) return override;
+
+  const pinnedName = readNonEmptyFile(MACHINE_NAME_FILE);
+  if (pinnedName) return pinnedName;
+
+  const identityName = machineNameFromIdentity(IDENTITY_FILE);
+  if (identityName) return identityName;
+
+  return normalizeHostname(hostname());
+}
+
+function readNonEmptyFile(path: string): string {
+  if (!existsSync(path)) return '';
+  try {
+    return readFileSync(path, 'utf8').trim();
+  } catch {
+    return '';
   }
-  // Fall back to hostname
-  return hostname().replace(/\.local$/, '');
+}
+
+function machineNameFromIdentity(identityPath: string): string {
+  const keyPath = readNonEmptyFile(identityPath);
+  if (!keyPath) return '';
+  const base = basename(expandHome(keyPath));
+  if (!base.startsWith('agent-bridge_')) return '';
+  return base.slice('agent-bridge_'.length).trim();
+}
+
+function expandHome(path: string): string {
+  return path.startsWith('~/') ? join(homedir(), path.slice(2)) : path;
+}
+
+function normalizeHostname(value: string): string {
+  return value.trim().replace(/\.local$/i, '');
 }

@@ -26,6 +26,7 @@
 
 import { deliverReply, localMachineName } from "./outbound.js";
 import { buildReply } from "./envelope.js";
+import { decodeBridgePeerId } from "./bridge-peer.js";
 
 const CHANNEL_ID = "agent-bridge";
 const DEFAULT_ACCOUNT_ID = "default";
@@ -124,19 +125,22 @@ export function createAgentBridgeChannelPlugin(opts) {
     outbound: {
       deliveryMode: "direct",
       async sendText(ctx) {
-        // ctx.to is the outbound target. For us, this is expected to be the
-        // machine name of the paired peer (e.g. "Ethans-MacBook-Pro"). When
-        // the current reply is an in-turn response to an earlier inbound
-        // message we prefer the fromMachine we captured on inbound (via
-        // ctx.accountId/threadId -> getReplyTargets). The same lookup also
-        // surfaces the last-seen incoming BridgeMessage so `buildReply`
-        // can route the reply back to the sender's own target-ID for a
-        // proper round-trip (refinement 3 — 2026-04-20).
+        // ctx.to is either a legacy machine name or an encoded agent-bridge
+        // peer id containing both the sender machine and the sender's
+        // `fromTarget`. The encoded form is authoritative because it is
+        // persisted in OpenClaw's session route and survives gateway restarts.
         const hit = resolveOutboundTarget(ctx, getReplyTargets);
-        const target = hit?.fromMachine;
-        if (!target) {
+        const toMachine = hit?.fromMachine;
+        const returnTarget = hit?.returnTarget ?? hit?.incoming?.fromTarget;
+        if (!toMachine) {
           throw new Error(
             `agent-bridge outbound: cannot resolve target machine for to="${ctx.to}"`,
+          );
+        }
+        if (!returnTarget) {
+          throw new Error(
+            `agent-bridge outbound: cannot resolve return target for to="${ctx.to}". `
+            + `Inbound bridge messages must carry fromTarget (for example "claude-code" or "openclaw/default").`,
           );
         }
         const pluginCfg = getPluginConfig() ?? {};
@@ -147,21 +151,22 @@ export function createAgentBridgeChannelPlugin(opts) {
           (accountId ? `openclaw/${accountId}` : undefined);
         const msg = buildReply({
           fromMachine: localMachineName(),
-          toMachine: target,
-          replyToId: ctx.replyToId ?? null,
+          toMachine,
+          replyToId: ctx.replyToId ?? hit?.replyToId ?? hit?.incoming?.id ?? null,
           content: ctx.text ?? "",
+          target: returnTarget,
           incoming: hit?.incoming,
           ownTarget,
         });
         await deliverReply({
           message: msg,
-          toMachine: target,
+          toMachine,
           keysDir: pluginCfg.keysDir,
           logger: log,
         });
         return {
           channel: CHANNEL_ID,
-          to: target,
+          to: toMachine,
           messageId: msg.id,
         };
       },
@@ -177,32 +182,60 @@ function resolveOutboundTarget(ctx, getReplyTargets) {
   const targets = getReplyTargets?.();
   const accountId =
     typeof ctx.accountId === "string" ? ctx.accountId.trim() : "";
+  const decodedTo = decodeBridgePeerId(ctx.to);
+  const mergeHit = (hit) => {
+    if (!hit && !decodedTo?.fromMachine) return null;
+    const hitReturnTarget = hit?.returnTarget ?? hit?.incoming?.fromTarget ?? null;
+    const decodedConflictsWithHit =
+      Boolean(decodedTo?.encoded && hit) &&
+      (
+        (hit?.fromMachine && hit.fromMachine !== decodedTo.fromMachine) ||
+        (hitReturnTarget && hitReturnTarget !== decodedTo.returnTarget)
+      );
+    const effectiveHit = decodedConflictsWithHit ? null : hit;
+    return {
+      ...(effectiveHit ?? {}),
+      fromMachine: decodedTo?.fromMachine ?? effectiveHit?.fromMachine,
+      returnTarget:
+        decodedTo?.returnTarget ??
+        effectiveHit?.returnTarget ??
+        effectiveHit?.incoming?.fromTarget ??
+        null,
+      replyToId: effectiveHit?.replyToId ?? effectiveHit?.incoming?.id ?? null,
+      ownTarget:
+        effectiveHit?.ownTarget ??
+        (accountId ? `openclaw/${accountId}` : undefined),
+    };
+  };
+
   if (targets) {
-    const sessionHints = [ctx.threadId, ctx.accountId, ctx.to]
+    const machineTargetHint =
+      decodedTo?.fromMachine && decodedTo?.returnTarget
+        ? `${decodedTo.fromMachine}|${decodedTo.returnTarget}`
+        : null;
+    const sessionHints = [ctx.threadId, ctx.to, machineTargetHint, ctx.accountId]
       .filter((v) => v != null)
       .map((v) => String(v));
     for (const hint of sessionHints) {
       const hit = targets.get(hint);
-      if (hit?.fromMachine) return hit;
+      if (hit?.fromMachine) return mergeHit(hit);
     }
     if (accountId) {
       const hit = targets.get(accountId);
-      if (hit?.fromMachine) return hit;
+      if (hit?.fromMachine) return mergeHit(hit);
       const ownTarget = `openclaw/${accountId}`;
       for (const candidate of targets.values()) {
-        if (candidate?.fromMachine && candidate.ownTarget === ownTarget) return candidate;
+        if (candidate?.fromMachine && candidate.ownTarget === ownTarget) {
+          return mergeHit(candidate);
+        }
       }
     }
   }
-  // Fallback: treat ctx.to as the machine name directly (bridge messages
-  // often encode that explicitly). No incoming context in this case.
-  if (typeof ctx.to === "string" && ctx.to.trim()) {
-    return {
-      fromMachine: ctx.to.trim(),
-      ownTarget: accountId ? `openclaw/${accountId}` : undefined,
-    };
-  }
-  return null;
+
+  return mergeHit(null);
 }
 
 export const AGENT_BRIDGE_CHANNEL_ID = CHANNEL_ID;
+export const __testing = {
+  resolveOutboundTarget,
+};

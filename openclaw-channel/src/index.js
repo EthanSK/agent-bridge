@@ -23,7 +23,8 @@
  *     back through the live Telegram outbound and Ethan's phone pings.
  *
  *   replyVia: "agent-bridge" — peer-to-peer back-channel. Inbound message
- *     injects into `agent:main:agent-bridge:<account>:direct:<senderMachine>`
+ *     injects into an `agent-bridge` session whose peer id encodes both
+ *     `<senderMachine>` and the sender's `<fromTarget>`
  *     with Provider/OriginatingChannel=agent-bridge, so the agent's reply
  *     flows back through the NATIVE agent-bridge channel (channel-plugin.js
  *     :: sendText), which SCPs a BridgeMessage to the sender machine. No
@@ -77,6 +78,7 @@ import {
   AGENT_BRIDGE_CHANNEL_ID,
 } from "./channel-plugin.js";
 import { localMachineName } from "./outbound.js";
+import { encodeBridgePeerId } from "./bridge-peer.js";
 
 const PLUGIN_ID = "agent-bridge";
 const PLUGIN_NAME = "Agent Bridge (Channel v2)";
@@ -256,18 +258,27 @@ export default {
             }
 
             // Figure out the targetChannel + peer identity to inject as.
-            //   telegram mode:    channel=telegram, peer=<Ethan's telegram id>
-            //   agent-bridge mode: channel=agent-bridge, peer=<sender machine>
+            //   telegram mode:     channel=telegram, peer=<Ethan's telegram id>
+            //   agent-bridge mode: channel=agent-bridge, peer=<encoded sender machine + return target>
             let targetChannel;
             let peerId;
+            const returnTarget =
+              typeof msg.fromTarget === "string" && msg.fromTarget.trim()
+                ? msg.fromTarget.trim()
+                : "";
             if (replyVia === "agent-bridge") {
               targetChannel = AGENT_BRIDGE_CHANNEL_ID; // "agent-bridge"
-              peerId = String(fromMachine);
-              if (!peerId || peerId === "unknown") {
+              if (!fromMachine || fromMachine === "unknown") {
                 throw new Error(
                   `replyVia=agent-bridge target="${target.name}": cannot resolve sender machine from msg.from — refusing to dispatch`,
                 );
               }
+              if (!returnTarget) {
+                throw new Error(
+                  `replyVia=agent-bridge target="${target.name}" requires msg.fromTarget so replies know which remote inbox target to use`,
+                );
+              }
+              peerId = encodeBridgePeerId(fromMachine, returnTarget);
             } else {
               targetChannel = target.config.openclaw_channel ?? "telegram";
               peerId = telegramPeerId;
@@ -282,14 +293,12 @@ export default {
             // dmScope-aware session-key builder (session-key-CbP51u9x.js:175),
             // so we don't need to hand-build the key.
             //
-            // In agent-bridge mode we STILL keep the originating OpenClaw
-            // account id (for example default vs clawdiboi2) in the session
-            // route. That preserves per-account isolation when multiple
-            // Telegram accounts on the same machine talk to the same remote
-            // machine over the back-channel. Collapsing everything into the
-            // native channel's implicit "default" account would merge those
-            // conversations onto the same sessionKey and make reply-target
-            // hints overwrite each other.
+            // In agent-bridge mode we keep the originating OpenClaw account id
+            // AND encode the sender's return target in the peer id. The return
+            // target is part of the conversation identity; otherwise
+            // MacBookPro/claude-code and MacBookPro/openclaw/default would
+            // collapse onto one session and replies could land in the wrong
+            // remote inbox target after a later message overwrote the hint.
             const routeAccountId = account;
             const route = runtime.channel.routing.resolveAgentRoute({
               cfg: hostCfg,
@@ -353,6 +362,8 @@ export default {
               target,
               accountId: account,
               ownTarget: `openclaw/${account}`,
+              peerId: String(peerId),
+              returnTarget,
             });
 
             log.info(
@@ -389,9 +400,9 @@ export default {
                   if (!text.trim()) return;
                   await deliverFn({
                     // For telegram, `peerId` is the numeric Telegram user id.
-                    // For agent-bridge, `peerId` is the sender machine name,
-                    // which is exactly what channel-plugin.js :: sendText
-                    // expects on ctx.to.
+                    // For agent-bridge, `peerId` is an encoded machine +
+                    // return-target tuple. channel-plugin.js decodes it before
+                    // calling deliverReply().
                     to: String(peerId),
                     text,
                     cfg: hostCfg,
@@ -451,12 +462,24 @@ export default {
  * plausible lookup shapes so the outbound adapter can find the origin
  * machine regardless of which ctx field the host passes through.
  */
-function registerReplyTarget(replyTargets, { sessionKey, fromMachine, incoming, target, accountId, ownTarget }) {
-  const hit = { fromMachine, incoming, ownTarget, accountId };
+function registerReplyTarget(replyTargets, { sessionKey, fromMachine, incoming, target, accountId, ownTarget, peerId, returnTarget }) {
+  const hit = {
+    fromMachine,
+    incoming,
+    ownTarget,
+    accountId,
+    peerId,
+    returnTarget: returnTarget ?? incoming?.fromTarget ?? null,
+    replyToId: incoming?.id ?? null,
+  };
   if (sessionKey) replyTargets.set(sessionKey, hit);
+  if (peerId) replyTargets.set(String(peerId), hit);
   if (accountId) replyTargets.set(String(accountId), hit);
   if (ownTarget) replyTargets.set(String(ownTarget), hit);
   if (fromMachine) replyTargets.set(String(fromMachine), hit);
+  if (fromMachine && hit.returnTarget) {
+    replyTargets.set(`${fromMachine}|${hit.returnTarget}`, hit);
+  }
   if (fromMachine) {
     replyTargets.set(`${AGENT_BRIDGE_CHANNEL_ID}:${fromMachine}`, hit);
   }

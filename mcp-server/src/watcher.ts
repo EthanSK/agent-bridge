@@ -19,9 +19,20 @@
  *  - Emit channel notifications when new messages arrive (push to Claude)
  */
 
-import { readdirSync, readFileSync, existsSync, mkdirSync, renameSync } from 'fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
-import { CLAUDE_CODE_TARGET, UNROUTED_DIR, inboxSubdir, isValidTarget } from './config.js';
+import { CLAUDE_CODE_TARGET, LOCKS_DIR, UNROUTED_DIR, inboxSubdir, isValidTarget } from './config.js';
 
 /**
  * The inbox subdir this watcher owns. As of mcp-server 3.4.0 the watcher
@@ -43,11 +54,29 @@ type MessageCallback = (files: string[]) => void;
  */
 type ChannelNotifyCallback = (message: BridgeMessage) => void | Promise<void>;
 
+type WatcherLeaseFile = {
+  pid: number;
+  target: string;
+  role: string;
+  token: string;
+  startedAt: number;
+  updatedAt: number;
+};
+
+type WatcherLeaseState = {
+  filePath: string;
+  heartbeat: ReturnType<typeof setInterval>;
+  meta: WatcherLeaseFile;
+};
+
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let knownFiles = new Set<string>();
+let watcherLease: WatcherLeaseState | null = null;
 
 /** Maximum entries in knownFiles before evicting oldest (insertion-order). */
 const KNOWN_FILES_MAX = 2000;
+const WATCHER_LEASE_STALE_MS = 15_000;
+const WATCHER_LEASE_HEARTBEAT_MS = 5_000;
 
 function addKnownFile(name: string): void {
   if (knownFiles.has(name)) return;
@@ -69,6 +98,213 @@ const currentBackend: 'polling' = 'polling';
 
 /** The channel notification callback. */
 let savedChannelCallback: ChannelNotifyCallback | null = null;
+
+function watcherLeasePath(target: string): string {
+  const safeTarget = target.replaceAll('/', '__');
+  return join(LOCKS_DIR, `${safeTarget}.watcher-lock.json`);
+}
+
+function readWatcherLease(filePath: string): WatcherLeaseFile | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<WatcherLeaseFile>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    const pid = Number(parsed.pid);
+    const startedAt = Number(parsed.startedAt);
+    const updatedAt = Number(parsed.updatedAt);
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    if (typeof parsed.target !== 'string' || !parsed.target) return null;
+    if (typeof parsed.role !== 'string' || !parsed.role) return null;
+    if (typeof parsed.token !== 'string' || !parsed.token) return null;
+    if (!Number.isFinite(startedAt) || !Number.isFinite(updatedAt)) {
+      return null;
+    }
+    return {
+      pid,
+      target: parsed.target,
+      role: parsed.role,
+      token: parsed.token,
+      startedAt,
+      updatedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function pidIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as { code?: string }).code !== 'ESRCH';
+  }
+}
+
+function watcherLeaseIsStale(filePath: string, lease: WatcherLeaseFile): boolean {
+  if (!pidIsAlive(lease.pid)) return true;
+  try {
+    const stats = statSync(filePath);
+    const lastUpdated = Math.max(Number(lease.updatedAt) || 0, stats.mtimeMs);
+    return Date.now() - lastUpdated > WATCHER_LEASE_STALE_MS;
+  } catch {
+    return true;
+  }
+}
+
+function clearWatcherLeaseState(): void {
+  if (watcherLease?.heartbeat) {
+    clearInterval(watcherLease.heartbeat);
+  }
+  watcherLease = null;
+}
+
+function releaseWatcherLease(): void {
+  if (!watcherLease) return;
+  const { filePath, meta } = watcherLease;
+  clearWatcherLeaseState();
+  try {
+    const current = readWatcherLease(filePath);
+    if (current?.token === meta.token && existsSync(filePath)) {
+      unlinkSync(filePath);
+      logEvent({
+        event: 'watcher.lease_released',
+        msg: `Watcher lease released for ${meta.target}`,
+        context: { target: meta.target, pid: process.pid, role: meta.role },
+      });
+    }
+  } catch (err) {
+    logWarn(`Watcher: failed to release lease ${filePath}: ${err}`);
+  }
+}
+
+function stopPollingForLeaseLoss(reason: string): void {
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  clearWatcherLeaseState();
+  setWatcherStatus(currentBackend, false);
+  logWarn(`Watcher: stopping poller because lease ownership was lost (${reason})`);
+  logEvent({
+    event: 'watcher.lease_lost',
+    level: 'warn',
+    msg: `Watcher lease lost for ${CLAUDE_CODE_TARGET}`,
+    context: { reason, pid: process.pid, target: CLAUDE_CODE_TARGET },
+  });
+}
+
+function renewWatcherLease(): void {
+  if (!watcherLease) return;
+  try {
+    const current = readWatcherLease(watcherLease.filePath);
+    if (!current || current.token !== watcherLease.meta.token) {
+      stopPollingForLeaseLoss('lock file replaced by another owner');
+      return;
+    }
+    watcherLease.meta.updatedAt = Date.now();
+    writeFileSync(watcherLease.filePath, JSON.stringify(watcherLease.meta, null, 2));
+  } catch (err) {
+    logWarn(`Watcher: failed to renew lease heartbeat: ${err}`);
+  }
+}
+
+function tryAcquireWatcherLease(role: string): boolean {
+  mkdirSync(LOCKS_DIR, { recursive: true, mode: 0o700 });
+  const filePath = watcherLeasePath(CLAUDE_CODE_TARGET);
+  const now = Date.now();
+  const meta: WatcherLeaseFile = {
+    pid: process.pid,
+    target: CLAUDE_CODE_TARGET,
+    role,
+    token: `${process.pid}-${now}-${Math.random().toString(36).slice(2, 10)}`,
+    startedAt: now,
+    updatedAt: now,
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const fd = openSync(filePath, 'wx', 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify(meta, null, 2));
+      } finally {
+        closeSync(fd);
+      }
+      const heartbeat = setInterval(renewWatcherLease, WATCHER_LEASE_HEARTBEAT_MS);
+      heartbeat.unref?.();
+      watcherLease = { filePath, heartbeat, meta };
+      logInfo(`Watcher lease acquired for ${meta.target} (role=${role}, pid=${process.pid})`);
+      logEvent({
+        event: 'watcher.lease_acquired',
+        msg: `Watcher lease acquired for ${meta.target}`,
+        context: { target: meta.target, role, pid: process.pid },
+      });
+      return true;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code !== 'EEXIST') {
+        logError(`Watcher: failed to acquire lease ${filePath}: ${err}`);
+        return false;
+      }
+
+      const existing = readWatcherLease(filePath);
+      if (!existing) {
+        try {
+          unlinkSync(filePath);
+          continue;
+        } catch (unlinkErr) {
+          logWarn(`Watcher: could not remove malformed lease ${filePath}: ${unlinkErr}`);
+          return false;
+        }
+      }
+
+      if (!watcherLeaseIsStale(filePath, existing)) {
+        logWarn(
+          `Watcher standby: ${CLAUDE_CODE_TARGET} lease already held by pid=${existing.pid} role=${existing.role}`,
+        );
+        logEvent({
+          event: 'watcher.lease_busy',
+          level: 'warn',
+          msg: `Watcher lease busy for ${CLAUDE_CODE_TARGET}`,
+          context: {
+            target: CLAUDE_CODE_TARGET,
+            holderPid: existing.pid,
+            holderRole: existing.role,
+            pid: process.pid,
+            role,
+          },
+        });
+        return false;
+      }
+
+      try {
+        unlinkSync(filePath);
+        logWarn(
+          `Watcher: removed stale lease for ${CLAUDE_CODE_TARGET} held by pid=${existing.pid} role=${existing.role}`,
+        );
+        logEvent({
+          event: 'watcher.lease_stolen',
+          level: 'warn',
+          msg: `Removed stale watcher lease for ${CLAUDE_CODE_TARGET}`,
+          context: {
+            target: CLAUDE_CODE_TARGET,
+            stalePid: existing.pid,
+            staleRole: existing.role,
+            pid: process.pid,
+            role,
+          },
+        });
+      } catch (unlinkErr) {
+        logWarn(`Watcher: failed to remove stale lease ${filePath}: ${unlinkErr}`);
+        return false;
+      }
+    }
+  }
+
+  return false;
+}
 
 /**
  * Try to parse a message file and emit a channel notification.
@@ -210,7 +446,8 @@ function startPolling(callback: MessageCallback): void {
 export async function startWatcher(
   callback: MessageCallback,
   channelCallback?: ChannelNotifyCallback,
-): Promise<void> {
+  opts?: { role?: string },
+): Promise<boolean> {
   if (channelCallback) {
     savedChannelCallback = channelCallback;
   }
@@ -220,8 +457,15 @@ export async function startWatcher(
     mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 });
   }
 
+  const role = opts?.role?.trim() || 'auto';
+  if (!tryAcquireWatcherLease(role)) {
+    setWatcherStatus(currentBackend, false);
+    return false;
+  }
+
   initKnownFiles();
   startPolling(callback);
+  return true;
 }
 
 /**
@@ -309,6 +553,7 @@ export function stopWatcher(): void {
     clearInterval(pollInterval);
     pollInterval = null;
   }
+  releaseWatcherLease();
   setWatcherStatus(currentBackend, false);
   logInfo('Watcher stopped');
   logEvent({

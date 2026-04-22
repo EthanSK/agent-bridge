@@ -99,6 +99,7 @@ function expandHome(path) {
  * @param {string} [opts.keysDir]
  * @param {string} [opts.outboundDir]
  * @param {string} [opts.configPath]
+ * @param {number} [opts.commandTimeoutMs]
  * @param {object} [opts.logger]
  */
 export async function deliverReply(opts) {
@@ -106,6 +107,7 @@ export async function deliverReply(opts) {
   const keysDir = opts.keysDir ?? DEFAULT_KEYS_DIR;
   const outboundDir = opts.outboundDir ?? DEFAULT_OUTBOUND;
   const configPath = opts.configPath ?? DEFAULT_CONFIG;
+  const commandTimeoutMs = opts.commandTimeoutMs ?? 30_000;
   const msg = opts.message;
   const toMachine = opts.toMachine;
   const targetName = msg.target;
@@ -173,12 +175,16 @@ export async function deliverReply(opts) {
     await runCommand("ssh", [
       ...sshBaseArgs,
       `mkdir -p "$HOME/.agent-bridge/inbox/${targetName}"`,
-    ], log);
-    await runCommand("scp", scpArgs, log);
+    ], log, commandTimeoutMs);
+    await runCommand("scp", scpArgs, log, commandTimeoutMs);
     await runCommand("ssh", [
       ...sshBaseArgs,
       `mv -f "$HOME/.agent-bridge/inbox/${targetName}/${remoteTmpName}" "$HOME/.agent-bridge/inbox/${targetName}/${msg.id}.json"`,
-    ], log);
+    ], log, commandTimeoutMs);
+    log.info?.(
+      `agent-bridge reply delivered id=${msg.id} to=${toMachine} target=${targetName}`
+      + (msg.replyTo ? ` replyTo=${msg.replyTo}` : ""),
+    );
   } finally {
     try {
       unlinkSync(tmpPath);
@@ -199,18 +205,44 @@ function isValidTarget(target) {
   return target.split("/").every((segment) => segmentPattern.test(segment));
 }
 
-function runCommand(cmd, args, log) {
+function runCommand(cmd, args, log, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill("SIGTERM");
+        const killTimer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* ignore */
+          }
+        }, 2000);
+        killTimer.unref?.();
+      } catch {
+        /* ignore */
+      }
+      reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timeout.unref?.();
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      fn(value);
+    };
     child.stdout.on("data", (b) => log.debug?.(String(b).trim()));
     child.stderr.on("data", (b) => {
       stderr += String(b);
     });
-    child.on("error", reject);
+    child.on("error", (err) => finish(reject, err));
     child.on("exit", (code) => {
-      if (code === 0) return resolve();
-      reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`));
+      if (code === 0) return finish(resolve);
+      finish(reject, new Error(`${cmd} exited ${code}: ${stderr.trim()}`));
     });
   });
 }

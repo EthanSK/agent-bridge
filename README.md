@@ -453,11 +453,11 @@ alias claude-tel='claude --dangerously-skip-permissions --channels plugin:telegr
 **Why the flag is still required:** Earlier versions of this doc claimed the plugin install removed the need for `--dangerously-load-development-channels`. That was wrong. Claude Code's channel allowlist gates on the marketplace's trust status, not just whether the plugin is installed. A **local directory marketplace** is by definition a dev source, so the allowlist rejects channels from it without the flag. The flag becomes unnecessary only once the plugin is published through an official marketplace Claude Code trusts.
 
 **How it works:**
-1. The plugin's `.mcp.json` registers a single `agent-bridge` MCP server.
+1. The plugin's `.mcp.json` registers a single `agent-bridge` MCP server and sets `AGENT_BRIDGE_ROLE=channel-owner`.
 2. That server declares the `claude/channel` experimental capability AND the `bridge_*` tools.
-3. When a message arrives in `~/.agent-bridge/inbox/`, the file watcher pushes it via `notifications/claude/channel`.
+3. When a message arrives in `~/.agent-bridge/inbox/claude-code/`, the watcher-owner pushes it via `notifications/claude/channel`.
 4. It appears in the conversation as: `<channel source="agent-bridge" from="MachineName" message_id="..." ts="...">content</channel>`.
-5. Respond using `bridge_send_message` — no need to call `bridge_receive_messages`.
+5. Respond using `bridge_send_message` — no need to call `bridge_receive_messages` unless you are debugging a tools-only/manual setup.
 
 The bash `agent-bridge` CLI (used for `pair`, `list`, `status`, `run`, `connect`) coexists with the plugin and is still installed via `./install.sh`.
 
@@ -496,7 +496,7 @@ OpenClaw connects to agent-bridge as both an MCP server (for tools) and, optiona
 
 **Step 1 -- MCP server (gives you bridge tools):**
 ```bash
-openclaw mcp set agent-bridge '{"command":"node","args":["/absolute/path/to/agent-bridge/mcp-server/build/index.js"]}'
+openclaw mcp set agent-bridge '{"command":"node","args":["/absolute/path/to/agent-bridge/mcp-server/build/index.js"],"env":{"AGENT_BRIDGE_ROLE":"tools-only"}}'
 ```
 
 **Step 2 -- install the skill:**
@@ -520,7 +520,7 @@ Install the native OpenClaw channel plugin (`openclaw-channel/`):
   }
 }
 ```
-Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegram) via `api.registerChannel()`. Inbound messages dispatch through `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` — the same dispatch primitive used by the native IRC / Nextcloud Talk channels — so a bridge message arriving for a Telegram-bound target runs a real agent turn and the reply lands in the Telegram chat. No CLI shell-out, no scanner bypass. Cross-harness outbound replies SCP a `BridgeMessage` back to the sender. See [`openclaw-channel/README.md`](openclaw-channel/README.md) and [`openclaw-channel/ARCHITECTURE.md`](openclaw-channel/ARCHITECTURE.md).
+Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegram) via `api.registerChannel()`. Inbound messages dispatch through `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` — the same dispatch primitive used by the native IRC / Nextcloud Talk channels — so a bridge message arriving for a Telegram-bound target runs a real agent turn and the reply lands in the Telegram chat. No CLI shell-out, no scanner bypass. Cross-harness outbound replies SCP a `BridgeMessage` back to the sender. Keep the MCP server in `tools-only` mode on OpenClaw, so only the real Claude Code plugin owns `inbox/claude-code/` delivery. See [`openclaw-channel/README.md`](openclaw-channel/README.md) and [`openclaw-channel/ARCHITECTURE.md`](openclaw-channel/ARCHITECTURE.md).
 
 > **Migrating from v1.3.0 (`openclaw-plugin/`)?** That extension plugin has been removed as of v2.0.0. Delete any `plugins.entries["agent-bridge"]` block from your config and point `plugins.load.paths` at the new `openclaw-channel/` directory. The gateway hot-reloads on config change.
 
@@ -864,7 +864,7 @@ Each entry resolves to an OpenClaw session route via `runtime.channel.routing.re
 
 **Round-trip bridge replies.** `BridgeMessage` carries an optional `fromTarget` field — the sender's OWN target-id. When an agent replies back over the bridge (cross-harness agent ↔ agent flows), `fromTarget` is copied into the reply's `target` field so the reply lands back in the session that started the conversation. There is no implicit fallback to `claude-code` or any other shared back-channel target. For round-trip conversations, send `from_target` / `fromTarget` explicitly as your local target-id (for example `claude-code`, `openclaw/default`, or `openclaw/clawdiboi2`).
 
-Listeners are independent processes: Claude Code's channel plugin and the OpenClaw gateway watch their own subdirs. One crashing doesn't affect the other.
+Listeners are independent processes: Claude Code's channel-owner plugin watches only `inbox/claude-code/`, and the OpenClaw gateway watches only its configured `inbox/openclaw/<target>/` subdirs. Tool-only MCP hosts should not watch `claude-code` at all. One crashing doesn't affect the other, and the Claude-side watcher lease auto-recovers from stale locks on restart.
 
 ---
 
