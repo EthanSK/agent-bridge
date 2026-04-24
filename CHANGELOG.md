@@ -1,5 +1,12 @@
 # Changelog
 
+## agent-bridge 3.4.8 — 2026-04-24
+
+### Fix: channel-parent detection regex
+
+- Fixed the 3.4.7 watcher-owner guard so Claude channel parents with `--channels ...` or `--dangerously-load-development-channels ...` are recognized correctly.
+- This repairs the accidental tools-only demotion caused by a literal backspace character in the generated regex and lets the real Claude Code channel plugin acquire the `claude-code` watcher lease again.
+
 ## agent-bridge 3.4.7 — 2026-04-24
 
 ### Fix: prevent tool-only Claude helpers stealing `claude-code` watcher ownership

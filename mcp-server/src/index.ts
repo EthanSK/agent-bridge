@@ -90,8 +90,8 @@ function parentLooksChannelCapable(commandLine: string): boolean {
   // not process notifications/claude/channel. If they win the watcher lease,
   // messages are marked delivered and then disappear from the intended live
   // channel. Treat those parents as tools-only by default.
-  return /--channels/.test(commandLine)
-    || /--dangerously-load-development-channels/.test(commandLine);
+  return /--channels(?:\s|=|$)/.test(commandLine)
+    || /--dangerously-load-development-channels(?:\s|=|$)/.test(commandLine);
 }
 
 async function main(): Promise<void> {
@@ -106,14 +106,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.4.7', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.4.8', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.4.7',
+      version: '3.4.8',
     },
     {
       capabilities: {

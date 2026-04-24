@@ -156,7 +156,11 @@ $ agent-bridge pair \
 
 ```
 # From Claude Code on Machine A, the channel plugin gives you:
-bridge_send_message("MacBook-Pro", "can you check whether the tests pass in ~/Projects/myapp and tell me what broke?")
+bridge_send_message({
+  machine: "MacBook-Pro",
+  message: "can you check whether the tests pass in ~/Projects/myapp and tell me what broke?",
+  target: "claude-code"
+})
 
 # Over on MacBook-Pro, the running Claude session sees, pushed into its context:
 <channel source="agent-bridge" from="Mac-Mini" message_id="msg-..." ts="...">
@@ -615,7 +619,7 @@ The `.delivered` tracker file (`~/.agent-bridge/inbox/.delivered`) prevents dupl
 
 ## Message format
 
-Messages are JSON files stored in `~/.agent-bridge/inbox/`:
+Messages are JSON files stored in the receiver's target-specific inbox subdir, e.g. `~/.agent-bridge/inbox/claude-code/<id>.json`:
 
 ```json
 {
@@ -626,7 +630,9 @@ Messages are JSON files stored in `~/.agent-bridge/inbox/`:
   "content": "The tests are passing now. I fixed the import path in utils.ts.",
   "timestamp": "2026-04-13T01:15:00.000Z",
   "replyTo": null,
-  "ttl": 86400
+  "ttl": 86400,
+  "target": "claude-code",
+  "fromTarget": "claude-code"
 }
 ```
 
@@ -635,7 +641,7 @@ Messages are JSON files stored in `~/.agent-bridge/inbox/`:
 | `id` | string | Unique message ID (`msg-` prefix + UUID) |
 | `from` | string | Sender machine name |
 | `to` | string | Target machine name |
-| `type` | `"message"` / `"command"` / `"response"` | Message type |
+| `type` | `"message"` / `"command"` / `"response"` / `"reply"` | Message type |
 | `content` | string | The message body |
 | `timestamp` | string | ISO 8601 creation time |
 | `replyTo` | string or null | Message ID this is a reply to (for threading) |
@@ -1319,7 +1325,11 @@ agent-bridge run MacBook-Pro "cd ~/Projects/myapp && git pull && npm install && 
 From inside an agent session with the channel plugin loaded, call:
 
 ```
-bridge_send_message("MacBook-Pro", "review the code in ~/Projects/myapp and suggest improvements")
+bridge_send_message({
+  machine: "MacBook-Pro",
+  message: "review the code in ~/Projects/myapp and suggest improvements",
+  target: "claude-code"
+})
 ```
 
 The message is pushed into the running Claude Code session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event, and its reply comes back the same way. Do NOT shell out to `agent-bridge run ... --claude` — that path was removed in 3.0.0 because it spawned a fresh non-interactive agent instead of using the live session.

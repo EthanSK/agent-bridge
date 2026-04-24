@@ -77,7 +77,11 @@ agent-bridge run MacBook-Pro "brew update && brew upgrade"
 Use the `bridge_send_message` MCP tool from the channel plugin:
 
 ```
-bridge_send_message("MacBook-Pro", "fix the failing tests in ~/Projects/myapp")
+bridge_send_message({
+  machine: "MacBook-Pro",
+  message: "fix the failing tests in ~/Projects/myapp",
+  target: "claude-code"
+})
 ```
 
 The message is pushed into the live Claude session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event, and the reply comes back the same way. This is the only supported agent-to-agent path.
@@ -137,7 +141,11 @@ agent-bridge run MacBook-Pro "cd ~/Projects/myapp && git pull && npm install && 
 From inside your agent session (with the channel plugin loaded):
 
 ```
-bridge_send_message("MacBook-Pro", "review the code in ~/Projects/myapp/src/ and suggest improvements")
+bridge_send_message({
+  machine: "MacBook-Pro",
+  message: "review the code in ~/Projects/myapp/src/ and suggest improvements",
+  target: "claude-code"
+})
 ```
 
 The running remote agent receives it in-context and replies via `bridge_send_message` back to this machine.
@@ -199,8 +207,8 @@ Add to Claude Code MCP config (`~/.claude/.mcp.json`):
 
 ### Messaging workflow (channel mode)
 
-1. Machine A's Claude calls `bridge_send_message("MacBookPro", "check the test results")`
-2. The message is written to Machine B's `~/.agent-bridge/inbox/` via SSH
+1. Machine A's Claude calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code" })`
+2. The message is written to Machine B's `~/.agent-bridge/inbox/claude-code/<id>.json` via SSH
 3. Machine B's file watcher detects the new file
 4. Machine B's channel plugin pushes the message into the running Claude session
 5. Machine B's Claude sees `<channel source="agent-bridge" ...>` and responds via `bridge_send_message`

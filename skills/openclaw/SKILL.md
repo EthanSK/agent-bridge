@@ -93,5 +93,9 @@ agent-bridge run MacBook-Pro "cd ~/Projects/myapp && git pull && npm run build"
 To ask the running remote agent to do work, use `bridge_send_message` (MCP), NOT the CLI:
 
 ```
-bridge_send_message("MacBook-Pro", "review the code in ~/Projects/myapp")
+bridge_send_message({
+  machine: "MacBook-Pro",
+  message: "review the code in ~/Projects/myapp",
+  target: "claude-code"
+})
 ```

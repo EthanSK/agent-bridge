@@ -153,7 +153,7 @@ Prefer the plugin install path above — it removes the need for this flag.
 
 ### Message flow
 
-1. Machine A's agent calls `bridge_send_message("MacBook", "check the test results")`
+1. Machine A's agent calls `bridge_send_message({ machine: "MacBook", message: "check the test results", target: "claude-code" })`
 2. The message is written to Machine B's target-specific inbox subdir via SSH, e.g. `~/.agent-bridge/inbox/claude-code/<id>.json`
 3. Machine B's file watcher detects the new file
 4. **Push mode:** Channel plugin pushes the message into the running Claude session
