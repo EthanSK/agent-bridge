@@ -2,6 +2,8 @@
 
 **Bridge running Claude Code and OpenClaw sessions across machines. Agent-to-agent push comms over SSH.**
 
+> 🚨 **First diagnostic: make sure every machine is actually running the current Agent Bridge code.** A common cause of confusing failures is stale runtime code: the repo may have been pulled, but the installed `agent-bridge` CLI, `mcp-server/build/` bundle, Claude Code plugin process, OpenClaw channel plugin, or long-running agent session may still be on an older version. Before debugging deeper, pull the repo on both sides, rebuild/reinstall where needed, restart or resume the affected host/plugin, and verify the live version/commit from that machine.
+>
 > ✅ **Tested end-to-end with Claude Code and OpenClaw.** They use different host models over the same SSH/file transport: Claude Code uses a unified MCP + experimental `claude/channel` plugin over stdio; OpenClaw uses the separate native `openclaw-channel/` plugin plus the MCP server, including cross-machine `replyVia: "agent-bridge"` round trips. Codex CLI, Gemini CLI, Aider, and other MCP hosts remain scaffolded/manual-polling integrations until verified in their own harnesses.
 >
 > ⚠️ **Breaking change in 3.0.0:** the `--claude`, `--codex`, and `--agent` flags on `agent-bridge run` have been removed. Agent-to-agent communication is channel-mode only (`bridge_send_message` → inbox drop → running remote agent's context). See [CHANGELOG.md](CHANGELOG.md) for details. The plain-shell `agent-bridge run <machine> "<cmd>"` is still supported for diagnostics.
