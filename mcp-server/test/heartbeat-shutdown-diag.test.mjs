@@ -1,5 +1,5 @@
 /**
- * Smoke tests for 3.5.2 diagnostic instrumentation:
+ * Smoke tests for 3.5.3 diagnostic instrumentation:
  *   - server.heartbeat events appear at ~60s intervals
  *   - server.shutdown_diag dumps active handles + requests on shutdown
  *
@@ -77,7 +77,7 @@ test('server.shutdown_diag dumps active handles and request counts on shutdown',
     const events = await readEvents(home);
     const starting = events.find((e) => e.event === 'server.starting');
     assert.ok(starting, 'expected server.starting event');
-    assert.equal(starting.context.version, '3.5.2', 'startup event should report version 3.5.2');
+    assert.equal(starting.context.version, '3.5.3', 'startup event should report version 3.5.3');
 
     const diag = events.find((e) => e.event === 'server.shutdown_diag');
     assert.ok(diag, 'expected server.shutdown_diag event on shutdown');

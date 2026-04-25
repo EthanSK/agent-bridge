@@ -1,5 +1,22 @@
 # Changelog
 
+## agent-bridge 3.5.3 — 2026-04-25
+
+### Fix: make stdout/EPIPE watcher exits visible and clear stale leases
+
+Live Mini evidence after 3.5.2 showed the remaining Claude Code channel-owner death path: a watcher could successfully push a channel notification, then see Claude close stdin/SIGTERM, and then disappear with no `server.shutdown`, no `shutdown_diag`, no `parent.dead`, and a stale `claude-code.watcher-lock.json`. The missing path was the stdout/JSON-RPC broken-pipe handler: stdout is the channel transport, so EPIPE is fatal, but the old handler called `process.exit(0)` without durable logging or lease cleanup.
+
+3.5.3 keeps the correct semantic boundary — if stdout is gone, Claude cannot receive channel notifications from that MCP child — but removes the silent/stale failure mode:
+
+- Logs `stdout.broken_pipe_exit`, `stdin.broken_pipe_exit`, `unhandled_rejection.broken_pipe_exit`, or `uncaught_exception.broken_pipe_exit` before exiting.
+- Releases the watcher lease via `stopWatcher()` and stops inbox/prune state via `shutdownInbox()` before fatal transport exit when JS still has a chance to clean up.
+- `bridge_inbox_stats` now reads the shared watcher lease file, so tools-only MCP children can report the real channel-owner PID/role/alive/fresh state instead of only their own process-local `unknown/no` watcher state.
+- Adds regression coverage for shared-lease stats and source-level guards that broken-pipe handlers no longer silently `process.exit(0)`. A manual pipe-close reproduction also produced `stdout.broken_pipe_exit` and removed the lock.
+
+#### Root-cause implication
+
+This does not pretend Claude Code delivery is a separate always-on daemon. The root architectural issue is still that the `claude-code` watcher lives inside a Claude-managed MCP stdio child. When Claude closes/reaps that stdout transport, live push from that child is impossible; the correct behaviour is now to log the transport death, release ownership, and let the next live channel-owner/replay recover instead of leaving a ghost lock and no evidence. A true always-on Claude route would need a larger 3.6.x architecture change.
+
 ## agent-bridge 3.5.2 — 2026-04-25
 
 ### Fix: post-mortem visibility + sibling-MCP step-down + SIGKILL backstop

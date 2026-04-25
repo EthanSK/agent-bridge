@@ -29,9 +29,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CLAUDE_CODE_TARGET, LOCKS_DIR, ensureDirectories, getLocalMachineName } from './config.js';
+import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, ensureDirectories, getLocalMachineName } from './config.js';
 import { initInbox, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 import { registerTools } from './tools.js';
@@ -52,6 +52,86 @@ function isBrokenPipe(err: unknown): boolean {
   return /write EPIPE|Broken pipe|premature close|ERR_STREAM_DESTROYED/i.test(msg);
 }
 
+function syncExitBreadcrumb(event: string, context: Record<string, unknown> = {}): void {
+  // Last-ditch post-mortem breadcrumb. This intentionally bypasses logger.ts
+  // and log.ts so a transport/logger failure cannot hide the exact death path.
+  try {
+    mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
+    appendFileSync(
+      join(LOGS_DIR, 'mcp-server-sync-exit.log'),
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        event,
+        pid: process.pid,
+        ppid: process.ppid,
+        uptime_ms: Math.floor(process.uptime() * 1000),
+        ...context,
+      }) + '\n',
+    );
+  } catch {
+    // No stdout/stderr fallback here: this path is specifically for broken
+    // stdio/logging scenarios, and breadcrumbs must never affect liveness.
+  }
+}
+
+let fatalTransportExitStarted = false;
+
+function fatalTransportExit(event: string, msg: string, err?: unknown): never {
+  syncExitBreadcrumb('fatal_transport_exit.enter', {
+    transport_event: event,
+    error: err ? String(err) : undefined,
+    already_started: fatalTransportExitStarted,
+  });
+  if (fatalTransportExitStarted) {
+    syncExitBreadcrumb('fatal_transport_exit.reentrant_exit', { transport_event: event });
+    process.exit(0);
+  }
+  fatalTransportExitStarted = true;
+
+  const anyErr = err as { code?: string; message?: string } | undefined;
+  try {
+    logError(`${msg}${err ? `: ${String(err)}` : ''}`);
+  } catch {}
+  try {
+    logEvent({
+      event,
+      level: 'error',
+      msg,
+      context: {
+        pid: process.pid,
+        parent_pid: process.ppid,
+        error_code: anyErr?.code,
+        error_message: anyErr?.message ?? (err ? String(err) : undefined),
+      },
+    });
+  } catch {}
+
+  // Broken stdout means JSON-RPC/channel delivery is gone. Before exiting,
+  // release the watcher lease synchronously where possible so bridge_inbox_stats
+  // and standby owners do not stare at a stale lock for the full timeout.
+  try {
+    stopWatcher();
+    syncExitBreadcrumb('fatal_transport_exit.after_stop_watcher', { transport_event: event });
+  } catch (stopErr) {
+    syncExitBreadcrumb('fatal_transport_exit.stop_watcher_error', { transport_event: event, error: String(stopErr) });
+    try { logError(`stopWatcher before fatal transport exit failed: ${stopErr}`); } catch {}
+  }
+  try {
+    shutdownInbox();
+    syncExitBreadcrumb('fatal_transport_exit.after_shutdown_inbox', { transport_event: event });
+  } catch (shutdownErr) {
+    syncExitBreadcrumb('fatal_transport_exit.shutdown_inbox_error', { transport_event: event, error: String(shutdownErr) });
+    try { logError(`shutdownInbox before fatal transport exit failed: ${shutdownErr}`); } catch {}
+  }
+
+  syncExitBreadcrumb('fatal_transport_exit.before_process_exit', { transport_event: event, code: 0 });
+  process.exit(0);
+}
+
+process.on('exit', (code) => {
+  syncExitBreadcrumb('process.exit_event', { code });
+});
+
 process.stderr.on('error', (err) => {
   // stderr is diagnostic only. Claude Code may close it between tool turns;
   // logger.ts already writes the durable file log first, so swallow stderr
@@ -63,21 +143,21 @@ process.stderr.on('error', (err) => {
 process.stdout.on('error', (err) => {
   // stdout is the JSON-RPC transport. If that pipe breaks, the MCP connection
   // is gone and channel notifications cannot be delivered to Claude anymore.
-  if (isBrokenPipe(err)) process.exit(0);
+  if (isBrokenPipe(err)) {
+    fatalTransportExit('stdout.broken_pipe_exit', 'stdout broken pipe — JSON-RPC/channel transport closed; releasing watcher lease before exit', err);
+  }
   try { logError(`stdout error: ${err}`); } catch {}
 });
 
 process.on('unhandledRejection', (err) => {
   if (isBrokenPipe(err)) {
-    try { logError(`Unhandled rejection EPIPE — parent pipe closed, exiting`); } catch {}
-    process.exit(0);
+    fatalTransportExit('unhandled_rejection.broken_pipe_exit', 'Unhandled rejection EPIPE — parent pipe closed; releasing watcher lease before exit', err);
   }
   logError(`Unhandled rejection: ${err}`);
 });
 process.on('uncaughtException', (err) => {
   if (isBrokenPipe(err)) {
-    try { logError(`Uncaught exception EPIPE — parent pipe closed, exiting`); } catch {}
-    process.exit(0);
+    fatalTransportExit('uncaught_exception.broken_pipe_exit', 'Uncaught exception EPIPE — parent pipe closed; releasing watcher lease before exit', err);
   }
   logError(`Uncaught exception: ${err}`);
 });
@@ -134,14 +214,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.5.2', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.5.3', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.5.2',
+      version: '3.5.3',
     },
     {
       capabilities: {
@@ -357,6 +437,7 @@ async function main(): Promise<void> {
   let shuttingDown = false;
   let parentWatchdog: NodeJS.Timeout | null = null;
   const shutdown = (reason: string) => {
+    syncExitBreadcrumb('shutdown.enter', { reason, already_shutting_down: shuttingDown, watcherStarted, bridgeRole });
     if (shuttingDown) return;
     shuttingDown = true;
 
@@ -406,6 +487,7 @@ async function main(): Promise<void> {
     // the Telegram channel plugin's discipline — no MCP server should ever
     // survive its parent.
     const forceExit = setTimeout(() => {
+      syncExitBreadcrumb('shutdown.force_exit_timer', { reason, code: 0 });
       try { logError('Shutdown timeout exceeded, force-exiting'); } catch {}
       process.exit(0);
     }, 2000);
@@ -417,6 +499,7 @@ async function main(): Promise<void> {
     // is kernel-delivered and ALWAYS terminates. Pairs with the Telegram
     // channel plugin's identical backstop (server.ts ~line 693).
     const sigkillBackstop = setTimeout(() => {
+      syncExitBreadcrumb('shutdown.sigkill_backstop', { reason, signal: 'SIGKILL' });
       try { logError('Shutdown sigkill backstop firing — process.exit(0) was swallowed'); } catch {}
       try { process.kill(process.pid, 'SIGKILL'); } catch { /* if even SIGKILL fails, fall through */ }
     }, 5000);
@@ -434,6 +517,7 @@ async function main(): Promise<void> {
       .catch((err) => { try { logError(`Error closing MCP server: ${err}`); } catch {} })
       .finally(() => {
         try { logInfo('agent-bridge MCP server shut down cleanly'); } catch {}
+        syncExitBreadcrumb('shutdown.before_process_exit', { reason, code: 0 });
         process.exit(0);
       });
   };
@@ -451,6 +535,7 @@ async function main(): Promise<void> {
   };
 
   const handleSignal = (signal: NodeJS.Signals) => {
+    syncExitBreadcrumb('signal.received', { signal, watcherStarted, bridgeRole, parent_alive: signalParentAlive() });
     // Claude Code may send SIGTERM to plugin MCP children after a tool turn even
     // though the parent channel session remains live. For channel-owner
     // watchers, treat that like the benign stdin end/close path and keep the
@@ -498,7 +583,9 @@ async function main(): Promise<void> {
   process.stdin.on('end', () => onStdioEnded('stdin end'));
   process.stdin.on('close', () => onStdioEnded('stdin close'));
   process.stdin.on('error', (err) => {
-    if (isBrokenPipe(err)) { process.exit(0); }
+    if (isBrokenPipe(err)) {
+      fatalTransportExit('stdin.broken_pipe_exit', 'stdin broken pipe — MCP input transport closed; releasing watcher lease before exit', err);
+    }
     shutdown(`stdin error: ${err}`);
   });
 
@@ -631,6 +718,10 @@ async function main(): Promise<void> {
             }
             const leaseAge = Date.now() - (leaseMeta.updatedAt ?? 0);
             if (siblingAlive && leaseAge < 30_000) {
+              syncExitBreadcrumb('sibling.detected.before_shutdown', {
+                sibling_pid: leaseMeta.pid,
+                lease_age_ms: leaseAge,
+              });
               logEvent({
                 event: 'sibling.detected',
                 level: 'warn',
@@ -662,6 +753,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  syncExitBreadcrumb('main.catch.before_process_exit', { error: String(err), code: 1 });
   logError(`Fatal error: ${err}`);
   process.exit(1);
 });

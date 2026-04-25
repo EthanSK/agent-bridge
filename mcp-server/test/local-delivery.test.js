@@ -180,3 +180,31 @@ test('mixed scenario: local send lands in local inbox even when paired remotes e
   const localPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', `${msg.id}.json`);
   assert.equal(JSON.parse(readFileSync(localPath, 'utf8')).id, msg.id);
 });
+
+test('getInboxStats reports a healthy shared watcher lease from a tools-only process', async () => {
+  const { writeFileSync } = await import('node:fs');
+  const locksDir = join(sandbox, '.agent-bridge', 'locks');
+  mkdirSync(locksDir, { recursive: true });
+  const now = Date.now();
+  writeFileSync(
+    join(locksDir, 'claude-code.watcher-lock.json'),
+    JSON.stringify({
+      pid: process.pid,
+      target: 'claude-code',
+      role: 'channel-owner',
+      token: `test-${now}`,
+      startedAt: now,
+      updatedAt: now,
+    }, null, 2),
+    { mode: 0o600 },
+  );
+
+  const stats = inbox.getInboxStats();
+  assert.equal(stats.watcherBackend, 'polling');
+  assert.equal(stats.watcherHealthy, true);
+  assert.equal(stats.watcherLeasePid, process.pid);
+  assert.equal(stats.watcherLeaseRole, 'channel-owner');
+  assert.equal(stats.watcherLeaseAlive, true);
+  assert.equal(stats.watcherLeaseFresh, true);
+  assert.equal(typeof stats.watcherLeaseAge, 'number');
+});

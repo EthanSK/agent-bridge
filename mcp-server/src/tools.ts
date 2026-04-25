@@ -600,6 +600,7 @@ export function registerTools(server: McpServer): void {
         `  Total inbox size: ${formatBytes(stats.totalSizeBytes)}`,
         `  Watcher backend: ${stats.watcherBackend}`,
         `  Watcher healthy: ${stats.watcherHealthy ? 'yes' : 'no'}`,
+        `  Watcher lease: ${formatWatcherLease(stats)}`,
         `  Processed IDs tracked: ${stats.processedIdCount}`,
         `  Failed/quarantined: ${stats.failedCount}`,
       ];
@@ -627,6 +628,15 @@ function resolveFromTargetArg(params: {
   }
 
   return snake || camel || undefined;
+}
+
+function formatWatcherLease(stats: ReturnType<typeof getInboxStats>): string {
+  if (stats.watcherLeasePid === null) return 'none';
+  const age = stats.watcherLeaseAge !== null ? `${stats.watcherLeaseAge}s` : 'n/a';
+  const alive = stats.watcherLeaseAlive === null ? 'unknown' : (stats.watcherLeaseAlive ? 'yes' : 'no');
+  const fresh = stats.watcherLeaseFresh === null ? 'unknown' : (stats.watcherLeaseFresh ? 'yes' : 'no');
+  const role = stats.watcherLeaseRole ?? 'unknown';
+  return `pid=${stats.watcherLeasePid} role=${role} alive=${alive} fresh=${fresh} age=${age}`;
 }
 
 function formatBytes(bytes: number): string {

@@ -29,6 +29,7 @@ import {
   FAILED_DIR,
   ARCHIVE_DIR,
   UNROUTED_DIR,
+  LOCKS_DIR,
   PROCESSED_FILE,
   DELIVERED_FILE,
   PROCESSED_FILE_MAX_SIZE,
@@ -91,6 +92,12 @@ export interface InboxStats {
   totalSizeBytes: number;
   watcherBackend: 'fswatch' | 'inotifywait' | 'polling' | 'unknown';
   watcherHealthy: boolean;
+  /** Shared on-disk watcher lease metadata, when present. */
+  watcherLeasePid: number | null;
+  watcherLeaseRole: string | null;
+  watcherLeaseAge: number | null; // seconds since heartbeat/mtime, or null
+  watcherLeaseAlive: boolean | null;
+  watcherLeaseFresh: boolean | null;
   processedIdCount: number;
   failedCount: number;
 }
@@ -116,6 +123,16 @@ let pruneTimer: ReturnType<typeof setInterval> | null = null;
 /** Watcher metadata (set externally by watcher.ts). */
 let _watcherBackend: InboxStats['watcherBackend'] = 'unknown';
 let _watcherHealthy = false;
+
+const WATCHER_LEASE_STALE_MS = 15_000;
+
+type SharedWatcherLease = {
+  pid: number | null;
+  role: string | null;
+  ageSeconds: number | null;
+  alive: boolean | null;
+  fresh: boolean | null;
+};
 
 // ── Directory helpers ────────────────────────────────────────────────────────
 
@@ -885,6 +902,68 @@ export function stopPruneTimer(): void {
 
 // ── Inbox stats ──────────────────────────────────────────────────────────────
 
+function watcherLeasePathForTarget(target: string): string {
+  return join(LOCKS_DIR, `${target.replaceAll('/', '__')}.watcher-lock.json`);
+}
+
+function pidIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as { code?: string }).code !== 'ESRCH';
+  }
+}
+
+function readSharedWatcherLease(): SharedWatcherLease {
+  const empty: SharedWatcherLease = {
+    pid: null,
+    role: null,
+    ageSeconds: null,
+    alive: null,
+    fresh: null,
+  };
+
+  const filePath = watcherLeasePathForTarget(CLAUDE_CODE_TARGET);
+  if (!existsSync(filePath)) return empty;
+
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw) as {
+      pid?: unknown;
+      target?: unknown;
+      role?: unknown;
+      updatedAt?: unknown;
+    };
+    const pid = Number(parsed.pid);
+    const role = typeof parsed.role === 'string' ? parsed.role : null;
+    if (!Number.isInteger(pid) || pid <= 0 || parsed.target !== CLAUDE_CODE_TARGET) {
+      return { ...empty, role };
+    }
+
+    const stat = statSync(filePath);
+    const updatedAt = Number(parsed.updatedAt);
+    const lastUpdated = Math.max(
+      Number.isFinite(updatedAt) ? updatedAt : 0,
+      stat.mtimeMs,
+    );
+    const ageMs = Math.max(0, Date.now() - lastUpdated);
+    const alive = pidIsAlive(pid);
+    const fresh = alive && ageMs <= WATCHER_LEASE_STALE_MS;
+
+    return {
+      pid,
+      role,
+      ageSeconds: Math.floor(ageMs / 1000),
+      alive,
+      fresh,
+    };
+  } catch {
+    return empty;
+  }
+}
+
 export function getInboxStats(): InboxStats {
   ensureInboxDirs();
 
@@ -929,12 +1008,22 @@ export function getInboxStats(): InboxStats {
     }
   } catch { /* ignore */ }
 
+  const sharedLease = readSharedWatcherLease();
+  const sharedWatcherHealthy = sharedLease.fresh === true;
+
   return {
     pendingCount,
     oldestMessageAge: oldestAge,
     totalSizeBytes: totalSize,
-    watcherBackend: _watcherBackend,
-    watcherHealthy: _watcherHealthy,
+    watcherBackend: _watcherBackend !== 'unknown'
+      ? _watcherBackend
+      : (sharedWatcherHealthy ? 'polling' : 'unknown'),
+    watcherHealthy: _watcherHealthy || sharedWatcherHealthy,
+    watcherLeasePid: sharedLease.pid,
+    watcherLeaseRole: sharedLease.role,
+    watcherLeaseAge: sharedLease.ageSeconds,
+    watcherLeaseAlive: sharedLease.alive,
+    watcherLeaseFresh: sharedLease.fresh,
     processedIdCount: processedIds.size,
     failedCount,
   };
