@@ -1,5 +1,63 @@
 # Changelog
 
+## agent-bridge 3.5.5 — 2026-04-25
+
+### Telegram-pattern lifecycle polish (diagnostics-only)
+
+3.5.4 nailed the correct lifecycle posture: when Claude Code closes the MCP stdio transport (stdin EOF, SIGTERM) or stdout EPIPE makes the channel transport unusable, the channel-owner exits and releases the watcher lease so the next live owner picks up pending work. 3.5.5 keeps that semantic boundary intact and adds Telegram-style robustness around it — the four changes below are strictly diagnostic / lifecycle polish; no message-delivery semantics change.
+
+#### Changes
+
+1. **3-poll orphan-watchdog confirmation** (mirror of Telegram channel plugin's Patch A — `plugins/cache/.../telegram/0.0.6/server.ts:711-737`).
+   - Pre-3.5.5: the parent-watchdog `setInterval` shut down on a single `kill(parentPid, 0)` ESRCH, and `process.stdin.on('end' | 'close')` shut down immediately.
+   - 3.5.5: a unified orphan watchdog now requires **3 consecutive failed polls (≈15s at 5s polling)** across parent-PID liveness AND stdin destroyed/readableEnded/errored before calling `shutdown()`. Any clean poll resets the counter, so transient ppid/stdin glitches under heavy load no longer false-trigger shutdown. True reparenting still terminates within ~15s.
+   - Stdin-end / stdin-close listeners no longer call `shutdown()` directly — they're observed by the watchdog via `process.stdin.readableEnded` / `process.stdin.destroyed`. Stdin-error listener still records a deferred reason that the watchdog observes. Stdin EPIPE remains immediate-fatal (3.5.4 baseline) — a broken transport must not be tolerated.
+   - New events: `parent.orphan_poll`, `parent.orphan_recovered`. `parent.dead` now fires only at the 3-poll confirmation boundary, not on the first ESRCH.
+   - New env opt-out: `AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG=1` for diagnostic / detached scenarios. The existing `AGENT_BRIDGE_DISABLE_PARENT_CHECK=1` now disables only the parent-PID portion; the stdio-orphan portion still runs.
+
+2. **Persistent stderr tee** (mirror of Telegram channel plugin's Patch B — `server.ts:31-51`).
+   - All process stderr writes are now teed to `~/.agent-bridge/logs/mcp-server-stderr.log` so post-mortem evidence survives even when Claude closes the diagnostic stderr pipe between turns. The `process.stderr.write` override falls back to the original write so stderr → harness piping continues to work when the pipe is healthy.
+   - 5 MiB rotation: when the file exceeds 5 MiB at startup, the last 2 MiB is retained.
+
+3. **Shared `bridge_inbox_stats` correctness verified.** The 3.5.3 shared-lease read in `getInboxStats` was already correct: tools-only children read the lock file and probe the holder's PID via `kill(pid, 0)`, then derive `watcherBackend` and `watcherHealthy` from that shared signal when their own watcher state is unknown. 3.5.5 adds an explicit regression assertion (already present from 3.5.3 — kept) and confirms behaviour by source review. No code change in this area; verified-only.
+
+4. **Explicit `notification.push_failed` event** with `decision="leave_pending_for_next_owner"`.
+   - Before: the channel-notification rejection path in `watcher.ts` only called `logError(...)` and reused `message.push_failed` from `index.ts`; the post-mortem chain didn't say WHY the file was left pending.
+   - 3.5.5: `watcher.ts` now emits a deliberate `notification.push_failed` event (level `error`) carrying `msg_id`, `from`, `to`, `target`, `reply_to`, `error`, `error_code`, `decision: 'leave_pending_for_next_owner'`, and `file_name`. The legacy `message.push_failed` in `index.ts` is retained for backward compatibility with existing log consumers and now also carries `decision: 'leave_pending_for_next_owner'`.
+
+#### What this does NOT change
+
+- Stdout-EPIPE-fatal semantics are unchanged. A broken JSON-RPC/channel transport remains fatal — this is intentional. Tolerating EPIPE would create a live-but-deaf channel-owner that silently swallows messages.
+- Stdin-end shutdown semantics are unchanged in posture — the channel-owner still exits on transport teardown, releases the lease, and leaves pending work for the next live owner. Only the *trigger condition* tightens to require 3-poll confirmation, eating false positives without weakening the eventual outcome.
+- Wire format unchanged. Cross-machine SSH and same-machine local delivery paths unchanged. `openclaw-channel` is not touched (same-machine routing parity already shipped in 3.5.1).
+
+#### Bonus note: 3.5.4 baseline
+
+3.5.4 is the canonical lifecycle-obey baseline: a Claude MCP channel-owner exits / relinquishes the lease on lifecycle / transport teardown, and pending messages replay on the next owner. The earlier "keep the channel-owner alive across SIGTERM/stdin-end" patches (3.4.9–3.4.13) were a dead-end because they fought Claude's plugin host instead of cooperating with it. Do not keep a deaf stdout-broken owner alive.
+
+#### Tests
+
+- All 16 existing tests still pass.
+- 6 new tests added (22 total):
+  - 3-poll watchdog wiring guard.
+  - Live behavioural test: single stdin-end does NOT shut down within 5s; 3-poll confirmation does within ~15s, and the `parent.orphan_poll` event progression is observed in the log.
+  - Persistent stderr tee creates a durable file with the startup banner.
+  - Stderr tee wiring guard.
+  - `notification.push_failed` event-shape and decision-field source guards (watcher.ts + index.ts back-compat).
+- The pre-existing `channel-owner treats stdin close as host lifecycle shutdown` test was updated to expect the new `orphan-watchdog: ...` reason and the 3-poll progression.
+
+#### Files touched
+
+- `mcp-server/src/index.ts` — persistent stderr tee, 3-poll orphan watchdog, deferred stdin-end/stdin-close handling, version bump, decision field on legacy push-failed event.
+- `mcp-server/src/watcher.ts` — explicit `notification.push_failed` event with `decision=leave_pending_for_next_owner`.
+- `mcp-server/package.json`, `mcp-server/package-lock.json`, `mcp-server/.claude-plugin/plugin.json` — 3.5.5.
+- `agent-bridge` (top-level CLI) — `VERSION="3.5.5"`.
+- `mcp-server/test/heartbeat-shutdown-diag.test.mjs` — updated stdin-close test for 3-poll behaviour; switched the shutdown-diag test to SIGTERM trigger; bumped version assertion to 3.5.5.
+- `mcp-server/test/three-poll-watchdog.test.mjs` (new).
+- `mcp-server/test/stderr-tee.test.mjs` (new).
+- `mcp-server/test/notification-push-failed.test.mjs` (new).
+- `CHANGELOG.md`.
+
 ## agent-bridge 3.5.4 — 2026-04-25
 
 ### Fix: obey Claude Code MCP child lifecycle instead of fighting SIGTERM

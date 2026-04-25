@@ -529,6 +529,31 @@ function emitChannelNotification(fileName: string): void {
         knownFiles.delete(fileName);
         invalidateCache();
         logError(`Channel: notification callback failed for ${msg.id}: ${err}; will retry on next poll`);
+        // 3.5.5 — explicit notification.push_failed event with a deliberate
+        // decision field. Earlier builds only logged `message.push_failed`
+        // from index.ts (and rethrew), which left the post-mortem chain
+        // ambiguous about WHY the file was left pending. This event makes
+        // the contract unambiguous: file stays in inbox/, not markDelivered'd,
+        // ready for the next live channel-owner / replay scan.
+        const errCode =
+          (err as { code?: string } | undefined)?.code
+          ?? ((err && typeof err === 'object' && 'name' in err) ? String((err as { name?: string }).name) : undefined);
+        logEvent({
+          event: 'notification.push_failed',
+          level: 'error',
+          msg: `Channel notification push failed for ${msg.id}; leaving file pending for next owner`,
+          context: {
+            msg_id: msg.id,
+            from: msg.from,
+            to: msg.to,
+            target: msg.target,
+            reply_to: msg.replyTo,
+            error: String(err),
+            error_code: errCode,
+            decision: 'leave_pending_for_next_owner',
+            file_name: fileName,
+          },
+        });
       });
   } catch (err) {
     quarantineFailed(fileName, `failed to parse/emit notification: ${err}`);

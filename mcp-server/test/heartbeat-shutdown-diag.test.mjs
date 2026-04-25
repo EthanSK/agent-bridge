@@ -65,19 +65,20 @@ async function readEvents(home) {
 }
 
 test('server.shutdown_diag dumps active handles and request counts on shutdown', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-2-shutdown-'));
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-5-shutdown-'));
+  // 3.5.5: stdin-end no longer fires immediate shutdown — orphan watchdog
+  // confirms across 3 polls. To exercise the shutdown path quickly, send
+  // SIGTERM instead, which goes through handleSignal → shutdown → diag.
   const server = startServer(home);
   try {
     await sleep(800);
-    server.child.stdin.end();
-    await sleep(800);
-    server.child.kill('SIGKILL');
-    await sleep(200);
+    server.child.kill('SIGTERM');
+    await new Promise((resolve) => server.child.once('exit', resolve));
 
     const events = await readEvents(home);
     const starting = events.find((e) => e.event === 'server.starting');
     assert.ok(starting, 'expected server.starting event');
-    assert.equal(starting.context.version, '3.5.4', 'startup event should report version 3.5.4');
+    assert.equal(starting.context.version, '3.5.5', 'startup event should report version 3.5.5');
 
     const diag = events.find((e) => e.event === 'server.shutdown_diag');
     assert.ok(diag, 'expected server.shutdown_diag event on shutdown');
@@ -147,8 +148,12 @@ test('sibling detection wiring is present in shipped build', async () => {
   );
 });
 
-test('channel-owner treats stdin close as host lifecycle shutdown and releases lease', async () => {
-  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-4-channel-owner-'));
+test('channel-owner treats stdin close as host lifecycle shutdown after 3-poll confirmation and releases lease', { timeout: 30_000 }, async () => {
+  // 3.5.5: stdin-end no longer triggers immediate shutdown. The orphan
+  // watchdog must observe stdin destroyed/readableEnded across 3 consecutive
+  // 5s polls (15s total) before calling shutdown. Reason is the new
+  // composite "orphan-watchdog: ..." string (mirroring Telegram's Patch A).
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-5-channel-owner-'));
   const server = startServer(home, {
     AGENT_BRIDGE_ROLE: 'channel-owner',
     AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
@@ -159,12 +164,25 @@ test('channel-owner treats stdin close as host lifecycle shutdown and releases l
     assert.ok(await readFile(lockPath, 'utf8'), 'channel-owner should acquire watcher lease');
 
     server.child.stdin.end();
-    await new Promise((resolve) => server.child.once('exit', resolve));
+    // Give the orphan watchdog up to 25s to reach 3 confirmations (15s nominal
+    // at 5s polling, plus startup slack).
+    const exited = await Promise.race([
+      new Promise((resolve) => server.child.once('exit', () => resolve(true))),
+      sleep(25_000).then(() => false),
+    ]);
+    assert.ok(exited, 'channel-owner should exit within 25s of stdin.end()');
 
     const events = await readEvents(home);
     const shutdown = events.find((e) => e.event === 'server.shutdown');
     assert.ok(shutdown, 'expected clean shutdown event');
-    assert.equal(shutdown.context.reason, 'stdin end');
+    assert.match(
+      shutdown.context.reason,
+      /orphan-watchdog/,
+      'shutdown reason should come from the 3-poll orphan watchdog',
+    );
+    // Confirm we logged at least one orphan_poll event before the final shutdown.
+    const orphanPolls = events.filter((e) => e.event === 'parent.orphan_poll');
+    assert.ok(orphanPolls.length >= 1, 'expected at least one parent.orphan_poll log entry');
     assert.ok(events.find((e) => e.event === 'watcher.lease_released'), 'watcher lease should be released');
     await assert.rejects(() => readFile(lockPath, 'utf8'), { code: 'ENOENT' });
   } finally {

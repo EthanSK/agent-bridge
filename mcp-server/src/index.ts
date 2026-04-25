@@ -29,7 +29,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, ensureDirectories, getLocalMachineName } from './config.js';
 import { initInbox, shutdownInbox } from './inbox.js';
@@ -38,6 +38,33 @@ import { registerTools } from './tools.js';
 import { startWatcher, stopWatcher, replayUndeliveredMessages } from './watcher.js';
 import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
+
+// 3.5.5 — Patch B (mirror of Telegram plugin server.ts:31-51): persistent
+// stderr tee. Claude Code can close diagnostic stderr between tool turns; once
+// that happens, anything we write to stderr disappears. Tee process.stderr to
+// a durable log file so post-mortem evidence survives even when the harness's
+// stderr pipe is gone. Rotate when ~5 MiB to bound disk use; identical pattern
+// to the Telegram channel plugin's Patch B.
+const STDERR_LOG_FILE = join(LOGS_DIR, 'mcp-server-stderr.log');
+try {
+  mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
+  if (existsSync(STDERR_LOG_FILE) && statSync(STDERR_LOG_FILE).size > 5 * 1024 * 1024) {
+    const existing = readFileSync(STDERR_LOG_FILE, 'utf8');
+    writeFileSync(STDERR_LOG_FILE, existing.slice(-2 * 1024 * 1024));
+  }
+} catch { /* best-effort rotation */ }
+try {
+  const stderrLogStream = createWriteStream(STDERR_LOG_FILE, { flags: 'a' });
+  // Swallow stream errors so a wedged log file can never crash the watcher.
+  stderrLogStream.on('error', () => { /* never let log tee take us down */ });
+  const origStderrWrite = process.stderr.write.bind(process.stderr);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (process.stderr as any).write = ((chunk: any, ...args: any[]) => {
+    try { stderrLogStream.write(chunk); } catch { /* ignore */ }
+    return (origStderrWrite as (chunk: unknown, ...rest: unknown[]) => boolean)(chunk, ...(args as unknown[]));
+  });
+  process.on('exit', () => { try { stderrLogStream.end(); } catch { /* ignore */ } });
+} catch { /* if we cannot install the tee, just keep going */ }
 
 // Global error handlers. Most errors are logged and swallowed so the server
 // stays up, BUT broken-pipe errors (EPIPE) mean the parent Claude process
@@ -214,14 +241,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.5.4', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.5.5', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.5.4',
+      version: '3.5.5',
     },
     {
       capabilities: {
@@ -382,11 +409,21 @@ async function main(): Promise<void> {
           },
         }).catch((err) => {
           logError(`Failed to push channel notification for ${message.id}: ${err}`);
+          // Kept for backward compatibility with 3.5.4 and earlier log
+          // consumers. The deliberate notification.push_failed event with
+          // decision=leave_pending_for_next_owner is emitted in watcher.ts
+          // (3.5.5+) once this rejection propagates back through the catch
+          // around savedChannelCallback().
           logEvent({
             event: 'message.push_failed',
             level: 'error',
             msg: `Failed to push channel notification for ${message.id}`,
-            context: { msg_id: message.id, from: message.from, error: String(err) },
+            context: {
+              msg_id: message.id,
+              from: message.from,
+              error: String(err),
+              decision: 'leave_pending_for_next_owner',
+            },
           });
           throw err;
         });
@@ -550,11 +587,28 @@ async function main(): Promise<void> {
   // stdio lifecycle:
   // Claude Code's plugin host owns MCP child lifetime. EOF/close on stdin means
   // the host has closed the transport and may SIGTERM/SIGKILL shortly after.
-  // Shut down immediately so the watcher lease is released cleanly and
-  // undelivered messages remain pending for the next live channel-owner/replay.
+  // The desired posture is still "shutdown so the watcher lease is released
+  // cleanly and undelivered messages remain pending for the next live
+  // channel-owner/replay" — but as of 3.5.5 we no longer trigger that path on
+  // a SINGLE stdin-end/close event. Instead we mirror the Telegram channel
+  // plugin's Patch A pattern (server.ts:711-737): require 3 consecutive
+  // confirmations (15s window at 5s polling) of orphaned state — combined
+  // across parent-pid liveness AND stdin destroyed/ended — before calling
+  // shutdown. This eats transient stdin/ppid glitches under heavy load while
+  // still terminating true orphans within ~15s.
+  //
+  // Note we deliberately do NOT touch stdout-EPIPE-fatal or stdin-EPIPE-fatal
+  // paths: those are real transport-broken signals where keeping the lease
+  // alive would mean a deaf-but-live channel-owner silently swallowing
+  // messages. The 3-poll gate only protects against false-positive shutdowns
+  // on benign lifecycle hiccups.
   const isChannelOwner = watcherStarted && bridgeRole === 'channel-owner';
-  const onStdioEnded = (reason: string) => {
-    shutdown(reason);
+  let stdinErrored: { reason: string } | null = null;
+  const onStdioEnded = (_reason: string) => {
+    // Intentionally a no-op for liveness — `process.stdin.readableEnded` and
+    // `process.stdin.destroyed` are observed directly by the orphan watchdog
+    // below, which gates shutdown behind a 3-poll confirmation. Keeping the
+    // event listeners attached avoids unhandled 'error' warnings.
   };
 
   process.stdin.on('end', () => onStdioEnded('stdin end'));
@@ -563,7 +617,9 @@ async function main(): Promise<void> {
     if (isBrokenPipe(err)) {
       fatalTransportExit('stdin.broken_pipe_exit', 'stdin broken pipe — MCP input transport closed; releasing watcher lease before exit', err);
     }
-    shutdown(`stdin error: ${err}`);
+    // Non-EPIPE stdin error: defer to the orphan watchdog. Recording the
+    // reason lets the eventual shutdown carry the original error string.
+    stdinErrored = { reason: `stdin error: ${err}` };
   });
 
   // Parent-PID liveness watchdog.
@@ -622,15 +678,42 @@ async function main(): Promise<void> {
       msg: 'Parent-PID liveness check disabled via AGENT_BRIDGE_DISABLE_PARENT_CHECK=1',
       context: { pid: process.pid, parentPid: process.ppid },
     });
-  } else {
+  }
+  {
     const parentPid = process.ppid;
-    logEvent({
-      event: 'parent.detected',
-      msg: `Parent process detected (ppid=${parentPid})`,
-      context: { parentPid, pid: process.pid },
-    });
+    if (!parentCheckDisabled) {
+      logEvent({
+        event: 'parent.detected',
+        msg: `Parent process detected (ppid=${parentPid})`,
+        context: { parentPid, pid: process.pid },
+      });
+    }
 
-    parentWatchdog = setInterval(() => {
+    // 3.5.5 — 3-poll orphan confirmation (mirror of Telegram plugin's Patch A,
+    // server.ts:711-737). Under heavy load (Ableton + OBS + many concurrent
+    // Claude sessions) a single transient ppid/stdin glitch used to
+    // false-trigger shutdown. Now we require 3 consecutive polls (15 s at the
+    // 5 s interval) of an orphaned state — across BOTH parent-pid liveness
+    // AND stdin destroyed/ended/errored — before calling shutdown. Any clean
+    // poll resets the counter, so a true orphan still terminates within ~15s.
+    //
+    // We keep the orphan watchdog interval running even when
+    // AGENT_BRIDGE_DISABLE_PARENT_CHECK=1: only the parent-PID check itself is
+    // disabled, the stdio-orphan portion still applies. Tests that want to
+    // fully detach should also set AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG=1.
+    const ORPHAN_CONFIRMATION_POLLS = 3;
+    let orphanedPolls = 0;
+    let lastOrphanReason = '';
+    const orphanWatchdogDisabled = process.env.AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG === '1';
+    if (orphanWatchdogDisabled) {
+      logEvent({
+        event: 'orphan_watchdog.disabled',
+        msg: 'Orphan watchdog disabled via AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG=1',
+        context: { pid: process.pid, parentPid },
+      });
+    }
+
+    if (!orphanWatchdogDisabled) parentWatchdog = setInterval(() => {
       if (shuttingDown) return;
 
       // Liveness check — kill(pid, 0) on a live process is a no-op; on a
@@ -638,21 +721,76 @@ async function main(): Promise<void> {
       // can't signal it, which still tells us it's alive — do nothing. Any
       // other error is unexpected; treat conservatively as "still alive" so
       // we don't false-positive ourselves into shutdown.
-      try {
-        process.kill(parentPid, 0);
-      } catch (err) {
-        const code = (err as { code?: string }).code;
-        if (code === 'ESRCH') {
-          logEvent({
-            event: 'parent.dead',
-            level: 'warn',
-            msg: `Parent process ${parentPid} is gone (ESRCH)`,
-            context: { parentPid, pid: process.pid },
-          });
-          shutdown(`parent dead (pid ${parentPid} gone)`);
+      let parentDead = false;
+      if (!parentCheckDisabled) {
+        try {
+          process.kill(parentPid, 0);
+        } catch (err) {
+          const code = (err as { code?: string }).code;
+          if (code === 'ESRCH') {
+            parentDead = true;
+          }
+          // EPERM or anything else — parent still exists from our POV, keep running.
+        }
+      }
+
+      // Combined orphan signals — any one of these indicates the parent
+      // chain has gone away. We confirm across multiple polls before shutdown.
+      const stdinDestroyed = process.stdin.destroyed === true;
+      const stdinEnded = process.stdin.readableEnded === true;
+      const stdinHadError = stdinErrored !== null;
+      const orphaned = parentDead || stdinDestroyed || stdinEnded || stdinHadError;
+
+      if (orphaned) {
+        orphanedPolls += 1;
+        // Compose a stable reason string for the eventual shutdown / log.
+        const reasons: string[] = [];
+        if (parentDead) reasons.push(`parent dead (pid ${parentPid} ESRCH)`);
+        if (stdinDestroyed) reasons.push('stdin destroyed');
+        if (stdinEnded) reasons.push('stdin readableEnded');
+        if (stdinHadError && stdinErrored) reasons.push(stdinErrored.reason);
+        lastOrphanReason = reasons.join(' | ');
+
+        logEvent({
+          event: 'parent.orphan_poll',
+          level: 'warn',
+          msg: `Orphan watchdog poll ${orphanedPolls}/${ORPHAN_CONFIRMATION_POLLS}: ${lastOrphanReason}`,
+          context: {
+            parentPid,
+            pid: process.pid,
+            poll: orphanedPolls,
+            confirmation_polls: ORPHAN_CONFIRMATION_POLLS,
+            parent_dead: parentDead,
+            stdin_destroyed: stdinDestroyed,
+            stdin_ended: stdinEnded,
+            stdin_errored: stdinHadError,
+          },
+        });
+
+        if (orphanedPolls >= ORPHAN_CONFIRMATION_POLLS) {
+          if (parentDead) {
+            logEvent({
+              event: 'parent.dead',
+              level: 'warn',
+              msg: `Parent process ${parentPid} is gone (ESRCH) — confirmed across ${ORPHAN_CONFIRMATION_POLLS} polls`,
+              context: { parentPid, pid: process.pid, confirmation_polls: ORPHAN_CONFIRMATION_POLLS },
+            });
+          }
+          shutdown(`orphan-watchdog: ${lastOrphanReason}`);
           return;
         }
-        // EPERM or anything else — parent still exists from our POV, keep running.
+      } else {
+        // Reset the counter on any clean poll so transient glitches don't
+        // accumulate over time.
+        if (orphanedPolls > 0) {
+          logEvent({
+            event: 'parent.orphan_recovered',
+            msg: `Orphan watchdog cleared after ${orphanedPolls} poll(s)`,
+            context: { parentPid, pid: process.pid, polls_seen: orphanedPolls },
+          });
+        }
+        orphanedPolls = 0;
+        lastOrphanReason = '';
       }
 
       // Sibling-MCP-child detection (3.5.2+). Claude Code may spawn a fresh
@@ -720,7 +858,7 @@ async function main(): Promise<void> {
     // Tool-only MCP children should not keep Node alive once stdio closes.
     // Channel-owner watchers keep this watchdog ref'ed only while the MCP
     // transport is open; stdin close/SIGTERM now shuts them down cleanly.
-    if (!isChannelOwner) {
+    if (parentWatchdog && !isChannelOwner) {
       parentWatchdog.unref();
     }
   }
