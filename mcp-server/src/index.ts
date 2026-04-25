@@ -29,7 +29,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { execFileSync } from 'node:child_process';
-import { ensureDirectories, getLocalMachineName } from './config.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { CLAUDE_CODE_TARGET, LOCKS_DIR, ensureDirectories, getLocalMachineName } from './config.js';
 import { initInbox, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 import { registerTools } from './tools.js';
@@ -132,14 +134,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.5.1', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.5.2', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.5.1',
+      version: '3.5.2',
     },
     {
       capabilities: {
@@ -374,6 +376,32 @@ async function main(): Promise<void> {
       });
     } catch {}
 
+    // Pre-shutdown diagnostics dump — logs what kept the event loop alive at
+    // teardown time. Mirrors the Telegram channel plugin's [shutdown-diag]
+    // pattern (server.ts ~line 675-680). The post-mortem usually reveals one
+    // of: a wedged stdout JSON-RPC write, the parent watchdog interval, the
+    // file-watcher poll, the prune timer, or an outstanding fs request.
+    try {
+      const handles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles?.() ?? [];
+      const reqs = (process as unknown as { _getActiveRequests?: () => unknown[] })._getActiveRequests?.() ?? [];
+      const rssMB = Math.floor(process.memoryUsage().rss / 1024 / 1024);
+      const handleTypes = handles.map((h) => (h && (h as { constructor?: { name?: string } }).constructor?.name) || typeof h);
+      logEvent({
+        event: 'server.shutdown_diag',
+        msg: `Shutdown diag uptime=${Math.floor(process.uptime())}s handles=${handles.length} requests=${reqs.length} rss=${rssMB}MB`,
+        context: {
+          uptime_s: Math.floor(process.uptime()),
+          handles: handles.length,
+          requests: reqs.length,
+          rss_mb: rssMB,
+          handle_types: handleTypes,
+          reason,
+          pid: process.pid,
+          parent_pid: process.ppid,
+        },
+      });
+    } catch {}
+
     // Hard deadline: whatever state async cleanup is in, die within 2s. Matches
     // the Telegram channel plugin's discipline — no MCP server should ever
     // survive its parent.
@@ -382,6 +410,17 @@ async function main(): Promise<void> {
       process.exit(0);
     }, 2000);
     forceExit.unref();
+
+    // Kernel-delivered SIGKILL backstop. A Node process whose main thread is
+    // stuck in an uninterruptible kernel wait (U state — e.g. stuck in a
+    // wedged fetch syscall) can swallow process.exit(0). Self-SIGKILL at 5s
+    // is kernel-delivered and ALWAYS terminates. Pairs with the Telegram
+    // channel plugin's identical backstop (server.ts ~line 693).
+    const sigkillBackstop = setTimeout(() => {
+      try { logError('Shutdown sigkill backstop firing — process.exit(0) was swallowed'); } catch {}
+      try { process.kill(process.pid, 'SIGKILL'); } catch { /* if even SIGKILL fails, fall through */ }
+    }, 5000);
+    sigkillBackstop.unref();
 
     // 1. Stop the file watcher (kills fswatch/inotifywait/polling)
     try { stopWatcher(); } catch (err) { try { logError(`stopWatcher error: ${err}`); } catch {} }
@@ -480,6 +519,37 @@ async function main(): Promise<void> {
   //
   // Opt-out: set AGENT_BRIDGE_DISABLE_PARENT_CHECK=1 for diagnostic scenarios
   // (e.g. intentional detachment, debugging).
+  // Periodic heartbeat (3.5.2+). Writes one line every 60s to the durable
+  // mcp-server.log so a post-mortem can see EXACTLY when the process went
+  // silent. Without this, a silent reaping leaves the log frozen at the last
+  // event (often the prune-pass debug line at 5min boundaries) and we can't
+  // tell whether the process died at minute 1 or minute 4 of a gap. Mirrors
+  // the Telegram channel plugin's [heartbeat] pattern. Refed for channel
+  // owners (must keep Node alive between turns); unref'd for tools-only
+  // (must not pin Node alive after stdio closes).
+  const heartbeatInterval = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      const rssMB = Math.floor(process.memoryUsage().rss / 1024 / 1024);
+      const lease = watcherStarted ? 'held' : (bridgeRole === 'tools-only' ? 'tools-only' : 'standby');
+      logEvent({
+        event: 'server.heartbeat',
+        msg: `heartbeat uptime=${Math.floor(process.uptime())}s ppid=${process.ppid} rss=${rssMB}MB lease=${lease}`,
+        context: {
+          uptime_s: Math.floor(process.uptime()),
+          ppid: process.ppid,
+          pid: process.pid,
+          rss_mb: rssMB,
+          lease,
+          role: bridgeRole || 'auto',
+        },
+      });
+    } catch { /* never let a heartbeat take us down */ }
+  }, 60_000);
+  if (!(watcherStarted && bridgeRole === 'channel-owner')) {
+    heartbeatInterval.unref?.();
+  }
+
   const parentCheckDisabled = process.env.AGENT_BRIDGE_DISABLE_PARENT_CHECK === '1';
   if (parentCheckDisabled) {
     logInfo('Parent-PID liveness check disabled via AGENT_BRIDGE_DISABLE_PARENT_CHECK=1');
@@ -520,6 +590,64 @@ async function main(): Promise<void> {
         }
         // EPERM or anything else — parent still exists from our POV, keep running.
       }
+
+      // Sibling-MCP-child detection (3.5.2+). Claude Code may spawn a fresh
+      // agent-bridge MCP child for the same parent claude session — for
+      // example after `/reload-plugins`, after a transient stdio disconnect,
+      // or as a routine recycle. The 3.4.9-3.4.13 patches keep us alive
+      // through SIGTERM/stdin-end, but if Claude has already wired its stdio
+      // to the new sibling, our heroically-still-alive process is now a
+      // zombie: we'll never receive another tool call, our channel
+      // notifications go to a closed pipe, and we eventually die silently
+      // from EPIPE during a write.
+      //
+      // When that happens, gracefully step down so the new sibling owns
+      // delivery cleanly. Detection: scan for a younger node process that's
+      // also running build/index.js with the same parent PID and a higher
+      // start time. We use the lease file as the source of truth for "the
+      // current owner" and exit if the lease is now held by a different,
+      // alive PID — that strictly proves a sibling has taken over.
+      try {
+        const leasePath = join(LOCKS_DIR, `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`);
+        if (existsSync(leasePath)) {
+          const leaseRaw = readFileSync(leasePath, 'utf8');
+          const leaseMeta = JSON.parse(leaseRaw) as { pid?: number; updatedAt?: number };
+          if (
+            typeof leaseMeta.pid === 'number'
+            && leaseMeta.pid > 0
+            && leaseMeta.pid !== process.pid
+            && watcherStarted // only relevant if WE think we're the owner
+          ) {
+            // The lease has been taken by a different process. Verify it's
+            // alive (ESRCH = dead, leftover lease file). Verify it's also
+            // recent (updatedAt within 30s) so we don't false-positive on a
+            // stale lease that hasn't been GC'd yet.
+            let siblingAlive = false;
+            try {
+              process.kill(leaseMeta.pid, 0);
+              siblingAlive = true;
+            } catch (e) {
+              if ((e as { code?: string }).code !== 'ESRCH') siblingAlive = true;
+            }
+            const leaseAge = Date.now() - (leaseMeta.updatedAt ?? 0);
+            if (siblingAlive && leaseAge < 30_000) {
+              logEvent({
+                event: 'sibling.detected',
+                level: 'warn',
+                msg: `Sibling MCP child pid=${leaseMeta.pid} owns watcher lease; this process stepping down`,
+                context: {
+                  pid: process.pid,
+                  parent_pid: process.ppid,
+                  sibling_pid: leaseMeta.pid,
+                  lease_age_ms: leaseAge,
+                },
+              });
+              shutdown(`sibling MCP child (pid ${leaseMeta.pid}) took over watcher`);
+              return;
+            }
+          }
+        }
+      } catch { /* ignore — best-effort sibling detection */ }
     }, 5000);
     // Tool-only MCP children should not keep Node alive once stdio closes.
     // Channel-owner watchers are intentionally different: after Claude Code

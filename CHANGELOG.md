@@ -1,5 +1,40 @@
 # Changelog
 
+## agent-bridge 3.5.2 — 2026-04-25
+
+### Fix: post-mortem visibility + sibling-MCP step-down + SIGKILL backstop
+
+3.4.9–3.4.13 patched a series of channel-owner death paths (stdin-end, SIGTERM, SIGPIPE, stderr-EPIPE), and 3.5.0 added watcher standby promotion. Real-world MBP behaviour today shows those patches working: the current channel-owner MCP child has been alive 9+ hours through the same idle-then-traffic pattern that previously killed older builds. The remaining gap was diagnostic: when a channel-owner DOES die between heartbeat-spaced events (5-minute prune-pass cadence), the on-disk log goes silent for minutes at a time and we can't tell whether the death was at minute 1 or minute 4, or which handle/request was wedged at teardown. The other gap: a fresh sibling MCP child spawned by the same Claude parent (e.g. after `/reload-plugins`) leaves the older sibling alive but stdio-orphaned, eventually dying silently from EPIPE during a channel notification.
+
+3.5.2 closes both gaps without touching the watcher's well-tested signal-survival logic:
+
+- **Periodic heartbeat (60s).** Mirrors the Telegram channel plugin's `[heartbeat]` cadence (`plugins/cache/.../telegram/0.0.6/server.ts` ~line 743). Emits `server.heartbeat` to the unified NDJSON log every minute with `uptime_s`, `ppid`, `pid`, `rss_mb`, `lease`, and `role`. A dead channel-owner is now detectable to the minute instead of guessable to the 5-minute prune window. Refed for channel-owner watchers (must keep Node alive between turns); unref'ed for tools-only and standby (must not pin Node alive after stdio closes).
+- **Shutdown diagnostics dump.** When `shutdown()` runs, emits `server.shutdown_diag` with `handles` count, `requests` count, `rss_mb`, `handle_types[]` (constructor names — usually `Timeout`, `Pipe`, `WriteWrap`), `reason`, `pid`, `parent_pid`. Mirrors the Telegram plugin's `[shutdown-diag]` line (server.ts ~line 675). The post-mortem reveals what kept the event loop alive at teardown — typically the parent watchdog interval, the file-watcher poll, or a wedged JSON-RPC stdout write.
+- **SIGKILL self-destruct backstop (5s).** The existing 2s force-exit timer used `process.exit(0)`, which can be swallowed by a Node main thread stuck in an uninterruptible kernel wait (U state — e.g. wedged fetch or fs syscall). 3.5.2 adds a 5s self-SIGKILL via `process.kill(process.pid, 'SIGKILL')`, which is kernel-delivered and ALWAYS terminates. Mirrors the Telegram plugin's identical backstop (server.ts ~line 693). No semantic change to clean shutdown — only changes hung-shutdown timeline from "leaks until OOM" to "guaranteed dead within 5 seconds".
+- **Sibling-MCP step-down.** Inside the parent-watchdog interval, when a different alive PID holds our `claude-code` watcher lease and that lease is fresh (`updatedAt` within 30s), we treat it as proof that Claude Code spawned a fresh sibling MCP child for the same parent and cleanly transferred ownership. We log `sibling.detected` and shut down. Without this, the older sibling stayed alive ignoring SIGTERM (correctly per 3.4.11) but without a stdin reader, eventually dying silently from EPIPE during a channel notification. The new behaviour makes the handoff visible and immediate, instead of trickling out through a silent EPIPE later.
+
+#### Changes
+
+- `mcp-server/src/index.ts`:
+  - Imports `existsSync`/`readFileSync` from `node:fs`, `join` from `node:path`, and `CLAUDE_CODE_TARGET`/`LOCKS_DIR` from `./config.js`.
+  - Bumped server name and starting-event version metadata to 3.5.2.
+  - Inserted `server.shutdown_diag` emission before the force-exit timer in `shutdown()`.
+  - Added 5s SIGKILL backstop after the existing 2s force-exit timer.
+  - Added 60s heartbeat interval refed for channel-owner watchers.
+  - Added sibling-MCP detection block inside `parentWatchdog`.
+- `mcp-server/test/heartbeat-shutdown-diag.test.mjs`: new file. 3 tests covering the shutdown_diag fields, error-free first-second startup, and source-level wiring of `sibling.detected` + `watcher-lock.json` + `SIGKILL`.
+- Version bumps: `mcp-server/package.json`, `mcp-server/.claude-plugin/plugin.json`, `mcp-server/src/index.ts` server version + startup log, `agent-bridge` bash CLI `VERSION`, `mcp-server/package-lock.json`.
+
+#### Compatibility
+
+- Wire format unchanged. Cross-machine SSH and same-machine local delivery paths unchanged. Watcher behaviour unchanged. The new instrumentation only ADDS log events; no existing event was renamed or removed.
+- Heartbeat lifecycle: the heartbeat is `unref()`-ed for tools-only and standby modes, so it can never keep a tool-only MCP child alive past stdio close. For channel-owner watchers it is intentionally refed (the parent watchdog is also refed for the same reason — keepalive is the whole point of a channel-owner).
+- Sibling detection only fires when a DIFFERENT alive PID holds a FRESH lease (`updatedAt` < 30s). A stale lease left by a dead sibling triggers the existing `lease_stolen` recovery path in `tryAcquireWatcherLease`, not the new step-down.
+
+#### Forward plan
+
+If the soak test reveals a future death despite 3.5.2's instrumentation, the new logs will pinpoint the exact failure mode and the followup is then targeted (instead of speculative). The longer-term architectural option — lifting the watcher into a separate long-lived channel plugin process à la the Telegram bun process — is queued as 3.6.0 but explicitly NOT shipped in 3.5.2 because (a) the existing patches demonstrably work for the current MBP session, (b) the migration is a multi-day refactor, and (c) the diagnostic instrumentation in 3.5.2 is a strict prerequisite for evaluating whether the migration is even necessary.
+
 ## agent-bridge 3.5.1 — 2026-04-21
 
 ### Fix: openclaw-channel outbound now handles same-machine routing without SSH
