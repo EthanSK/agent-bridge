@@ -250,14 +250,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.6.0', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.6.1', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.6.0',
+      version: '3.6.1',
     },
     {
       capabilities: {
@@ -758,10 +758,20 @@ async function main(): Promise<void> {
 
       // Combined orphan signals — any one of these indicates the parent
       // chain has gone away. We confirm across multiple polls before shutdown.
+      //
+      // 3.6.1 fix (2026-04-21): REMOVED the `stdin.readableEnded === true`
+      // check. Claude Code's MCP plugin host writes to the child's stdin once
+      // during the JSON-RPC handshake and then leaves the pipe idle. Node's
+      // `process.stdin.readableEnded` flips to `true` once the MCP SDK's
+      // `StdioServerTransport` has consumed the buffered handshake bytes —
+      // even though the pipe is still open and JSON-RPC traffic continues
+      // to flow over it. Treating that as an orphan signal killed the host
+      // (channel plugin in particular) within 15 s of every spawn. An IDLE
+      // stdin is NOT an orphan signal on Node; only a destroyed or errored
+      // stdin is. Parent-PID liveness still catches true reparenting.
       const stdinDestroyed = process.stdin.destroyed === true;
-      const stdinEnded = process.stdin.readableEnded === true;
       const stdinHadError = stdinErrored !== null;
-      const orphaned = parentDead || stdinDestroyed || stdinEnded || stdinHadError;
+      const orphaned = parentDead || stdinDestroyed || stdinHadError;
 
       if (orphaned) {
         orphanedPolls += 1;
@@ -769,7 +779,6 @@ async function main(): Promise<void> {
         const reasons: string[] = [];
         if (parentDead) reasons.push(`parent dead (pid ${parentPid} ESRCH)`);
         if (stdinDestroyed) reasons.push('stdin destroyed');
-        if (stdinEnded) reasons.push('stdin readableEnded');
         if (stdinHadError && stdinErrored) reasons.push(stdinErrored.reason);
         lastOrphanReason = reasons.join(' | ');
 
@@ -784,7 +793,7 @@ async function main(): Promise<void> {
             confirmation_polls: ORPHAN_CONFIRMATION_POLLS,
             parent_dead: parentDead,
             stdin_destroyed: stdinDestroyed,
-            stdin_ended: stdinEnded,
+            stdin_ended: process.stdin.readableEnded === true, // diagnostic-only: logged but NOT acted on (3.6.1)
             stdin_errored: stdinHadError,
           },
         });

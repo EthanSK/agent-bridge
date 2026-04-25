@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * agent-bridge — claude-code-channel plugin (3.6.0).
+ * agent-bridge — claude-code-channel plugin (3.6.1).
  *
  * Long-lived, session-scoped MCP server. Owns:
  *   1. The watcher lease for `~/.agent-bridge/inbox/claude-code/`.
@@ -64,7 +64,7 @@ import {
 } from './watcher.js';
 import { logEvent } from './log.js';
 
-const VERSION = '3.6.0';
+const VERSION = '3.6.1';
 const SERVER_NAME = 'agent-bridge-channel';
 
 // ─── Patch B — persistent stderr tee ────────────────────────────────────────
@@ -537,8 +537,21 @@ async function main(): Promise<void> {
   // INTENTIONALLY NOT unref'd — see header comment.
   void heartbeatInterval;
 
-  // Patch A — 3-poll orphan watchdog. ppid != bootPpid OR stdin destroyed/
-  // ended. 3 consecutive orphaned polls (5s × 3 = 15s) → shutdown.
+  // Patch A — 3-poll orphan watchdog. ppid != bootPpid OR stdin destroyed
+  // OR stdin errored. 3 consecutive orphaned polls (5s × 3 = 15s) → shutdown.
+  //
+  // 3.6.1 fix (2026-04-21): REMOVED the `stdin.readableEnded === true` check.
+  // Claude Code's MCP plugin host writes to the child's stdin once during the
+  // JSON-RPC handshake and then leaves the pipe idle. Node's
+  // `process.stdin.readableEnded` flips to `true` after the initial messages
+  // are consumed by the MCP SDK's `StdioServerTransport`, even though the pipe
+  // is still open and we're still receiving JSON-RPC traffic. Treating that as
+  // an orphan signal killed the channel plugin within 15 s of every spawn.
+  // The Telegram plugin doesn't see this because bun handles stdin lifecycle
+  // differently; on Node we have to be stricter about what counts as orphan.
+  // An IDLE stdin is not an orphan signal — only an actively-broken
+  // (`destroyed`) or actually-errored stdin is. `ppid_changed` still catches
+  // true reparenting (the original Claude session dying).
   const ORPHAN_CONFIRMATION_POLLS = 3;
   const bootPpid = process.ppid;
   let orphanedPolls = 0;
@@ -555,16 +568,15 @@ async function main(): Promise<void> {
       if (shuttingDown) return;
       const ppidChanged = process.platform !== 'win32' && process.ppid !== bootPpid;
       const stdinDestroyed = process.stdin.destroyed === true;
-      const stdinEnded = process.stdin.readableEnded === true;
+      // 3.6.1: stdin.readableEnded is NOT an orphan signal on Node — see comment above.
       const stdinHadError = stdinErrored !== null;
-      const orphaned = ppidChanged || stdinDestroyed || stdinEnded || stdinHadError;
+      const orphaned = ppidChanged || stdinDestroyed || stdinHadError;
 
       if (orphaned) {
         orphanedPolls += 1;
         const reasons: string[] = [];
         if (ppidChanged) reasons.push(`ppid changed (boot=${bootPpid}, now=${process.ppid})`);
         if (stdinDestroyed) reasons.push('stdin destroyed');
-        if (stdinEnded) reasons.push('stdin readableEnded');
         if (stdinHadError && stdinErrored) reasons.push(stdinErrored.reason);
         lastOrphanReason = reasons.join(' | ');
 
@@ -580,7 +592,7 @@ async function main(): Promise<void> {
             confirmation_polls: ORPHAN_CONFIRMATION_POLLS,
             ppid_changed: ppidChanged,
             stdin_destroyed: stdinDestroyed,
-            stdin_ended: stdinEnded,
+            stdin_ended: process.stdin.readableEnded === true, // diagnostic-only: logged but NOT acted on (3.6.1)
             stdin_errored: stdinHadError,
           },
         });

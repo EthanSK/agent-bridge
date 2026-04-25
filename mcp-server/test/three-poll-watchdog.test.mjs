@@ -89,48 +89,96 @@ test('3-poll watchdog wiring is present in shipped build', async () => {
   );
 });
 
-test('single stdin-end does NOT trigger immediate shutdown (orphan watchdog requires 3 polls)', { timeout: 20_000 }, async () => {
-  // Behavioural confirmation: with the 3-poll gate, a fresh orphaned stdin
-  // must not kill the child within the first 5s after stdin.end(). Telegram's
-  // Patch A explicitly says "any clean poll resets the counter, so a true
-  // reparenting still terminates within ~15s" — we assert the lower bound.
-  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-5-no-immediate-'));
+test('3.6.1: source-level — stdin.readableEnded is NOT in the orphan decision', async () => {
+  // 3.6.1 regression: Claude Code's MCP plugin host writes the JSON-RPC
+  // handshake to the child's stdin then leaves the pipe idle. On Node, the
+  // MCP SDK's StdioServerTransport consumes those bytes and Node flips
+  // `process.stdin.readableEnded` to true even though the pipe is still
+  // open. Treating that as an orphan signal killed the server within 15 s
+  // of every spawn. The fix: drop `stdin.readableEnded` from the orphan
+  // decision in the watchdog. Source-level assertion that the orphan flag
+  // composition is `parentDead || stdinDestroyed || stdinHadError` — NO
+  // `stdinEnded` term.
+  const indexSrc = await readFile(indexPath, 'utf8');
+  // The orphan decision line — must NOT include stdinEnded as a disjunct.
+  const orphanLineMatch = indexSrc.match(/const\s+orphaned\s*=\s*[^;]+;/);
+  assert.ok(orphanLineMatch, 'expected an `orphaned = ...` decision line in the watchdog');
+  const orphanLine = orphanLineMatch[0];
+  assert.ok(
+    !/\bstdinEnded\b/.test(orphanLine),
+    `3.6.1 fix regressed: orphan decision still references stdinEnded — got: ${orphanLine}`,
+  );
+  assert.ok(/parentDead/.test(orphanLine), 'parentDead must remain in orphan decision');
+  assert.ok(/stdinDestroyed/.test(orphanLine), 'stdinDestroyed must remain in orphan decision');
+  assert.ok(/stdinHadError/.test(orphanLine), 'stdinHadError must remain in orphan decision');
+  // Diagnostic field still logged for forensics.
+  assert.ok(
+    /stdin_ended:\s*process\.stdin\.readableEnded/.test(indexSrc),
+    'stdin_ended should still be logged as a diagnostic-only field in orphan_poll context',
+  );
+});
+
+test('3.6.1: idle stdin (handshake delivered, pipe held open) does not trigger shutdown', { timeout: 25_000 }, async () => {
+  // Behavioural confirmation. Reproduces the production scenario: parent
+  // writes a single JSON-RPC handshake message to stdin, then holds the
+  // pipe open and idle for 20 s. The orphan watchdog must NOT shut the
+  // server down. This catches the bug where the watchdog tripped on
+  // `readableEnded === true` during normal idle operation.
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-idle-'));
   const server = startServer(home, {
     AGENT_BRIDGE_ROLE: 'channel-owner',
     AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
   });
   try {
     await sleep(800);
-    server.stdin.end();
-    // Observe state at 5s (one poll in) — the child MUST still be alive.
-    await sleep(5_000);
-    assert.equal(server.exitCode, null, 'child must not have exited after a single orphan poll');
+    // Simulate the MCP initialize handshake. Importantly we do NOT call
+    // server.stdin.end() — the pipe stays open, just like Claude Code does.
+    const handshake = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'test-client', version: '1.0' },
+      },
+    }) + '\n';
+    server.stdin.write(handshake);
 
-    // Now wait the rest of the way (up to 25s total) — child should exit.
+    // Wait 20 s — well past the old 15 s confirmation window. Server must
+    // still be alive and the watchdog must not have flagged an orphan.
     const exited = await Promise.race([
-      new Promise((resolve) => server.once('exit', () => resolve(true))),
-      sleep(20_000).then(() => false),
+      new Promise((resolve) => server.once('exit', (code, signal) => resolve({ code, signal }))),
+      sleep(20_000).then(() => null),
     ]);
-    assert.ok(exited, 'child must exit after 3 confirmed polls (~15s)');
+    assert.equal(exited, null, `server must remain alive on idle stdin (3.6.1) — got ${JSON.stringify(exited)}`);
 
-    // Verify the log carries the orphan_poll progression.
     const events = await readEvents(home);
     const polls = events.filter((e) => e.event === 'parent.orphan_poll');
-    assert.ok(
-      polls.length >= 3,
-      `expected at least 3 parent.orphan_poll events, got ${polls.length}`,
-    );
-    // Final poll number should be >= 3 (confirmation reached).
-    const finalPoll = polls[polls.length - 1];
-    assert.ok(
-      typeof finalPoll.context.poll === 'number' && finalPoll.context.poll >= 3,
-      'final orphan poll must be >= 3 (confirmation count reached)',
-    );
-    assert.equal(
-      finalPoll.context.confirmation_polls,
-      3,
-      'confirmation_polls field must be 3',
-    );
+    assert.equal(polls.length, 0, `no orphan polls expected on healthy idle parent, got: ${JSON.stringify(polls.map((p) => p.context))}`);
+  } finally {
+    try { server.kill('SIGKILL'); } catch {}
+    await sleep(100);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('3.6.1: SIGTERM still triggers clean shutdown (orphan watchdog not regressing other paths)', { timeout: 10_000 }, async () => {
+  // Sanity — make sure removing the stdin_ended check didn't break the rest
+  // of the lifecycle. Explicit SIGTERM must still drive shutdown promptly.
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-sigterm-'));
+  const server = startServer(home, {
+    AGENT_BRIDGE_ROLE: 'channel-owner',
+    AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+  });
+  try {
+    await sleep(800);
+    server.kill('SIGTERM');
+    const exited = await Promise.race([
+      new Promise((resolve) => server.once('exit', () => resolve(true))),
+      sleep(7_000).then(() => false),
+    ]);
+    assert.ok(exited, 'server must exit promptly on SIGTERM');
   } finally {
     try { server.kill('SIGKILL'); } catch {}
     await sleep(100);

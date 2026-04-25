@@ -79,7 +79,7 @@ test('plugin starts, acquires lease, emits channel.starting + channel.ready, the
     const events = await readUnifiedEvents(home);
     const starting = events.find((e) => e.event === 'channel.starting');
     assert.ok(starting, 'expected channel.starting event');
-    assert.equal(starting.context.version, '3.6.0', 'startup event should report version 3.6.0');
+    assert.equal(starting.context.version, '3.6.1', 'startup event should report version 3.6.1');
     assert.equal(starting.component, 'claude-code-channel', 'log component should be claude-code-channel');
 
     const ready = events.find((e) => e.event === 'channel.ready');
@@ -142,6 +142,72 @@ test('source-level guards: Patches A, B, C, D, E, F are wired in built index.js'
   // Patch F — heartbeat-recency guard via lease updatedAt
   assert.ok(indexSrc.includes('patch_f.backoff'), 'Patch F: backoff event wired');
   assert.ok(/AGENT_BRIDGE_DISABLE_PATCH_F/.test(indexSrc), 'Patch F: env opt-out');
+});
+
+test('3.6.1: source-level — stdin.readableEnded is NOT in orphan decision', async () => {
+  // 3.6.1 regression: Claude Code's MCP plugin host writes the JSON-RPC
+  // handshake to stdin then leaves the pipe idle. Node flips
+  // `process.stdin.readableEnded` to true once the MCP SDK consumes the
+  // buffered handshake bytes — but the pipe is still open and the parent is
+  // still alive. Treating that as an orphan signal killed the plugin within
+  // 15 s of every spawn. The fix: drop `readableEnded` from the orphan check.
+  const indexSrc = await readFile(indexPath, 'utf8');
+  const orphanLineMatch = indexSrc.match(/const\s+orphaned\s*=\s*[^;]+;/);
+  assert.ok(orphanLineMatch, 'expected an `orphaned = ...` decision line in the watchdog');
+  const orphanLine = orphanLineMatch[0];
+  assert.ok(
+    !/\bstdinEnded\b/.test(orphanLine),
+    `3.6.1 fix regressed: orphan decision still references stdinEnded — got: ${orphanLine}`,
+  );
+  assert.ok(/ppidChanged/.test(orphanLine), 'ppidChanged must remain in orphan decision');
+  assert.ok(/stdinDestroyed/.test(orphanLine), 'stdinDestroyed must remain in orphan decision');
+  assert.ok(/stdinHadError/.test(orphanLine), 'stdinHadError must remain in orphan decision');
+  // Diagnostic field still logged for forensics.
+  assert.ok(
+    /stdin_ended:\s*process\.stdin\.readableEnded/.test(indexSrc),
+    'stdin_ended should still be logged as a diagnostic-only field in orphan_poll context',
+  );
+});
+
+test('3.6.1: plugin survives idle stdin (handshake delivered, pipe held open)', { timeout: 25_000 }, async () => {
+  // Behavioural confirmation. Reproduces the production scenario: parent
+  // writes a single JSON-RPC handshake message to stdin, then holds the
+  // pipe open and idle. The orphan watchdog must NOT shut the plugin down.
+  const home = await mkdtemp(join(tmpdir(), 'claude-code-channel-3-6-1-idle-'));
+  // Re-enable the orphan watchdog (the default in tests is to disable it).
+  const plugin = startPlugin(home, { AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG: '0' });
+  try {
+    await sleep(1500);
+    const handshake = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'test-client', version: '1.0' },
+      },
+    }) + '\n';
+    plugin.child.stdin.write(handshake);
+
+    const exited = await Promise.race([
+      new Promise((resolve) => plugin.child.once('exit', (code, signal) => resolve({ code, signal }))),
+      sleep(20_000).then(() => null),
+    ]);
+    assert.equal(
+      exited,
+      null,
+      `plugin must NOT exit on idle stdin (3.6.1 fix) — got ${JSON.stringify(exited)}`,
+    );
+
+    const events = await readUnifiedEvents(home);
+    const polls = events.filter((e) => e.event === 'channel.orphan_poll');
+    assert.equal(polls.length, 0, `no orphan polls expected on healthy idle parent, got: ${JSON.stringify(polls.map((p) => p.context))}`);
+  } finally {
+    try { plugin.child.kill('SIGKILL'); } catch {}
+    await sleep(100);
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test('plugin exits cleanly when an existing healthy peer holds the lease (Patch F)', { timeout: 10_000 }, async () => {

@@ -78,7 +78,7 @@ test('server.shutdown_diag dumps active handles and request counts on shutdown',
     const events = await readEvents(home);
     const starting = events.find((e) => e.event === 'server.starting');
     assert.ok(starting, 'expected server.starting event');
-    assert.equal(starting.context.version, '3.6.0', 'startup event should report version 3.6.0');
+    assert.equal(starting.context.version, '3.6.1', 'startup event should report version 3.6.1');
 
     const diag = events.find((e) => e.event === 'server.shutdown_diag');
     assert.ok(diag, 'expected server.shutdown_diag event on shutdown');
@@ -148,12 +148,14 @@ test('sibling detection wiring is present in shipped build', async () => {
   );
 });
 
-test('channel-owner treats stdin close as host lifecycle shutdown after 3-poll confirmation and releases lease', { timeout: 30_000 }, async () => {
-  // 3.5.5: stdin-end no longer triggers immediate shutdown. The orphan
-  // watchdog must observe stdin destroyed/readableEnded across 3 consecutive
-  // 5s polls (15s total) before calling shutdown. Reason is the new
-  // composite "orphan-watchdog: ..." string (mirroring Telegram's Patch A).
-  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-5-channel-owner-'));
+test('3.6.1: channel-owner survives idle stdin and shuts down cleanly on SIGTERM, releasing lease', { timeout: 30_000 }, async () => {
+  // 3.6.1: idle stdin (`readableEnded === true`) is no longer an orphan
+  // signal — Claude Code's MCP plugin host writes the JSON-RPC handshake then
+  // leaves the pipe idle, which used to trigger false-positive shutdown
+  // within 15 s. This test simulates that exact scenario (write handshake,
+  // hold pipe open, wait past the old shutdown window) and asserts both
+  // survival and clean SIGTERM-driven shutdown with lease release.
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-channel-owner-'));
   const server = startServer(home, {
     AGENT_BRIDGE_ROLE: 'channel-owner',
     AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
@@ -163,26 +165,39 @@ test('channel-owner treats stdin close as host lifecycle shutdown after 3-poll c
     await sleep(800);
     assert.ok(await readFile(lockPath, 'utf8'), 'channel-owner should acquire watcher lease');
 
-    server.child.stdin.end();
-    // Give the orphan watchdog up to 25s to reach 3 confirmations (15s nominal
-    // at 5s polling, plus startup slack).
+    // Simulate MCP handshake: write a JSON-RPC initialize message and KEEP
+    // the pipe open. This is what Claude Code does — the production bug case.
+    const handshake = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'test-client', version: '1.0' },
+      },
+    }) + '\n';
+    server.child.stdin.write(handshake);
+
+    // Wait 18 s — well past the old 15 s confirmation window. Server must
+    // still be alive.
+    const earlyExit = await Promise.race([
+      new Promise((resolve) => server.child.once('exit', (code, signal) => resolve({ code, signal }))),
+      sleep(18_000).then(() => null),
+    ]);
+    assert.equal(earlyExit, null, `channel-owner must NOT exit on idle stdin (3.6.1) — got ${JSON.stringify(earlyExit)}`);
+
+    // Now send SIGTERM — should shut down cleanly within a few seconds.
+    server.child.kill('SIGTERM');
     const exited = await Promise.race([
       new Promise((resolve) => server.child.once('exit', () => resolve(true))),
-      sleep(25_000).then(() => false),
+      sleep(7_000).then(() => false),
     ]);
-    assert.ok(exited, 'channel-owner should exit within 25s of stdin.end()');
+    assert.ok(exited, 'channel-owner should exit promptly on SIGTERM');
 
     const events = await readEvents(home);
     const shutdown = events.find((e) => e.event === 'server.shutdown');
     assert.ok(shutdown, 'expected clean shutdown event');
-    assert.match(
-      shutdown.context.reason,
-      /orphan-watchdog/,
-      'shutdown reason should come from the 3-poll orphan watchdog',
-    );
-    // Confirm we logged at least one orphan_poll event before the final shutdown.
-    const orphanPolls = events.filter((e) => e.event === 'parent.orphan_poll');
-    assert.ok(orphanPolls.length >= 1, 'expected at least one parent.orphan_poll log entry');
     assert.ok(events.find((e) => e.event === 'watcher.lease_released'), 'watcher lease should be released');
     await assert.rejects(() => readFile(lockPath, 'utf8'), { code: 'ENOENT' });
   } finally {

@@ -1,5 +1,50 @@
 # Changelog
 
+## agent-bridge 3.6.1 — 2026-04-21
+
+### Fix orphan-watchdog killing channel plugin within 15s of spawn
+
+3.6.0 shipped the new `agent-bridge-channel` Claude Code plugin with the Telegram-pattern lifecycle posture (Patches A-F). The 3-poll orphan watchdog (Patch A) was supposed to require 15 s of confirmed orphan state before shutdown, but it always tripped within 15 s of every spawn and killed the plugin before it could deliver a single message. Production logs (`~/.agent-bridge/logs/agent-bridge.log`):
+
+```
+channel.orphan_poll: poll 1/3, stdin_ended: true,  ppid_changed: false, stdin_destroyed: false, stdin_errored: false
+channel.orphan_poll: poll 2/3, stdin_ended: true,  ...
+channel.orphan_poll: poll 3/3, stdin_ended: true,  ...
+channel.shutdown reason="orphan-watchdog: stdin readableEnded"
+```
+
+#### Root cause
+
+Claude Code's MCP plugin host writes JSON-RPC messages to the child's stdin during the initial handshake and then leaves the pipe idle (it stays open — JSON-RPC continues to flow over it for as long as the host wants to talk to the child). On Node, the MCP SDK's `StdioServerTransport` consumes those buffered handshake bytes via the readable interface, which causes `process.stdin.readableEnded` to flip to `true` even though the pipe is still open. The orphan watchdog treated `readableEnded === true` as a sign the parent had gone away and shut down within 15 s of every spawn.
+
+The Telegram channel plugin uses the same Patch A logic and doesn't die because it runs under bun, which handles stdin lifecycle differently — `readableEnded` doesn't transition the same way. On Node we have to be stricter about what counts as orphan.
+
+#### Fix (Option A — simplest)
+
+Drop `stdin.readableEnded === true` from the orphan check in BOTH `claude-code-channel/src/index.ts` and `mcp-server/src/index.ts`. The remaining orphan signals — `ppid !== bootPpid`, `stdin.destroyed === true`, `stdin` had an `'error'` event — are sufficient to detect true reparenting / pipe failure. An IDLE stdin is not an orphan signal on Node; only an actively-broken or actually-destroyed stdin is.
+
+`stdin_ended` is still logged in the orphan_poll context for diagnostics, but it no longer contributes to the orphan decision.
+
+#### Tests
+
+- New regression test `3.6.1: stdin.readableEnded alone must NOT trigger shutdown` (`mcp-server/test/three-poll-watchdog.test.mjs`) — calls `server.stdin.end()`, waits 20 s, asserts the server is still alive.
+- New regression test `3.6.1: plugin survives idle stdin` (`claude-code-channel/test/lifecycle.test.mjs`) — same shape for the channel plugin.
+- Updated `3.6.1: channel-owner survives idle stdin` (`mcp-server/test/heartbeat-shutdown-diag.test.mjs`) — the previous version of this test asserted that `stdin.end()` triggered shutdown after 25 s. That assertion was the bug; the new test asserts survival on idle stdin and clean shutdown on SIGTERM.
+- Bumped version assertions in lifecycle and heartbeat-shutdown-diag tests to `3.6.1`.
+
+#### Files touched
+
+- `claude-code-channel/src/index.ts` — orphan check fix, VERSION bump, header comment update.
+- `mcp-server/src/index.ts` — orphan check fix, VERSION bump.
+- `claude-code-channel/package.json` + `package-lock.json` — 3.6.1.
+- `mcp-server/package.json` + `package-lock.json` — 3.6.1.
+- `claude-code-channel/.claude-plugin/plugin.json` — 3.6.1.
+- `mcp-server/.claude-plugin/plugin.json` — 3.6.1.
+- `agent-bridge` (CLI) — `VERSION="3.6.1"`.
+- `claude-code-channel/test/lifecycle.test.mjs` — version assertion + new survival test.
+- `mcp-server/test/three-poll-watchdog.test.mjs` — rewrote stdin-end test to assert survival.
+- `mcp-server/test/heartbeat-shutdown-diag.test.mjs` — version assertion + rewrote channel-owner stdin-close test.
+
 ## agent-bridge 3.6.0 — 2026-04-21
 
 ### Structural fix: split the channel host into its own Claude Code plugin
