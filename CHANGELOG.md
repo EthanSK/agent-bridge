@@ -11,11 +11,11 @@ Live Mini evidence after 3.5.2 showed the remaining Claude Code channel-owner de
 - Logs `stdout.broken_pipe_exit`, `stdin.broken_pipe_exit`, `unhandled_rejection.broken_pipe_exit`, or `uncaught_exception.broken_pipe_exit` before exiting.
 - Releases the watcher lease via `stopWatcher()` and stops inbox/prune state via `shutdownInbox()` before fatal transport exit when JS still has a chance to clean up.
 - `bridge_inbox_stats` now reads the shared watcher lease file, so tools-only MCP children can report the real channel-owner PID/role/alive/fresh state instead of only their own process-local `unknown/no` watcher state.
-- Adds regression coverage for shared-lease stats and source-level guards that broken-pipe handlers no longer silently `process.exit(0)`. A manual pipe-close reproduction also produced `stdout.broken_pipe_exit` and removed the lock.
+- Adds regression coverage for shared-lease stats and source-level guards that broken-pipe handlers no longer silently `process.exit(0)`. A separate logger-independent sync breadcrumb file now records fatal-transport/shutdown/signal/process-exit progress for the next live reproduction.
 
 #### Root-cause implication
 
-This does not pretend Claude Code delivery is a separate always-on daemon. The root architectural issue is still that the `claude-code` watcher lives inside a Claude-managed MCP stdio child. When Claude closes/reaps that stdout transport, live push from that child is impossible; the correct behaviour is now to log the transport death, release ownership, and let the next live channel-owner/replay recover instead of leaving a ghost lock and no evidence. A true always-on Claude route would need a larger 3.6.x architecture change.
+This does not pretend Claude Code delivery is a separate always-on daemon. The root architectural issue is still that the `claude-code` watcher lives inside a Claude-managed MCP stdio child. When Claude closes/reaps that stdout transport, live push from that child is impossible; the correct behaviour is now to make the next death path provable, release ownership when JS still has a chance, and let the next live channel-owner/replay recover instead of leaving a ghost lock and no evidence. A true always-on Claude route would need a larger 3.6.x architecture change.
 
 ## agent-bridge 3.5.2 — 2026-04-25
 
