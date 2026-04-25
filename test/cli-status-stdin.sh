@@ -31,4 +31,6 @@ OUTPUT="$(HOME="$TMP" PATH="$TMP/bin:$PATH" "$ROOT/agent-bridge" status)"
 
 grep -q 'one' <<<"$OUTPUT"
 grep -q 'two' <<<"$OUTPUT"
-grep -q '2/2 machines reachable' <<<"$OUTPUT"
+grep -q '2/2 remote machines reachable' <<<"$OUTPUT"
+# 3.5.0+: status output now includes the local pseudo-machine line as well.
+grep -q 'LOCAL' <<<"$OUTPUT"

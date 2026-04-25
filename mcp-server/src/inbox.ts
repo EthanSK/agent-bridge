@@ -430,6 +430,99 @@ export function createMessage(
 }
 
 /**
+ * Deliver a message to the LOCAL machine — no SSH.
+ *
+ * Same-machine delivery (3.5.0+) writes directly to
+ * `~/.agent-bridge/inbox/<target>/<id>.json` using the same atomic write
+ * pattern as the SSH path (write to a hidden temp file, fsync, rename) so
+ * the local file watcher never sees a half-written JSON file.
+ *
+ * Use this when `machine` resolves to the local host (matches
+ * `getLocalMachineName()` or one of `LOCAL_MACHINE_ALIASES`). Cross-machine
+ * sends still go through `sendMessage` over SSH.
+ */
+export function sendLocalMessage(message: BridgeMessage): void {
+  if (!message.target || !isValidTarget(message.target)) {
+    throw new Error(
+      `BridgeMessage.target is required for local delivery (e.g. "claude-code", "openclaw/clawdiboi2"). `
+      + `Got: ${JSON.stringify(message.target ?? null)}`,
+    );
+  }
+
+  ensureInboxDirs();
+
+  const targetDir = inboxSubdir(message.target);
+  if (!existsSync(targetDir)) {
+    mkdirSync(targetDir, { recursive: true, mode: 0o700 });
+  }
+
+  const finalPath = join(targetDir, `${message.id}.json`);
+  // Atomic write: temp file in the same directory, then rename. This matches
+  // sshWriteFile() so the inbox watcher sees a fully-formed JSON file appear
+  // in a single rename event — never a partial write.
+  const tmpPath = join(targetDir, `.agent-bridge-${randomUUID()}.tmp`);
+  const content = JSON.stringify(message, null, 2);
+
+  logInfo(`Sending message ${message.id} locally to target=${message.target}`);
+  logEvent({
+    event: 'message.local_send_start',
+    msg: `Sending message ${message.id} locally to ${message.to}`,
+    context: {
+      msg_id: message.id,
+      to: message.to,
+      target: message.target,
+      type: message.type,
+      content_length: message.content?.length ?? 0,
+      reply_to: message.replyTo ?? undefined,
+      ttl: message.ttl,
+      transport: 'local',
+    },
+  });
+
+  try {
+    writeFileSync(tmpPath, content, { mode: 0o600 });
+    renameSync(tmpPath, finalPath);
+  } catch (err) {
+    // Best-effort cleanup of the orphan temp file
+    try { unlinkSync(tmpPath); } catch { /* ignore */ }
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logError(`Local send failed for ${message.id}: ${errMsg}`);
+    logEvent({
+      event: 'message.local_send_failed',
+      level: 'error',
+      msg: `Local send failed for ${message.id}`,
+      context: { msg_id: message.id, target: message.target, error: errMsg },
+    });
+    throw new Error(`Failed to deliver message locally: ${errMsg}`);
+  }
+
+  // Save a copy in the local outbox for tracking, mirroring the SSH path.
+  try {
+    const outboxPath = join(OUTBOX_DIR, `${message.id}.json`);
+    writeFileSync(outboxPath, content, { mode: 0o600 });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes('ENOSPC')) {
+      throw new Error(`Disk full: cannot save outbox copy of ${message.id}`);
+    }
+    logWarn(`Failed to write outbox copy: ${errMsg}`);
+  }
+
+  logInfo(`Message ${message.id} delivered locally (target=${message.target})`);
+  logEvent({
+    event: 'message.delivered',
+    msg: `Message ${message.id} delivered locally`,
+    context: {
+      msg_id: message.id,
+      to: message.to,
+      target: message.target,
+      type: message.type,
+      transport: 'local',
+    },
+  });
+}
+
+/**
  * Send a message to a remote machine by writing it to their inbox via SSH.
  * Retries once on failure before throwing.
  *

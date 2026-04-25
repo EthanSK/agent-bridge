@@ -17,6 +17,8 @@ import {
   loadConfig,
   getMachine,
   getLocalMachineName,
+  isLocalMachineName,
+  LOCAL_MACHINE_ALIASES,
   CLAUDE_CODE_TARGET,
   DEFAULT_TTL_SECONDS,
   isValidTarget,
@@ -25,6 +27,7 @@ import { sshExec, sshPingDetailed } from './ssh.js';
 import {
   createMessage,
   sendMessage,
+  sendLocalMessage,
   consumeInbox,
   peekInbox,
   clearInbox,
@@ -43,28 +46,30 @@ export function registerTools(server: McpServer): void {
     {
       title: 'List Machines',
       description:
-        'List all paired machines and their connection details. Shows machine name, host, user, port, and pairing date.',
+        'List all paired machines and their connection details. Shows machine name, host, user, port, and pairing date. The local machine is always listed as a same-machine target (no SSH); send to it by passing its real name or one of the aliases ("local", "self", "localhost").',
     },
     async () => {
       const machines = loadConfig();
       const localName = getLocalMachineName();
 
-      if (machines.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `No paired machines found. This machine is "${localName}". Use \`agent-bridge pair\` to add a remote machine.`,
-            },
-          ],
-        };
-      }
+      const lines: string[] = [];
+      lines.push(
+        `Local machine: ${localName} (same-machine target, no SSH; aliases: ${LOCAL_MACHINE_ALIASES.join(', ')})`,
+      );
+      lines.push('');
 
-      const lines = [`Local machine: ${localName}`, '', 'Paired machines:'];
-      for (const m of machines) {
+      if (machines.length === 0) {
         lines.push(
-          `  - ${m.name}: ${m.user}@${m.host}:${m.port} (paired ${m.pairedAt})`,
+          'No paired remote machines. Use `agent-bridge pair` to add one. '
+          + 'You can still bridge_send_message to this machine by name or alias.',
         );
+      } else {
+        lines.push('Paired remote machines:');
+        for (const m of machines) {
+          lines.push(
+            `  - ${m.name}: ${m.user}@${m.host}:${m.port} (paired ${m.pairedAt})`,
+          );
+        }
       }
 
       return {
@@ -95,6 +100,34 @@ export function registerTools(server: McpServer): void {
     },
     async ({ machine, probe }) => {
       const machines = loadConfig();
+      const localName = getLocalMachineName();
+
+      // Same-machine status: no SSH, always reachable. Reported as
+      // "LOCAL (no SSH)" so callers don't confuse it with a Tailscale endpoint.
+      if (machine && isLocalMachineName(machine)) {
+        const text = `${localName}: LOCAL (no SSH — same-machine delivery via inbox/<target>/)`;
+        logEvent({
+          event: 'tool.bridge_status',
+          msg: `bridge_status: ${localName} is LOCAL (same-machine)`,
+          context: { machine: localName, transport: 'local', reachable: true },
+        });
+        return { content: [{ type: 'text' as const, text }] };
+      }
+
+      if (!machine && machines.length === 0) {
+        // No paired remotes — still surface the local machine so callers know
+        // same-machine delivery is available.
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `${localName}: LOCAL (no SSH — same-machine delivery via inbox/<target>/)\n`
+                + 'No paired remote machines.',
+            },
+          ],
+        };
+      }
 
       if (machines.length === 0) {
         return {
@@ -118,7 +151,9 @@ export function registerTools(server: McpServer): void {
           content: [
             {
               type: 'text' as const,
-              text: `Machine "${machine}" not found. Available: ${machines.map(m => m.name).join(', ')}`,
+              text:
+                `Machine "${machine}" not found. Available: ${machines.map(m => m.name).join(', ')}, `
+                + `or "${localName}" / one of [${LOCAL_MACHINE_ALIASES.join(', ')}] for the local machine.`,
             },
           ],
           isError: true,
@@ -126,6 +161,11 @@ export function registerTools(server: McpServer): void {
       }
 
       const results: string[] = [];
+      // When checking ALL machines, prepend a local-machine line so users see
+      // same-machine delivery is available alongside the SSH peers.
+      if (!machine) {
+        results.push(`${localName}: LOCAL (no SSH — same-machine delivery via inbox/<target>/)`);
+      }
       for (const m of toCheck) {
         const ping = await sshPingDetailed(m, { bypassPathCache: probe === true });
         const pathTag = `via ${ping.label.toLowerCase()}`;
@@ -159,17 +199,22 @@ export function registerTools(server: McpServer): void {
     {
       title: 'Send Message',
       description:
-        'Send a message to a running agent on another machine. The message is delivered to their per-target inbox subdir via SSH and pushed into the matching agent harness:\n'
+        'Send a message to a running agent on another machine, OR to a same-machine target. Cross-machine sends go via SSH; same-machine sends write directly to the local inbox (no SSH). The receiver picks up the message via their per-target inbox subdir:\n'
         + '  • target="claude-code"           — Claude Code channel plugin (default for cross-machine Claude ↔ Claude)\n'
         + '  • target="openclaw/default"      — OpenClaw @ClawdStationMiniBot running Telegram session\n'
         + '  • target="openclaw/clawdiboi2"   — OpenClaw @Clawdiboi2bot running Telegram session\n'
         + '  • target="openclaw/clordlethird" — OpenClaw @ClordLeThirdBot running Telegram session\n'
         + '  • target="<harness>/<name>"      — any other configured harness\n\n'
+        + 'The `machine` parameter accepts either a paired remote machine name OR the local machine name (or one of the aliases "local", "self", "localhost"). Same-machine delivery is first-class (3.5.0+): the message JSON is written directly to ~/.agent-bridge/inbox/<target>/<id>.json with no SSH hop. Useful for routing to OpenClaw embedded agents (target="openclaw/<account>") on the same host.\n\n'
         + 'The target field is REQUIRED as of agent-bridge 3.4.0 — there is intentionally no default delivery routing. '
         + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup. '
         + '`from_target` / `fromTarget` defaults to `claude-code` for normal Claude Code sends so the remote agent can reply over agent-bridge. '
         + 'Set `one_way=true` only when you intentionally do not want a bridge reply path.',      inputSchema: {
-        machine: z.string().describe('Name of the target machine'),
+        machine: z
+          .string()
+          .describe(
+            'Name of the target machine. Pass a paired remote machine name for SSH delivery, OR the local machine name / one of the aliases ("local", "self", "localhost") for same-machine delivery (no SSH).',
+          ),
         message: z.string().describe('The message content to send'),
         target: z
           .string()
@@ -207,14 +252,23 @@ export function registerTools(server: McpServer): void {
       },
     },
     async ({ machine: machineName, message, target, from_target, fromTarget, one_way, reply_to, ttl }) => {
-      const machine = getMachine(machineName);
-      if (!machine) {
+      const localName = getLocalMachineName();
+      const isLocal = isLocalMachineName(machineName);
+      const machine = isLocal ? null : getMachine(machineName);
+      if (!isLocal && !machine) {
         const all = loadConfig();
+        const availableNames = [
+          localName,
+          ...all.map(m => m.name),
+          ...LOCAL_MACHINE_ALIASES,
+        ].join(', ');
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Machine "${machineName}" not found. Available: ${all.map(m => m.name).join(', ')}`,
+              text:
+                `Machine "${machineName}" not found. Available: ${availableNames}. `
+                + `(Pass the local machine name or "local"/"self"/"localhost" for same-machine delivery.)`,
             },
           ],
           isError: true,
@@ -285,10 +339,13 @@ export function registerTools(server: McpServer): void {
         };
       }
 
-      const localName = getLocalMachineName();
+      // Always record the human-readable destination name. For local sends we
+      // use the real local machine name even when the caller passed an alias,
+      // so receivers (and the outbox copy) see a stable identifier.
+      const toName = isLocal ? localName : machineName;
       const msg = createMessage(
         localName,
-        machineName,
+        toName,
         'message',
         message,
         reply_to ?? null,
@@ -298,13 +355,18 @@ export function registerTools(server: McpServer): void {
       );
 
       try {
-        await sendMessage(machine, msg);
+        if (isLocal) {
+          sendLocalMessage(msg);
+        } else {
+          await sendMessage(machine!, msg);
+        }
+        const transportLabel = isLocal ? 'local' : 'ssh';
         return {
           content: [
             {
               type: 'text' as const,
               text:
-                `Message sent to ${machineName} target=${target}`
+                `Message sent to ${toName} target=${target} transport=${transportLabel}`
                 + `${resolvedFromTarget ? ` from_target=${resolvedFromTarget}` : ' one_way=true'}`
                 + ` (id: ${msg.id})`,
             },
@@ -313,12 +375,12 @@ export function registerTools(server: McpServer): void {
       } catch (err) {
         const errMsg =
           err instanceof Error ? err.message : String(err);
-        logError(`Failed to send message to ${machineName} target=${target}: ${errMsg}`);
+        logError(`Failed to send message to ${toName} target=${target}: ${errMsg}`);
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Failed to send message to ${machineName} target=${target}: ${errMsg}`,
+              text: `Failed to send message to ${toName} target=${target}: ${errMsg}`,
             },
           ],
           isError: true,
@@ -420,6 +482,24 @@ export function registerTools(server: McpServer): void {
       },
     },
     async ({ machine: machineName, command, timeout }) => {
+      // bridge_run_command is intentionally cross-machine only: there is no
+      // SSH-to-self path. For local shell work, the harness has direct shell
+      // access already (Bash tool, etc.). Reject local routes loudly so users
+      // don't accidentally rely on a non-existent "run on self via SSH" path.
+      if (isLocalMachineName(machineName)) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `bridge_run_command targets remote machines only. "${machineName}" is the local machine — `
+                + 'just run the command directly in your harness shell. There is no SSH loopback in agent-bridge.',
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const machine = getMachine(machineName);
       if (!machine) {
         const all = loadConfig();

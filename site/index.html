@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>agent-bridge &mdash; Bridge Claude Code sessions across machines</title>
+    <title>agent-bridge &mdash; Bridge Claude Code and OpenClaw sessions across machines</title>
     <meta
       name="description"
-      content="Bridge Claude Code sessions across machines. Channel-mode agent-to-agent messaging over SSH. Paste one prompt into Claude on each Mac and they wire themselves together."
+      content="Bridge Claude Code and OpenClaw sessions across machines. Agent-to-agent messaging over SSH with harness-specific push paths."
     />
     <meta name="robots" content="index, follow, max-image-preview:large" />
     <link rel="canonical" href="https://ethansk.github.io/agent-bridge/" />
@@ -19,21 +19,21 @@
     <meta property="og:type" content="website" />
     <meta property="og:locale" content="en_GB" />
     <meta property="og:url" content="https://ethansk.github.io/agent-bridge/" />
-    <meta property="og:title" content="agent-bridge &mdash; Bridge Claude Code sessions across machines" />
-    <meta property="og:description" content="Channel-mode agent-to-agent messaging over SSH. One Claude Code plugin. Zero cloud. One prompt to install." />
+    <meta property="og:title" content="agent-bridge &mdash; Bridge Claude Code and OpenClaw sessions across machines" />
+    <meta property="og:description" content="Agent-to-agent messaging over SSH. Claude Code plugin, OpenClaw native channel, zero cloud." />
     <meta property="og:image" content="https://ethansk.github.io/agent-bridge/og-image.png" />
     <meta property="og:image:secure_url" content="https://ethansk.github.io/agent-bridge/og-image.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="agent-bridge: two Claude Code sessions (Mac-Mini and MacBook-Pro) connected over an SSH channel, peer-to-peer with no cloud." />
+    <meta property="og:image:alt" content="agent-bridge: Claude Code and OpenClaw sessions connected over SSH, peer-to-peer with no cloud." />
 
     <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="agent-bridge &mdash; Bridge Claude Code sessions across machines" />
-    <meta name="twitter:description" content="Channel-mode agent-to-agent messaging over SSH. One Claude Code plugin. One prompt to install." />
+    <meta name="twitter:title" content="agent-bridge &mdash; Bridge Claude Code and OpenClaw sessions across machines" />
+    <meta name="twitter:description" content="Agent-to-agent messaging over SSH. Claude Code plugin plus OpenClaw native channel." />
     <meta name="twitter:image" content="https://ethansk.github.io/agent-bridge/og-image.png" />
-    <meta name="twitter:image:alt" content="agent-bridge: two Claude Code sessions (Mac-Mini and MacBook-Pro) connected over an SSH channel, peer-to-peer with no cloud." />
+    <meta name="twitter:image:alt" content="agent-bridge: Claude Code and OpenClaw sessions connected over SSH, peer-to-peer with no cloud." />
 
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -52,7 +52,7 @@
           </span>
           <span class="logo-copy">
             <span class="logo-title">
-              agent-bridge <span class="logo-version">v3.4.13</span>
+              agent-bridge <span class="logo-version">v3.5.0</span>
             </span>
             <span class="logo-sub">channel-mode · peer-to-peer · SSH</span>
           </span>
@@ -69,20 +69,20 @@
       <header class="hero wrap">
         <div class="hero-meta reveal reveal-1">
           <span><span class="dot" aria-hidden="true"></span> channel open</span>
-          <span class="ver">v3.4.13</span>
+          <span class="ver">v3.5.0</span>
           <span>Claude Code + OpenClaw</span>
           <span>tested end-to-end</span>
         </div>
 
         <h1 class="hero-title reveal reveal-2">
           <span class="line">Let your</span>
-          <span class="line"><span class="peer-a">Claude</span></span>
+          <span class="line"><span class="peer-a">agent</span></span>
           <span class="line">sessions</span>
           <span class="line">talk to each <span class="peer-b">other.</span></span>
         </h1>
 
         <p class="hero-lede reveal reveal-3">
-          <strong>agent-bridge</strong> lets a Claude Code session on one Mac push messages straight into a Claude Code session on another &mdash; agent-to-agent, not shell-to-shell. One plugin per machine. Messages land as live <code>&lt;channel source="agent-bridge"&gt;</code> events inside the already-running conversation. No broker, no cloud, no fresh agents spawned on the remote side.
+          <strong>agent-bridge</strong> lets running Claude Code and OpenClaw sessions push messages to each other across machines &mdash; agent-to-agent, not shell-to-shell. Both share the same SSH file transport, but their host models are different: Claude Code uses an MCP + <code>claude/channel</code> stdio plugin; OpenClaw uses a native <code>openclaw-channel/</code> gateway plugin. No broker, no cloud, no fresh agents spawned on the remote side.
         </p>
 
         <div class="hero-actions reveal reveal-4">
@@ -112,7 +112,7 @@
             <div class="peer-node peer-node--b">
               <span class="label">peer b</span>
               <span class="name">MacBook-Pro</span>
-              <span class="host">ethansk@100.64.0.7 · Claude Code session</span>
+              <span class="host">ethansk@100.64.0.7 · OpenClaw session</span>
             </div>
           </div>
         </div>
@@ -186,11 +186,11 @@
         <div class="card-grid">
           <div class="card" data-tag="01">
             <h3>Push, not poll</h3>
-            <p>Messages from a remote machine arrive as real-time <code>&lt;channel source="agent-bridge"&gt;</code> events inside your running Claude session. No timers, no busy loops, no stale inbox.</p>
+            <p>Messages from a remote machine arrive through the right host path: <code>&lt;channel source="agent-bridge"&gt;</code> events in Claude Code, or native OpenClaw channel turns in OpenClaw. No fresh agent spawn on the far side.</p>
           </div>
           <div class="card" data-tag="02">
             <h3>Running sessions, not new ones</h3>
-            <p>The plugin connects <em>already-running</em> Claude sessions. Machine A&rsquo;s <code>bridge_send_message</code> drops a signed file into Machine B&rsquo;s inbox; Machine B&rsquo;s watcher pushes it into the live conversation. No fresh <code>claude --print</code> spawned on the far side &mdash; that whole shape was removed in 3.0.0.</p>
+            <p>The bridge connects <em>already-running</em> sessions. Machine A&rsquo;s <code>bridge_send_message</code> drops a signed file into Machine B&rsquo;s target inbox; Machine B&rsquo;s Claude Code or OpenClaw watcher injects it into the live conversation. No fresh <code>claude --print</code> spawned on the far side &mdash; that whole shape was removed in 3.0.0.</p>
           </div>
           <div class="card" data-tag="03">
             <h3>Peer-to-peer over SSH</h3>
@@ -198,7 +198,7 @@
           </div>
           <div class="card" data-tag="04">
             <h3>Hardened against zombies</h3>
-            <p>The MCP server exits cleanly on parent death, handles <code>EPIPE</code>, detects stdin close, watchdogs its own <code>ppid</code>, and expands remote tildes correctly. No shadow <code>~/.agent-bridge/inbox</code> directories, no orphaned Node processes chewing CPU after Claude quits.</p>
+            <p>The Claude Code channel-owner MCP child is hardened against benign stdin/stderr/SIGTERM closure, exits on real parent/stdout death, and replays undelivered messages on startup. OpenClaw is hosted separately by the gateway plugin. No shadow <code>~/.agent-bridge/inbox</code> directories, no fresh remote agent processes.</p>
           </div>
         </div>
       </section>
@@ -322,10 +322,10 @@
         <div class="install-panel">
           <div class="panel-head">
             <h3>Other MCP-capable harnesses</h3>
-            <span class="panel-tag panel-tag--muted">MCP polling · OpenClaw push</span>
+            <span class="panel-tag panel-tag--muted">MCP tools · OpenClaw push</span>
           </div>
           <p class="panel-desc">
-            Codex CLI, Gemini CLI, Aider, and anything else that speaks the Model Context Protocol can call the <code>bridge_*</code> tools in polling mode. OpenClaw is verified separately through the native <code>openclaw-channel/</code> plugin, which watches per-target inboxes and dispatches bridge messages into live Telegram-backed sessions.
+            Codex CLI, Gemini CLI, Aider, and anything else that speaks the Model Context Protocol can call the <code>bridge_*</code> tools, but their inbound receive loops are still scaffolded until tested. OpenClaw is verified separately through the native <code>openclaw-channel/</code> plugin, which watches per-target inboxes and dispatches bridge messages into live Telegram-backed sessions.
           </p>
           <div class="step-block">
             <div class="step-block-head">
@@ -335,13 +335,14 @@
   <span class="t-str">"mcpServers"</span>: {
     <span class="t-str">"agent-bridge"</span>: {
       <span class="t-str">"command"</span>: <span class="t-str">"node"</span>,
-      <span class="t-str">"args"</span>: [<span class="t-str">"/absolute/path/to/agent-bridge/mcp-server/build/index.js"</span>]
+      <span class="t-str">"args"</span>: [<span class="t-str">"/absolute/path/to/agent-bridge/mcp-server/build/index.js"</span>],
+      <span class="t-str">"env"</span>: { <span class="t-str">"AGENT_BRIDGE_ROLE"</span>: <span class="t-str">"tools-only"</span> }
     }
   }
 }</pre>
           </div>
           <p class="panel-note">
-            Without a push channel, harnesses run in <strong>polling mode</strong>: the agent calls <code>bridge_receive_messages</code> at natural breakpoints to drain the inbox. Companion instruction files ship in the repo: <code>AGENTS.md</code> (Codex), <code>GEMINI.md</code> (Gemini), <code>INSTRUCTIONS.md</code> (generic), and an <code>openclaw-channel/</code> native channel plugin for OpenClaw push delivery.
+            Without a verified push channel, MCP-only harnesses are tools-only by default; <code>bridge_receive_messages</code> is a manual Claude Code-target inbox fallback, not proof of full Codex/Gemini/Aider delivery. Companion instruction files ship in the repo: <code>AGENTS.md</code> (Codex), <code>GEMINI.md</code> (Gemini), <code>INSTRUCTIONS.md</code> (generic), and an <code>openclaw-channel/</code> native channel plugin for OpenClaw push delivery.
           </p>
         </div>
       </section>
@@ -360,11 +361,11 @@
           </li>
           <li>
             <h3>Pair</h3>
-            <p>Photograph the pairing screen on one machine and send the image to Claude Code on the other. Claude reads the photo, extracts the fields, and runs <code>agent-bridge pair --name ... --host ... --token ... --pubkey ...</code>. No password, no manual typing.</p>
+            <p>Photograph the pairing screen on one machine and send the image to the agent on the other. The agent reads the photo, extracts the fields, and runs <code>agent-bridge pair --name ... --host ... --token ... --pubkey ...</code>. No password, no manual typing.</p>
           </li>
           <li>
             <h3>Use</h3>
-            <p>Once paired, either side calls <code>bridge_send_message</code> from inside its Claude session. The message lands in the remote inbox over SSH and is pushed into the running remote Claude&rsquo;s context as a <code>&lt;channel source="agent-bridge"&gt;</code> event. No fresh agent is ever spawned on either side.</p>
+            <p>Once paired, either side calls <code>bridge_send_message</code> with an explicit <code>target</code>. The message lands in the remote target inbox over SSH and is injected into the running remote session by Claude Code&rsquo;s channel-owner or OpenClaw&rsquo;s native channel plugin. No fresh agent is ever spawned on either side.</p>
           </li>
         </ol>
       </section>
@@ -374,7 +375,7 @@
         <div class="kicker"><span class="num">05 /</span> The channel</div>
         <h2 class="section-title">Push into a <span class="accent">running session.</span></h2>
         <p class="section-sub">
-          The plugin registers a single MCP server that advertises the experimental <code>claude/channel</code> capability <em>and</em> the <code>bridge_*</code> tools. A file watcher on <code>~/.agent-bridge/inbox/</code> detects new message files and emits <code>notifications/claude/channel</code> into the Claude session &mdash; no polling, no manual <code>bridge_receive_messages</code> call needed.
+          For Claude Code, the plugin registers a single MCP stdio server that advertises the experimental <code>claude/channel</code> capability <em>and</em> the <code>bridge_*</code> tools. A watcher on <code>~/.agent-bridge/inbox/claude-code/</code> emits <code>notifications/claude/channel</code> into the Claude session. OpenClaw uses a separate gateway plugin watching <code>inbox/openclaw/&lt;target&gt;/</code>.
         </p>
         <div class="terminal">
           <div class="terminal-bar">
@@ -387,7 +388,8 @@
 <pre><span class="t-dim">// Machine A's Claude calls:</span>
 <span class="t-cyan">bridge_send_message</span>({
   <span class="t-bold">machine:</span> <span class="t-green">"MacBook-Pro"</span>,
-  <span class="t-bold">content:</span> <span class="t-green">"can you run the e2e suite and paste the failures?"</span>
+  <span class="t-bold">message:</span> <span class="t-green">"can you run the e2e suite and paste the failures?"</span>,
+  <span class="t-bold">target:</span> <span class="t-green">"claude-code"</span>
 })
 
 <span class="t-dim">// A few hundred ms later, Machine B's Claude sees:</span>
@@ -396,7 +398,7 @@
 <span class="t-tag">&lt;/channel&gt;</span>
 
 <span class="t-dim">// ...and responds the same way:</span>
-<span class="t-cyan">bridge_send_message</span>({ <span class="t-bold">machine:</span> <span class="t-green">"Mac-Mini"</span>, <span class="t-bold">content:</span> <span class="t-green">"3 failed, logs attached: ..."</span> })</pre>
+<span class="t-cyan">bridge_send_message</span>({ <span class="t-bold">machine:</span> <span class="t-green">"Mac-Mini"</span>, <span class="t-bold">message:</span> <span class="t-green">"3 failed, logs attached: ..."</span>, <span class="t-bold">target:</span> <span class="t-green">"claude-code"</span> })</pre>
           </div>
         </div>
       </section>
@@ -408,11 +410,11 @@
         <div class="tools-grid">
           <div class="tool">
             <div class="tool-name">bridge_send_message</div>
-            <p>Deliver a message to a running agent on a paired machine. Writes a signed JSON message file to the remote inbox over SSH. Under Claude Code, the remote session receives it as a <code>&lt;channel&gt;</code> event; under polling harnesses it waits in the inbox until drained.</p>
+            <p>Deliver a message to a running agent on a paired machine. Requires an explicit <code>target</code>; writes a signed JSON message file to the matching remote inbox over SSH. Claude Code receives <code>&lt;channel&gt;</code> events; OpenClaw receives native channel turns; other MCP hosts remain unverified/manual.</p>
           </div>
           <div class="tool">
             <div class="tool-name">bridge_receive_messages</div>
-            <p>Manually drain the local inbox. Usually not needed under Claude Code (the channel pushes for you), but the primary entry point for polling-mode harnesses. Supports <code>peek</code> for non-destructive reads.</p>
+            <p>Manually inspect/consume the local Claude Code-target inbox. Usually not needed under Claude Code push; useful for diagnostics, tools-only setups, and future polling experiments. Supports <code>peek</code> for non-destructive reads.</p>
           </div>
           <div class="tool">
             <div class="tool-name">bridge_list_machines</div>
@@ -456,7 +458,7 @@
               Claude Code
             </div>
             <div class="compat-status" role="cell"><span class="pill pill--live">● live</span></div>
-            <div class="compat-desc" role="cell">Full push via the native plugin. Install with the local-directory marketplace flow above. The plugin bundles both the <code>bridge_*</code> MCP tools and the channel in one Node process.</div>
+            <div class="compat-desc" role="cell">Full push via the Claude Code plugin. Install with the local-directory marketplace flow above. The plugin bundles both the <code>bridge_*</code> MCP tools and the <code>claude/channel</code> path in one MCP stdio child, not a separate daemon.</div>
           </div>
 
           <div class="compat-row" role="row">
@@ -500,7 +502,7 @@
               Aider &amp; other MCP agents
             </div>
             <div class="compat-status" role="cell"><span class="pill pill--scaffold">scaffolded</span></div>
-            <div class="compat-desc" role="cell">Anything that speaks MCP can call the <code>bridge_*</code> tools. See <code>INSTRUCTIONS.md</code> in the repo root for plain-English guidance a generic agent can follow.</div>
+            <div class="compat-desc" role="cell">Anything that speaks MCP can call the <code>bridge_*</code> tools. Inbound receive/reply is scaffolded until a harness-specific target and polling loop are tested. See <code>INSTRUCTIONS.md</code> in the repo root.</div>
           </div>
         </div>
       </section>
@@ -535,9 +537,9 @@
         <h2 class="section-title">What&rsquo;s <span class="accent">new.</span></h2>
         <ul class="changelog-list">
           <li class="cl-item">
-            <div class="cl-version">3.4.13</div>
+            <div class="cl-version">3.5.0</div>
             <div class="cl-body">
-              <strong>Claude Code watcher hardening.</strong> Tool-only Claude helpers are prevented from stealing the claude-code watcher lease, delivered messages archive cleanly, and docs now reflect the current Tailscale-first routing model.
+              <strong>Same-machine delivery + Claude watcher recovery.</strong> Local/self/localhost sends now land directly in the local target inbox with no SSH loopback, and Claude Code channel-capable standbys can promote when the active watcher owner goes stale.
             </div>
           </li>
           <li class="cl-item">
@@ -584,7 +586,7 @@
             <circle cx="25" cy="16" r="3.5" fill="#4dd0e1"/>
             <path d="M11 16 L21 16" stroke="#ff7a1a" stroke-width="1.3" stroke-dasharray="2 2"/>
           </svg>
-          <span>agent-bridge / v3.4.13</span>
+          <span>agent-bridge / v3.5.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/EthanSK/agent-bridge" target="_blank" rel="noopener">GitHub</a>
@@ -595,7 +597,7 @@
         </div>
         <div class="footer-copy">
           © 2026 Ethan SK<br>
-          built for multi-machine Claude Code workflows
+          built for multi-machine Claude Code + OpenClaw workflows
         </div>
       </footer>
     </div>

@@ -78,16 +78,23 @@ type WatcherLeaseState = {
   meta: WatcherLeaseFile;
 };
 
+type WatcherLeaseAcquireResult = 'acquired' | 'busy' | 'failed';
+
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let knownFiles = new Set<string>();
 let watcherLease: WatcherLeaseState | null = null;
 let watcherLeaseRenewFailures = 0;
+let standbyRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let savedMessageCallback: MessageCallback | null = null;
+let savedWatcherRole = 'auto';
 
 /** Maximum entries in knownFiles before evicting oldest (insertion-order). */
 const KNOWN_FILES_MAX = 2000;
 const WATCHER_LEASE_STALE_MS = 15_000;
 const WATCHER_LEASE_HEARTBEAT_MS = 5_000;
 const WATCHER_LEASE_MAX_RENEW_FAILURES = 3;
+const WATCHER_STANDBY_RETRY_MS = 2_000;
+const DEFAULT_CHANNEL_NOTIFY_TIMEOUT_MS = 10_000;
 
 function addKnownFile(name: string): void {
   if (knownFiles.has(name)) return;
@@ -109,6 +116,33 @@ const currentBackend: 'polling' = 'polling';
 
 /** The channel notification callback. */
 let savedChannelCallback: ChannelNotifyCallback | null = null;
+
+function channelNotifyTimeoutMs(): number {
+  const raw = process.env.AGENT_BRIDGE_CHANNEL_NOTIFY_TIMEOUT_MS;
+  if (!raw) return DEFAULT_CHANNEL_NOTIFY_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1_000) return DEFAULT_CHANNEL_NOTIFY_TIMEOUT_MS;
+  return Math.min(parsed, 120_000);
+}
+
+function withChannelNotifyTimeout<T>(promise: Promise<T>, msgId: string): Promise<T> {
+  const timeoutMs = channelNotifyTimeoutMs();
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      const err = new Error(
+        `Channel notification for ${msgId} did not settle within ${timeoutMs}ms`,
+      );
+      (err as Error & { code?: string }).code = 'AGENT_BRIDGE_CHANNEL_NOTIFY_TIMEOUT';
+      reject(err);
+    }, timeoutMs);
+    timeout.unref?.();
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
 
 function watcherLeasePath(target: string): string {
   const safeTarget = target.replaceAll('/', '__');
@@ -206,6 +240,9 @@ function stopPollingForLeaseLoss(reason: string): void {
     msg: `Watcher lease lost for ${CLAUDE_CODE_TARGET}`,
     context: { reason, pid: process.pid, target: CLAUDE_CODE_TARGET },
   });
+  if (savedMessageCallback) {
+    scheduleStandbyRetry(savedMessageCallback, savedWatcherRole);
+  }
 }
 
 function renewWatcherLease(): void {
@@ -245,7 +282,7 @@ function renewWatcherLease(): void {
   }
 }
 
-function tryAcquireWatcherLease(role: string): boolean {
+function tryAcquireWatcherLease(role: string): WatcherLeaseAcquireResult {
   mkdirSync(LOCKS_DIR, { recursive: true, mode: 0o700 });
   const filePath = watcherLeasePath(CLAUDE_CODE_TARGET);
   const now = Date.now();
@@ -275,12 +312,12 @@ function tryAcquireWatcherLease(role: string): boolean {
         msg: `Watcher lease acquired for ${meta.target}`,
         context: { target: meta.target, role, pid: process.pid },
       });
-      return true;
+      return 'acquired';
     } catch (err) {
       const code = (err as { code?: string }).code;
       if (code !== 'EEXIST') {
         logError(`Watcher: failed to acquire lease ${filePath}: ${err}`);
-        return false;
+        return 'failed';
       }
 
       const existing = readWatcherLease(filePath);
@@ -290,7 +327,7 @@ function tryAcquireWatcherLease(role: string): boolean {
           continue;
         } catch (unlinkErr) {
           logWarn(`Watcher: could not remove malformed lease ${filePath}: ${unlinkErr}`);
-          return false;
+          return 'failed';
         }
       }
 
@@ -310,7 +347,7 @@ function tryAcquireWatcherLease(role: string): boolean {
             role,
           },
         });
-        return false;
+        return 'busy';
       }
 
       try {
@@ -332,12 +369,72 @@ function tryAcquireWatcherLease(role: string): boolean {
         });
       } catch (unlinkErr) {
         logWarn(`Watcher: failed to remove stale lease ${filePath}: ${unlinkErr}`);
-        return false;
+        return 'failed';
       }
     }
   }
 
-  return false;
+  return 'failed';
+}
+
+function clearStandbyRetryTimer(): void {
+  if (standbyRetryTimer) {
+    clearTimeout(standbyRetryTimer);
+    standbyRetryTimer = null;
+  }
+}
+
+function activateWatcher(callback: MessageCallback): void {
+  initKnownFiles();
+  startPolling(callback);
+}
+
+function scheduleStandbyRetry(callback: MessageCallback, role: string): void {
+  savedMessageCallback = callback;
+  savedWatcherRole = role;
+  if (standbyRetryTimer || pollInterval || watcherLease) return;
+
+  const retry = () => {
+    standbyRetryTimer = null;
+    if (pollInterval || watcherLease) return;
+
+    const result = tryAcquireWatcherLease(savedWatcherRole);
+    if (result === 'acquired') {
+      logWarn(`Watcher standby: promoted to active owner for ${CLAUDE_CODE_TARGET}`);
+      logEvent({
+        event: 'watcher.standby_promoted',
+        level: 'warn',
+        msg: `Watcher standby promoted for ${CLAUDE_CODE_TARGET}`,
+        context: { target: CLAUDE_CODE_TARGET, pid: process.pid, role: savedWatcherRole },
+      });
+      activateWatcher(callback);
+      void replayUndeliveredMessages();
+      return;
+    }
+
+    if (result === 'failed') {
+      logWarn(
+        `Watcher standby: lease acquisition failed for ${CLAUDE_CODE_TARGET}; `
+        + `will retry in ${WATCHER_STANDBY_RETRY_MS}ms`,
+      );
+    }
+
+    standbyRetryTimer = setTimeout(retry, WATCHER_STANDBY_RETRY_MS);
+    standbyRetryTimer.unref?.();
+  };
+
+  logWarn(
+    `Watcher standby: will retry ${CLAUDE_CODE_TARGET} lease every `
+    + `${WATCHER_STANDBY_RETRY_MS}ms`,
+  );
+  logEvent({
+    event: 'watcher.standby_retry_scheduled',
+    level: 'warn',
+    msg: `Watcher standby retry scheduled for ${CLAUDE_CODE_TARGET}`,
+    context: { target: CLAUDE_CODE_TARGET, pid: process.pid, role },
+  });
+  standbyRetryTimer = setTimeout(retry, WATCHER_STANDBY_RETRY_MS);
+  standbyRetryTimer.unref?.();
 }
 
 /**
@@ -423,7 +520,7 @@ function emitChannelNotification(fileName: string): void {
         content_length: msg.content?.length ?? 0,
       },
     });
-    Promise.resolve(savedChannelCallback(msg))
+    withChannelNotifyTimeout(Promise.resolve(savedChannelCallback(msg)), msg.id)
       .then(() => {
         markDelivered(msg.id);
         archiveDeliveredMessage(fileName, msg.id, 'pushed to channel');
@@ -511,6 +608,7 @@ export async function startWatcher(
   channelCallback?: ChannelNotifyCallback,
   opts?: { role?: string },
 ): Promise<boolean> {
+  savedMessageCallback = callback;
   if (channelCallback) {
     savedChannelCallback = channelCallback;
   }
@@ -521,14 +619,27 @@ export async function startWatcher(
   }
 
   const role = opts?.role?.trim() || 'auto';
-  if (!tryAcquireWatcherLease(role)) {
-    setWatcherStatus(currentBackend, false);
-    return false;
+  savedWatcherRole = role;
+  const leaseResult = tryAcquireWatcherLease(role);
+  if (leaseResult === 'acquired') {
+    clearStandbyRetryTimer();
+    activateWatcher(callback);
+    return true;
   }
 
-  initKnownFiles();
-  startPolling(callback);
-  return true;
+  setWatcherStatus(currentBackend, false);
+  if (leaseResult === 'busy') {
+    // A healthy process owns delivery right now. Stay connected as a standby
+    // channel owner and retry the lease so a future stale owner is recovered
+    // without requiring a manual Claude/plugin restart. This mirrors the
+    // OpenClaw channel watcher lifecycle while preserving the single-owner
+    // delivery invariant. Returning true tells index.ts to keep this
+    // channel-capable process alive across benign stdin/SIGTERM events.
+    scheduleStandbyRetry(callback, role);
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -546,6 +657,10 @@ export async function replayUndeliveredMessages(): Promise<void> {
   const channelCallback = savedChannelCallback;
   if (!channelCallback) {
     logWarn('Replay: no channel callback registered, skipping');
+    return;
+  }
+  if (!watcherLease) {
+    logInfo('Replay: this process is standby (no watcher lease), skipping');
     return;
   }
 
@@ -600,7 +715,7 @@ export async function replayUndeliveredMessages(): Promise<void> {
     for (const { fileName, msg } of undelivered) {
       logInfo(`Replay: pushing message ${msg.id} from ${msg.from} (ts: ${msg.timestamp})`);
       try {
-        await channelCallback(msg);
+        await withChannelNotifyTimeout(Promise.resolve(channelCallback(msg)), msg.id);
         markDelivered(msg.id);
         archiveDeliveredMessage(fileName, msg.id, 'replayed to channel');
       } catch (err) {
@@ -620,6 +735,7 @@ export async function replayUndeliveredMessages(): Promise<void> {
  * Stop the watcher (for clean shutdown).
  */
 export function stopWatcher(): void {
+  clearStandbyRetryTimer();
   if (pollInterval) {
     logInfo('Stopping polling watcher');
     clearInterval(pollInterval);

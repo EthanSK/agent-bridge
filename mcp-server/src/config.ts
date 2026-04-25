@@ -209,11 +209,49 @@ export function loadConfig(): MachineConfig[] {
 
 /**
  * Get a specific machine by name (case-insensitive).
+ *
+ * Returns `undefined` for the local machine name and the reserved aliases —
+ * those route through `sendLocalMessage` (no SSH), not the SSH path. Callers
+ * should check `isLocalMachineName()` before falling back to "machine not
+ * found" semantics.
  */
 export function getMachine(name: string): MachineConfig | undefined {
+  if (isLocalMachineName(name)) return undefined;
   const machines = loadConfig();
   const lower = name.toLowerCase();
   return machines.find(m => m.name.toLowerCase() === lower);
+}
+
+/**
+ * Reserved machine-name aliases that always resolve to the local machine.
+ *
+ * Same-machine delivery (3.5.0+) lets `bridge_send_message` write directly to
+ * `~/.agent-bridge/inbox/<target>/<id>.json` without going through SSH. The
+ * local machine is identified by EITHER:
+ *   - its real name (matches `getLocalMachineName()`, case-insensitive), or
+ *   - one of these reserved aliases.
+ *
+ * Aliases exist so callers don't have to know the local machine's hostname —
+ * useful for harness scripts and inline MCP calls. The aliases are only ever
+ * routes to the local machine; pairing a remote with one of these names is
+ * rejected up-front.
+ */
+export const LOCAL_MACHINE_ALIASES = ['local', 'self', 'localhost'] as const;
+
+/**
+ * Return true when `name` refers to the local machine — either the real
+ * machine name or a reserved alias like "local" / "self" / "localhost".
+ *
+ * Case-insensitive. Empty / whitespace / non-string inputs return false so the
+ * caller can keep its "machine not found" path for those cases.
+ */
+export function isLocalMachineName(name: string | undefined | null): boolean {
+  if (typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  if ((LOCAL_MACHINE_ALIASES as readonly string[]).includes(lower)) return true;
+  return lower === getLocalMachineName().toLowerCase();
 }
 
 /**

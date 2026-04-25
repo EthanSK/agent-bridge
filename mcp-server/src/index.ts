@@ -132,14 +132,14 @@ async function main(): Promise<void> {
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.4.13', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: '3.5.0', pid: process.pid, nodeVersion: process.version },
   });
 
   // Create MCP server with channel capability
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.4.13',
+      version: '3.5.0',
     },
     {
       capabilities: {

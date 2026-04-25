@@ -84,7 +84,7 @@ bridge_send_message({
 })
 ```
 
-The message is pushed into the live Claude session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event, and the reply comes back the same way. This is the only supported agent-to-agent path.
+For `target: "claude-code"`, the message is pushed into the live Claude Code session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event, and the reply comes back the same way. OpenClaw targets use `target: "openclaw/<account>"` and are delivered by the separate `openclaw-channel/` plugin. In all cases, use `bridge_send_message` for agent-to-agent work — do not shell out to fresh agent wrappers.
 
 ### Open an interactive SSH session
 ```bash
@@ -162,7 +162,7 @@ agent-bridge run MacBook-Pro "cd ~/Projects/myapp && nohup npm run dev > /tmp/de
 
 ## v2: MCP Server & Channel Plugin (running agent-to-agent communication)
 
-If the agent-bridge MCP server is configured, you have direct access to these tools without needing the CLI. The MCP server enables EXISTING running agent sessions to communicate -- it does NOT spawn new agent processes.
+If the agent-bridge MCP server is configured, you have direct access to these tools without needing the CLI. The MCP server provides the shared `bridge_*` tools for EXISTING running agent sessions -- it does NOT spawn new agent processes. Claude Code push uses this MCP server's experimental `claude/channel` stdio path; OpenClaw push uses the separate native `openclaw-channel/` plugin.
 
 ### MCP tools
 
@@ -171,20 +171,20 @@ If the agent-bridge MCP server is configured, you have direct access to these to
 | `bridge_list_machines` | List paired machines and their connection details |
 | `bridge_status` | Check if a machine is reachable via SSH |
 | `bridge_send_message` | Send a message to another machine's running agent |
-| `bridge_receive_messages` | Check for incoming messages (not needed in channel mode) |
+| `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox (not needed in normal channel mode) |
 | `bridge_run_command` | Run a shell command on a remote machine |
 | `bridge_clear_inbox` | Clear the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics and watcher health |
 
 ### Channel plugin (push mode -- Claude Code)
 
-When used with Claude Code, the MCP server acts as a **channel plugin**. Incoming messages from other machines are **pushed** directly into the conversation as:
+When used with Claude Code, the MCP server acts as a **channel plugin**: one stdio JSON-RPC child advertises both the `bridge_*` tools and the experimental `claude/channel` capability. Incoming messages from other machines are **pushed** directly into the conversation as:
 ```
 <channel source="agent-bridge" from="MachineName" message_id="..." ts="...">content</channel>
 ```
-No polling needed -- respond using `bridge_send_message`.
+No polling needed in the normal channel-owner path -- respond using `bridge_send_message`.
 
-On startup, any messages that arrived while Claude was offline are **automatically replayed** in chronological order, so nothing is lost.
+On startup, pending Claude Code-target messages are replayed in chronological order. This is replay-on-spawn durability, not a separate always-on daemon; live push still depends on a running Claude Code channel-owner MCP child.
 
 ### MCP server setup
 
@@ -193,13 +193,14 @@ cd ~/Projects/agent-bridge/mcp-server
 npm install && npm run build
 ```
 
-Add to Claude Code MCP config (`~/.claude/.mcp.json`):
+Recommended Claude Code setup is the plugin/marketplace flow in the README. If you are using a tools-only/manual MCP config, set `AGENT_BRIDGE_ROLE=tools-only`:
 ```json
 {
   "mcpServers": {
     "agent-bridge": {
       "command": "node",
-      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"]
+      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"],
+      "env": { "AGENT_BRIDGE_ROLE": "tools-only" }
     }
   }
 }
@@ -210,7 +211,7 @@ Add to Claude Code MCP config (`~/.claude/.mcp.json`):
 1. Machine A's Claude calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code" })`
 2. The message is written to Machine B's `~/.agent-bridge/inbox/claude-code/<id>.json` via SSH
 3. Machine B's file watcher detects the new file
-4. Machine B's channel plugin pushes the message into the running Claude session
+4. Machine B's channel-owner MCP child pushes the message into the running Claude session
 5. Machine B's Claude sees `<channel source="agent-bridge" ...>` and responds via `bridge_send_message`
 
 All messages are authenticated via SSH keys. The channel notification includes `authenticated: ssh-key` metadata confirming the sender was verified by the SSH transport.

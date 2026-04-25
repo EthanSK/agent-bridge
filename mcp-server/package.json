@@ -1,13 +1,14 @@
 {
   "name": "agent-bridge-mcp-server",
-  "version": "3.4.13",
+  "version": "3.5.0",
   "description": "MCP server and channel plugin for real-time bidirectional communication between AI agent sessions across machines via SSH",
   "type": "module",
   "main": "build/index.js",
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "start": "node build/index.js"
+    "start": "node build/index.js",
+    "test": "npm run build && node --test test/*.test.js test/*.test.mjs"
   },
   "keywords": [
     "mcp",

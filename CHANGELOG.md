@@ -1,5 +1,49 @@
 # Changelog
 
+## agent-bridge 3.5.0 — 2026-04-25
+
+### Feature: first-class same-machine delivery (no SSH loopback)
+
+`bridge_send_message` now accepts the **local machine name** (or one of the reserved aliases `local` / `self` / `localhost`) as the `machine` parameter. When the target resolves to the local host, the BridgeMessage JSON is written directly to `~/.agent-bridge/inbox/<target>/<id>.json` using the same atomic write pattern as the SSH path — no SSH hop, no loopback round-trip.
+
+Motivation: an MCP host such as Claude Code on Mac-mini routinely needs to fan messages out to OpenClaw embedded agents (`openclaw/default`, `openclaw/clawdiboi2`, `openclaw/clordlethird`) that watch the same `~/.agent-bridge/inbox/` directory tree on the same physical machine. Pre-3.5.0 this required either a brittle `cp` hack or pretending the same machine was a paired remote and SSH-ing into yourself. Same-machine delivery makes that route a first-class API, validated, atomic, and visible in `bridge_status` / `bridge_list_machines`.
+
+#### Changes
+
+- `mcp-server/src/config.ts`: new `LOCAL_MACHINE_ALIASES` constant (`['local', 'self', 'localhost']`) and `isLocalMachineName()` helper. `getMachine()` now returns `undefined` for the local name and aliases so cross-machine code paths cannot accidentally route to "self via SSH".
+- `mcp-server/src/inbox.ts`: new `sendLocalMessage()` that performs the inbox write directly on disk, mirroring `sshWriteFile`'s atomic temp-file-then-rename pattern (so file watchers never see partial JSON).
+- `mcp-server/src/tools.ts`:
+  - `bridge_send_message` accepts the local machine name and routes via `sendLocalMessage` when it does. The success message reports `transport=local|ssh` so callers can verify the path taken.
+  - `bridge_status` reports the local pseudo-machine as `LOCAL (no SSH — same-machine delivery via inbox/<target>/)` when no machine is given, and as the same single line when explicitly asked about the local name. SSH probing is skipped.
+  - `bridge_list_machines` always lists the local pseudo-machine first, with the alias list, even when no remotes are paired.
+  - `bridge_run_command` rejects the local machine name with a clear "use your shell directly — there is no SSH loopback" error.
+- `agent-bridge` (bash CLI):
+  - New `is_local_machine` helper, kept in sync with the TS aliases list.
+  - `agent-bridge status [<local-name>|local|self|localhost]` reports `LOCAL — same-machine delivery, no SSH` and exits 0 without invoking `ssh`.
+  - `agent-bridge status` (all machines) prepends a local-machine line.
+  - `agent-bridge run <local>` and `agent-bridge connect <local>` exit non-zero with a helpful message.
+  - `agent-bridge pair --name <local>|local|self|localhost` is rejected up-front so a remote cannot shadow the local-machine route.
+  - `get_machine_name` now honours `AGENT_BRIDGE_MACHINE_NAME` and `~/.agent-bridge/machine-name`, matching the TS resolver.
+- Tests:
+  - New `mcp-server/test/local-delivery.test.js` (9 cases) covering alias detection, target subdir routing, OpenClaw routing, atomic-write cleanup, malformed-target rejection, and the mixed local + paired-remote scenario.
+  - New `test/cli-local-status.sh` covering `status local`, `status <hostname>`, `run local` rejection, `connect local` rejection, and `pair --name local` rejection.
+  - Updated `test/cli-status-stdin.sh` to match the new "remote machines reachable (plus … local)" wording and assert the LOCAL line is present.
+  - `npm run test` runs the TS build then the node:test suite.
+- Docs: `INSTRUCTIONS.md`, `README.md`, `AGENTS.md` gained a "Same-machine delivery" section explaining when to use it, the alias list, and the receiver-side requirement (a watcher — Claude Code channel plugin or `openclaw-channel` — must be running for the inbox subdir on the local machine).
+
+
+### Fix: Claude Code watcher standby recovery
+
+- Channel-capable standby processes now retry the `claude-code` watcher lease and promote themselves when the active owner becomes stale, matching the resilient OpenClaw watcher pattern instead of requiring a manual Claude/plugin restart.
+- Channel notification writes are bounded by `AGENT_BRIDGE_CHANNEL_NOTIFY_TIMEOUT_MS` (default 10s), so a wedged stdout/JSON-RPC write leaves the inbox file retryable instead of pinning it forever in memory.
+- Claude plugin manifest version is aligned with the MCP/CLI runtime.
+
+#### Compatibility
+
+- Cross-machine SSH delivery is unchanged. Existing pairings continue to work.
+- The wire format is unchanged — same BridgeMessage schema, same per-target inbox layout, same delivered/processed-ID dedup. The only difference is whether the file gets there via SSH or a local atomic-rename.
+- Pairing under a name that collides with the local machine or one of the reserved aliases is now rejected. If you have an existing pairing with such a name (extremely unusual), `agent-bridge unpair <name>` and re-pair under a different label.
+
 ## agent-bridge 3.4.13 — 2026-04-24
 
 - Fixed the remaining channel-owner death path after 3.4.12: an explicit SIGPIPE handler was still exiting the process after Claude Code closed a pipe. SIGPIPE is now ignored and stream-specific EPIPE handlers decide liveness, so diagnostic-pipe closure cannot kill a live `claude-code` watcher while stdout/JSON-RPC failure remains fatal.

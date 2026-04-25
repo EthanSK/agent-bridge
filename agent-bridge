@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="3.4.13"
+VERSION="3.5.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -816,10 +816,44 @@ get_hostname() {
 }
 
 get_machine_name() {
+  # Mirror mcp-server/src/config.ts getLocalMachineName(): an explicit env-var
+  # override wins so tests and harness scripts can pin the local machine name
+  # without touching ~/.agent-bridge/machine-name.
+  if [ -n "${AGENT_BRIDGE_MACHINE_NAME:-}" ]; then
+    printf '%s' "$AGENT_BRIDGE_MACHINE_NAME"
+    return
+  fi
+  if [ -f "$CONFIG_DIR/machine-name" ]; then
+    local pinned
+    pinned="$(tr -d '[:space:]' <"$CONFIG_DIR/machine-name" 2>/dev/null || true)"
+    if [ -n "$pinned" ]; then
+      printf '%s' "$pinned"
+      return
+    fi
+  fi
   local h
   h="$(get_hostname)"
   # Strip .local suffix
   printf '%s' "${h%.local}"
+}
+
+# Reserved aliases that always refer to the local machine for same-machine
+# delivery (3.5.0+). Kept in sync with mcp-server/src/config.ts
+# `LOCAL_MACHINE_ALIASES`.
+LOCAL_MACHINE_ALIASES=("local" "self" "localhost")
+
+# Returns 0 if $1 is the local machine name (case-insensitive) or one of the
+# reserved aliases, 1 otherwise.
+is_local_machine() {
+  local name_lower local_lower alias
+  [ -z "${1:-}" ] && return 1
+  name_lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  for alias in "${LOCAL_MACHINE_ALIASES[@]}"; do
+    [ "$name_lower" = "$alias" ] && return 0
+  done
+  local_lower="$(get_machine_name | tr '[:upper:]' '[:lower:]')"
+  [ "$name_lower" = "$local_lower" ] && return 0
+  return 1
 }
 
 get_username() {
@@ -1233,6 +1267,13 @@ cmd_pair() {
   [ -z "$token" ] && die "Pairing token is required. Check the setup screen on the other machine."
   [ -z "$pubkey" ] && die "Public key is required. Copy it from the other machine's setup screen."
 
+  # 3.5.0+: same-machine delivery uses the local machine name and reserved
+  # aliases ("local"/"self"/"localhost") as routing keys. Pairing a remote
+  # machine under one of those names would shadow the local route — reject.
+  if is_local_machine "$machine_name"; then
+    die "\"$machine_name\" is reserved for the local machine (same-machine delivery). Pair the remote under a different name."
+  fi
+
   printf '\n'
   printf "${BOLD}${CYAN}  agent-bridge pair${RESET}\n"
   printf '\n'
@@ -1355,6 +1396,10 @@ cmd_connect() {
 
   [ -z "$machine_name" ] && die "Machine name required. Usage: agent-bridge connect <machine>"
 
+  if is_local_machine "$machine_name"; then
+    die "\"$machine_name\" is the local machine. agent-bridge connect opens an SSH session to a remote machine — open a new terminal locally instead."
+  fi
+
   if ! cfg_exists "$machine_name"; then
     die "Machine \"$machine_name\" not found. Run 'agent-bridge list' to see paired machines."
   fi
@@ -1433,6 +1478,10 @@ cmd_run() {
 
   [ -z "$machine_name" ] && die "Machine name required. Usage: agent-bridge run <machine> \"shell command\""
   [ -z "$command" ] && die "Command required. Usage: agent-bridge run <machine> \"shell command\""
+
+  if is_local_machine "$machine_name"; then
+    die "\"$machine_name\" is the local machine. agent-bridge run is for remote machines only — there is no SSH loopback. Run the command directly in your shell."
+  fi
 
   if ! cfg_exists "$machine_name"; then
     die "Machine \"$machine_name\" not found. Run 'agent-bridge list' to see paired machines."
@@ -1648,6 +1697,15 @@ cmd_status() {
   }
 
   if [ -n "$machine_name" ]; then
+    if is_local_machine "$machine_name"; then
+      local local_name
+      local_name="$(get_machine_name)"
+      printf "${GREEN}  %s${RESET}${DIM} (LOCAL — same-machine delivery, no SSH)${RESET}\n" "$local_name"
+      log_event info "cli.status.local" "$local_name local-machine status reported" \
+        "{\"machine\":\"$local_name\",\"transport\":\"local\"}"
+      printf '\n'
+      return 0
+    fi
     if ! cfg_exists "$machine_name"; then
       die "Machine \"$machine_name\" not found. Run 'agent-bridge list' to see paired machines."
     fi
@@ -1656,8 +1714,13 @@ cmd_status() {
     local names
     names="$(cfg_list_names)"
 
+    local local_name
+    local_name="$(get_machine_name)"
+    printf "${GREEN}  %s${RESET}${DIM} (LOCAL — same-machine delivery, no SSH)${RESET}\n" "$local_name"
+
     if [ -z "$names" ]; then
-      dim "No paired machines."
+      printf '\n'
+      dim "No paired remote machines."
       dim "Run 'agent-bridge setup' on each machine, then 'agent-bridge pair' to connect them."
       printf '\n'
       return
@@ -1673,7 +1736,7 @@ cmd_status() {
     done <<< "$names"
 
     printf '\n'
-    dim "$reachable/$total machines reachable."
+    dim "$reachable/$total remote machines reachable (plus $local_name local)."
   fi
 
   printf '\n'
@@ -1893,6 +1956,14 @@ cmd_help() {
   printf "  Talking to the RUNNING agent on another machine is done via the\n"
   printf "  Claude Code channel plugin and its bridge_send_message MCP tool.\n"
   printf "  The CLI does NOT wrap or spawn agents — 'run' is shell-only.\n"
+  printf '\n'
+  printf "${BOLD}Same-machine delivery (3.5.0+):${RESET}\n"
+  printf "  bridge_send_message also accepts the LOCAL machine name (or one of\n"
+  printf "  the aliases 'local', 'self', 'localhost'). Same-machine sends write\n"
+  printf "  the BridgeMessage JSON directly to ~/.agent-bridge/inbox/<target>/\n"
+  printf "  with no SSH hop. Useful for routing to OpenClaw embedded agents on\n"
+  printf "  the SAME host (e.g. target=openclaw/clawdiboi2). The receiver still\n"
+  printf "  needs a watcher (Claude Code channel plugin or openclaw-channel).\n"
   printf '\n'
   printf "${BOLD}Examples:${RESET}\n"
   printf '  agent-bridge setup --name MacBook-Pro\n'

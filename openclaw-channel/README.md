@@ -11,7 +11,7 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 
 - **`replyVia` per-target routing.** Inbound bridge messages can now route their reply either back through the Telegram chat (default — visible on Ethan's phone) or back over agent-bridge as a BridgeMessage to the sender machine (silent peer-to-peer back-channel). Set it plugin-level (`channels["agent-bridge"].config.replyVia`), per-target (`targets.<name>.replyVia`), or per-message (add `replyVia` to the BridgeMessage JSON). Valid modes: `"telegram"` | `"agent-bridge"`. Unknown values fall back to `"telegram"` with a warn log.
   - When `replyVia: "agent-bridge"`, peer identity switches from `<telegram-peer-id>` to an encoded bridge peer id containing both `<sender-machine-name>` and `<sender-fromTarget>`. The session key becomes `agent:main:agent-bridge:<account>:direct:<encoded-peer>`, so multiple Telegram accounts or return targets on the same machine cannot collapse onto one shared back-channel session. Replies come back via the native `agent-bridge` channel's outbound SCP adapter (channel-plugin.js :: sendText) instead of the Telegram outbound. No Telegram traffic is generated.
-  - Use-case: a Claude session on one machine asking a Claude session on another for context without Ethan's phone pinging.
+  - Use-case: a Claude Code or OpenClaw session asking another bridge-aware session for context without Ethan's phone pinging.
 
 ## What's new in v2.2.0
 

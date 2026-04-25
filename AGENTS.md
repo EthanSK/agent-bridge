@@ -119,6 +119,18 @@ agent-bridge run MacBook-Pro "brew update && brew upgrade"
 
 > `agent-bridge run` is a plain remote-shell utility. It does NOT spawn or invoke an agent. The `--claude`, `--codex`, and `--agent` flags were removed in 3.0.0 — they ran a fresh non-interactive agent session (`claude --print` etc.) on the remote machine, which is the opposite of what this project is for.
 
+### Same-machine delivery (3.5.0+)
+
+`bridge_send_message` accepts the **local machine name** (or one of the reserved aliases `local`, `self`, `localhost`) as its `machine` parameter. The message JSON is written directly to `~/.agent-bridge/inbox/<target>/<id>.json` — no SSH hop, no loopback round-trip:
+
+```
+bridge_send_message({ machine: "local",  message: "review the queue", target: "openclaw/clawdiboi2" })
+```
+
+Use this when an MCP host needs to talk to another agent harness running on the **same** machine (canonical case: a Claude Code session messaging OpenClaw embedded Telegram sessions in the same gateway). The receiver still needs a watcher running on its inbox subdir — agent-bridge just lands the file. `agent-bridge run <local>` and `agent-bridge connect <local>` are deliberately rejected: there is no SSH loopback.
+
+`agent-bridge list` and `agent-bridge status` always show the local pseudo-machine as `LOCAL — same-machine delivery, no SSH`.
+
 ### Talk to the RUNNING remote agent
 
 Use the channel plugin's `bridge_send_message` MCP tool. **As of mcp-server 3.4.0, the `target` parameter is required** — there is no default routing:
@@ -182,13 +194,13 @@ agent-bridge run MacBook-Pro "cd ~/Projects/myapp && git pull && npm install && 
 
 ### "Ask the remote agent to review my code"
 
-From inside your agent session (with the channel plugin loaded):
+From inside your agent session (with the agent-bridge MCP tools available):
 
 ```
 bridge_send_message({ machine: "MacBook-Pro", message: "review the code in ~/Projects/myapp/src/ and suggest improvements", target: "claude-code" })
 ```
 
-The running remote agent receives it in-context and replies via `bridge_send_message` back to this machine (also with an explicit `target`).
+For `target: "claude-code"`, the running remote Claude Code session receives it in-context and replies via `bridge_send_message` back to this machine. OpenClaw targets use `target: "openclaw/<account>"` and are delivered by the separate OpenClaw channel plugin.
 
 ### "Check what's running on my other machine"
 ```bash
@@ -197,7 +209,7 @@ agent-bridge run MacBook-Pro "ps aux | head -20 && df -h && free -h 2>/dev/null"
 
 ## v2: MCP Server (running agent-to-agent communication)
 
-If the agent-bridge MCP server is configured, you have direct access to these tools without needing the CLI. The MCP server enables EXISTING running agent sessions to communicate -- it does NOT spawn new agent processes.
+If the agent-bridge MCP server is configured, you have direct access to these tools without needing the CLI. The MCP server provides the shared `bridge_*` tools for EXISTING running agent sessions -- it does NOT spawn new agent processes. Push delivery is host-specific: Claude Code uses the MCP server's experimental `claude/channel` stdio path, while OpenClaw uses the separate native `openclaw-channel/` plugin.
 
 ### MCP tools
 
@@ -206,28 +218,28 @@ If the agent-bridge MCP server is configured, you have direct access to these to
 | `bridge_list_machines` | List paired machines and their connection details |
 | `bridge_status` | Check if a machine is reachable via SSH |
 | `bridge_send_message` | Send a message to another machine's running agent |
-| `bridge_receive_messages` | Check for incoming messages (polling mode) |
+| `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox |
 | `bridge_run_command` | Run a shell command on a remote machine |
 | `bridge_clear_inbox` | Clear the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics and watcher health |
 
-### Channel plugin (Claude Code only)
+### Claude Code channel plugin
 
-When used with Claude Code, the MCP server acts as a **channel plugin**. Incoming messages are pushed directly into the conversation as:
+When used with Claude Code, the MCP server acts as a **channel plugin**: one stdio JSON-RPC child advertises both the `bridge_*` tools and the experimental `claude/channel` capability. Incoming messages are pushed directly into the conversation as:
 ```
 <channel source="agent-bridge" from="MachineName" message_id="..." ts="...">content</channel>
 ```
-No polling needed -- respond using `bridge_send_message`.
+No polling needed in the normal channel-owner path -- respond using `bridge_send_message`.
 
-### Messaging workflow (polling mode)
+### Messaging workflow
 
-For harnesses without channel support (Codex, Gemini, Aider, etc.):
+For Claude Code push:
 1. Machine A's agent calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code" })`
-2. The message is written to Machine B's per-target inbox subdir (e.g. `~/.agent-bridge/inbox/claude-code/<id>.json`) via SSH
-3. Machine B's agent calls `bridge_receive_messages()` to read it
+2. The message is written to Machine B's `~/.agent-bridge/inbox/claude-code/<id>.json` via SSH
+3. Machine B's channel-owner MCP child emits `notifications/claude/channel` into the running Claude session
 4. Machine B responds via `bridge_send_message` back to Machine A with an explicit `target`
 
-OpenClaw is handled differently — its gateway has the openclaw-channel plugin installed, which watches `inbox/openclaw/<target>/` and injects inbound messages into the matching running Telegram session. See `openclaw-channel/README.md`.
+For OpenClaw push, the gateway loads `openclaw-channel/`, watches `inbox/openclaw/<target>/`, and injects inbound messages into the matching running OpenClaw/Telegram session. Codex/Gemini/Aider inbound receive/reply loops remain scaffolded until tested end-to-end; `bridge_receive_messages` is only a manual Claude Code-target inbox fallback today.
 
 ### MCP server setup
 
@@ -242,7 +254,8 @@ Register in your harness's MCP configuration:
   "mcpServers": {
     "agent-bridge": {
       "command": "node",
-      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"]
+      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"],
+      "env": { "AGENT_BRIDGE_ROLE": "tools-only" }
     }
   }
 }
