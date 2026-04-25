@@ -1,0 +1,21 @@
+{
+  "name": "@agent-bridge/claude-code-channel",
+  "version": "0.0.0-stub",
+  "private": true,
+  "description": "STUB — design-stage skeleton for agent-bridge 3.6.0 Claude Code channel plugin. Not wired into the marketplace. Will not activate without AGENT_BRIDGE_PLUGIN_STUB=activate. See docs/3.6.0-channel-plugin-migration.md.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "start": "echo 'claude-code-channel is a 3.6.0 design-stage stub; see docs/3.6.0-channel-plugin-migration.md' && exit 0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EthanSK/agent-bridge.git",
+    "directory": "claude-code-channel"
+  },
+  "author": "EthanSK",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
