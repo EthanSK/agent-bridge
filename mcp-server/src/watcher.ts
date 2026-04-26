@@ -35,6 +35,7 @@ import { join } from 'path';
 import {
   CLAUDE_CODE_TARGET,
   LOCKS_DIR,
+  MCP_SERVER_VERSION,
   inboxSubdir,
   archiveSubdir,
   failedSubdir,
@@ -70,6 +71,14 @@ type WatcherLeaseFile = {
   token: string;
   startedAt: number;
   updatedAt: number;
+  /**
+   * 3.7.1 — semver string of the agent-bridge MCP server build that wrote the
+   * lease (e.g. "3.7.1"). Optional for backward compatibility: leases written
+   * by 3.7.0 and earlier do not include this field, and Patch F's stale-version
+   * peer-kill treats absent/unparseable versions as "same-version" (safe
+   * default — no kill).
+   */
+  version?: string;
 };
 
 type WatcherLeaseState = {
@@ -165,6 +174,9 @@ function readWatcherLease(filePath: string): WatcherLeaseFile | null {
     if (!Number.isFinite(startedAt) || !Number.isFinite(updatedAt)) {
       return null;
     }
+    const version = typeof parsed.version === 'string' && parsed.version.length > 0
+      ? parsed.version
+      : undefined;
     return {
       pid,
       target: parsed.target,
@@ -172,6 +184,7 @@ function readWatcherLease(filePath: string): WatcherLeaseFile | null {
       token: parsed.token,
       startedAt,
       updatedAt,
+      ...(version ? { version } : {}),
     };
   } catch {
     return null;
@@ -293,6 +306,10 @@ function tryAcquireWatcherLease(role: string): WatcherLeaseAcquireResult {
     token: `${process.pid}-${now}-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: now,
     updatedAt: now,
+    // 3.7.1 — write our build version so newer peers can detect a
+    // stale-version owner and force migration via SIGTERM (see Patch F's
+    // stale-version peer-kill path in index.ts).
+    version: MCP_SERVER_VERSION,
   };
 
   for (let attempt = 0; attempt < 3; attempt += 1) {

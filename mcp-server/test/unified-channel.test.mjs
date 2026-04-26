@@ -80,8 +80,14 @@ async function readEvents(home) {
 // ─── Source-level guards for Patches F, G, H + signal.evidence ──────────────
 test('source-level: Patches F, G, H wired into unified plugin', async () => {
   const indexSrc = await readFile(indexPath, 'utf8');
-  // Patch F — heartbeat-recency guard via lease updatedAt
-  assert.ok(indexSrc.includes('patch_f.backoff'), 'Patch F: backoff event wired');
+  const configSrc = await readFile(join(__dirname, '..', 'build', 'config.js'), 'utf8');
+  // Patch F — heartbeat-recency guard via lease updatedAt, plus 3.7.1's
+  // standby+retry refactor and stale-version peer-kill paths.
+  assert.ok(indexSrc.includes('patch_f.standby'), 'Patch F: 3.7.1 standby event wired');
+  assert.ok(
+    indexSrc.includes('patch_f.peer_version_kill'),
+    'Patch F: 3.7.1 stale-version peer-kill event wired',
+  );
   assert.ok(/AGENT_BRIDGE_DISABLE_PATCH_F/.test(indexSrc), 'Patch F: env opt-out present');
   // Patch G — channel-owner SIGTERM ignore
   assert.ok(indexSrc.includes('signal.ignored_channel_owner'), 'Patch G: ignored event wired');
@@ -95,15 +101,19 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant
-  assert.ok(/VERSION\s*=\s*['"]3\.7\.0['"]/.test(indexSrc), 'VERSION constant must be 3.7.0');
+  // Version constant — 3.7.1, sourced from config.ts
+  assert.ok(
+    /MCP_SERVER_VERSION\s*=\s*['"]3\.7\.1['"]/.test(configSrc),
+    'MCP_SERVER_VERSION must be 3.7.1 in config.ts',
+  );
 });
 
-// ─── Patch F — back off on healthy peer lease ───────────────────────────────
-test('Patch F: server exits cleanly when an existing healthy peer holds the lease', { timeout: 12_000 }, async () => {
-  // Simulate a healthy peer by writing a fresh lease file held by THIS test
-  // process (its pid is alive). Patch F should refuse to take over.
-  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-'));
+// ─── Patch F (3.7.1) — standby + retry on healthy peer lease, no exit ───────
+test('Patch F (3.7.1): server stays in standby when a same-version healthy peer holds the lease', { timeout: 12_000 }, async () => {
+  // Simulate a healthy SAME-VERSION peer by writing a fresh lease file held
+  // by THIS test process (its pid is alive). Patch F's 3.7.1 form must NOT
+  // exit — it should log patch_f.standby and stay alive, polling the lease.
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-standby-'));
   const lockDir = join(home, '.agent-bridge', 'locks');
   const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
@@ -114,23 +124,174 @@ test('Patch F: server exits cleanly when an existing healthy peer holds the leas
     token: `${process.pid}-fake-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
+    version: '3.7.1', // same version as our build → no kill
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
   const child = startServer(home);
   try {
+    // The plugin must NOT exit within 4 s — it should be sitting in standby.
     const exited = await Promise.race([
-      new Promise((resolve) => child.once('exit', (code) => resolve(code))),
-      sleep(8_000).then(() => null),
+      new Promise((resolve) => child.once('exit', (code) => resolve({ code }))),
+      sleep(4_000).then(() => null),
     ]);
-    assert.ok(exited !== null, 'plugin should exit promptly when Patch F sees a healthy peer');
-    assert.equal(exited, 0, 'Patch F backoff should exit 0');
+    assert.equal(
+      exited,
+      null,
+      `Patch F 3.7.1 must NOT exit when same-version peer holds the lease; got ${JSON.stringify(exited)}`,
+    );
 
     const events = await readEvents(home);
-    const backoff = events.find((e) => e.event === 'patch_f.backoff');
-    assert.ok(backoff, 'expected patch_f.backoff event when an alive peer holds the lease');
+    const standby = events.find((e) => e.event === 'patch_f.standby');
+    assert.ok(standby, 'expected patch_f.standby event when an alive same-version peer holds the lease');
+    // Should NOT have logged the legacy backoff_exit event.
+    const backoffExit = events.find((e) => e.event === 'patch_f.backoff_exit');
+    assert.equal(backoffExit, undefined, '3.7.1 must not emit the legacy patch_f.backoff_exit event');
   } finally {
     try { child.kill('SIGKILL'); } catch {}
+    await sleep(100);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('Patch F (3.7.1): standby plugin acquires lease once peer heartbeat goes stale', { timeout: 30_000 }, async () => {
+  // Write a stale lease file held by a definitely-dead pid. The standby
+  // retry path inside watcher.ts should pick this up via tryAcquireWatcherLease
+  // (lease is stale because the holder pid is ESRCH) and steal it. We use a
+  // pid that does not exist — pid 1 is always alive but signalling it from
+  // a non-root user gets EPERM (treated as alive). Use a guaranteed-dead pid
+  // by spawning + killing a short-lived helper to mint a recently-recycled
+  // pid number.
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-promote-'));
+  const lockDir = join(home, '.agent-bridge', 'locks');
+  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  await mkdir(lockDir, { recursive: true, mode: 0o700 });
+
+  // Mint a definitely-dead pid.
+  const helper = spawn(process.execPath, ['-e', 'process.exit(0)']);
+  await new Promise((resolve) => helper.once('exit', resolve));
+  const deadPid = helper.pid;
+
+  // Write a fresh-LOOKING lease (updatedAt now) held by a dead pid. Patch F
+  // probes liveness with kill(pid, 0) and ESRCH on the dead pid means it
+  // falls through directly without standby/kill. startWatcher then steals
+  // the lease via the stale-lease branch. We assert the steal happens.
+  const fakeLease = {
+    pid: deadPid,
+    target: 'claude-code',
+    role: 'channel-owner',
+    token: `${deadPid}-dead-${Math.random().toString(36).slice(2, 10)}`,
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    version: '3.7.1',
+  };
+  await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
+
+  const child = startServer(home, { AGENT_BRIDGE_ROLE: 'channel-owner' });
+  try {
+    // Wait up to ~10 s for the plugin to acquire the lease (either directly
+    // through Patch F fall-through or via the standby retry path).
+    let acquired = false;
+    for (let i = 0; i < 20; i += 1) {
+      await sleep(500);
+      try {
+        const raw = await readFile(lockPath, 'utf8');
+        const lease = JSON.parse(raw);
+        if (lease.pid === child.pid) {
+          acquired = true;
+          break;
+        }
+      } catch {
+        /* lease may be momentarily missing during steal */
+      }
+    }
+    assert.ok(acquired, `expected child pid=${child.pid} to take over the stale lease within 10 s`);
+  } finally {
+    try { child.kill('SIGTERM'); } catch {}
+    await Promise.race([
+      new Promise((resolve) => child.once('exit', resolve)),
+      sleep(2000),
+    ]);
+    try { child.kill('SIGKILL'); } catch {}
+    await sleep(100);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// ─── Patch F (3.7.1) — stale-version peer-kill ──────────────────────────────
+test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { timeout: 20_000 }, async () => {
+  // Mint a long-lived helper process that will simulate the older-version peer.
+  // It traps SIGTERM and exits cleanly within ~200 ms (well under the 2 s
+  // grace window). Patch F should detect the stale version, SIGTERM it,
+  // wait for the exit, and then steal the lease.
+  const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-version-kill-'));
+  const lockDir = join(home, '.agent-bridge', 'locks');
+  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  await mkdir(lockDir, { recursive: true, mode: 0o700 });
+
+  const peer = spawn(process.execPath, [
+    '-e',
+    `process.on('SIGTERM', () => { setTimeout(() => process.exit(0), 200); });
+     setInterval(() => {}, 1000);`,
+  ], { stdio: 'ignore' });
+  // Give the peer a moment to attach its SIGTERM handler before we write the
+  // lease file pointing at it.
+  await sleep(200);
+
+  try {
+    const peerLease = {
+      pid: peer.pid,
+      target: 'claude-code',
+      role: 'channel-owner',
+      token: `${peer.pid}-old-${Math.random().toString(36).slice(2, 10)}`,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      version: '3.6.0', // strictly older than our 3.7.1 build
+    };
+    await writeFile(lockPath, JSON.stringify(peerLease, null, 2));
+
+    const child = startServer(home, { AGENT_BRIDGE_ROLE: 'channel-owner' });
+    try {
+      // Wait for the peer to die (SIGTERMed by Patch F).
+      const peerExited = await Promise.race([
+        new Promise((resolve) => peer.once('exit', resolve)),
+        sleep(8_000).then(() => null),
+      ]);
+      assert.ok(peerExited !== null, 'older-version peer must be killed by Patch F');
+
+      // Wait for the new plugin to acquire the lease.
+      let acquired = false;
+      for (let i = 0; i < 20; i += 1) {
+        await sleep(500);
+        try {
+          const raw = await readFile(lockPath, 'utf8');
+          const lease = JSON.parse(raw);
+          if (lease.pid === child.pid) {
+            acquired = true;
+            break;
+          }
+        } catch {
+          /* lease in flux */
+        }
+      }
+      assert.ok(acquired, `expected child pid=${child.pid} to take over the lease after killing the old-version peer`);
+
+      const events = await readEvents(home);
+      const killEvent = events.find((e) => e.event === 'patch_f.peer_version_kill');
+      assert.ok(killEvent, 'expected patch_f.peer_version_kill event for stale-version peer');
+      assert.equal(killEvent.context.peer_version, '3.6.0', 'peer_version logged');
+      assert.equal(killEvent.context.our_version, '3.7.1', 'our_version logged');
+      assert.equal(killEvent.context.peer_pid, peer.pid, 'peer_pid logged');
+    } finally {
+      try { child.kill('SIGTERM'); } catch {}
+      await Promise.race([
+        new Promise((resolve) => child.once('exit', resolve)),
+        sleep(2000),
+      ]);
+      try { child.kill('SIGKILL'); } catch {}
+    }
+  } finally {
+    try { peer.kill('SIGKILL'); } catch {}
     await sleep(100);
     await rm(home, { recursive: true, force: true });
   }
@@ -281,7 +442,7 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
     assert.equal(typeof parsed.pid, 'number', 'status.pid is a number');
     assert.equal(parsed.pid, child.pid, 'status.pid matches the plugin child pid');
     assert.equal(typeof parsed.uptime_s, 'number', 'status.uptime_s is a number');
-    assert.equal(parsed.version, '3.7.0', 'status.version is 3.7.0');
+    assert.equal(parsed.version, '3.7.1', 'status.version is 3.7.1');
     assert.equal(typeof parsed.machine, 'string', 'status.machine is a string');
     assert.equal(parsed.machine, 'test-patch-h', 'status.machine reflects env override');
     assert.equal(typeof parsed.watcher_active, 'boolean', 'status.watcher_active is boolean');

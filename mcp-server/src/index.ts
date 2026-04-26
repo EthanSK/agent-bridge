@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * agent-bridge MCP server — unified tools-and-channel plugin (3.7.0).
+ * agent-bridge MCP server — unified tools-and-channel plugin (3.7.1).
  *
  * 3.7.0 — Undo of the 3.6.0 split. The dedicated `claude-code-channel` plugin
  * has been merged BACK into this MCP server. We now host:
@@ -38,11 +38,21 @@
  * IMPORTANT: stdout is the JSON-RPC transport — never `console.log`. Use
  * `console.error()` or the logger module for diagnostics.
  *
+ * 3.7.1 — Patch F race fix + stale-version peer-kill. The 3.7.0 form of
+ * Patch F exited the new plugin when a fresh peer held the lease, which
+ * created a race during /reload-plugins migrations: the old plugin then
+ * died and there was no successor. 3.7.1 changes this so the new plugin
+ * either kills an older-version peer (SIGTERM, 2s grace, SIGKILL) or
+ * stays in standby+retry instead of exiting. Same-version peers are
+ * never killed; unknown-version peers are treated as same-version.
+ *
  * Lifecycle posture (all 3.5.x → 3.6.x diagnostic + recovery improvements
  * are retained):
  *   - Patch B  — persistent stderr tee (Telegram pattern)
  *   - Patch F  — heartbeat-recency guard against parallel-spawn from
- *                subagents murdering the parent's poller
+ *                subagents murdering the parent's poller. 3.7.1 form:
+ *                standby+retry on same-version peer; kill+steal on
+ *                older-version peer.
  *   - Patch G  — channel-owner SIGTERM ignore (defence-in-depth; tools
  *                that get called regularly will normally avoid the reap
  *                window in the first place)
@@ -60,7 +70,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, ensureDirectories, getLocalMachineName } from './config.js';
+import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, MCP_SERVER_VERSION, ensureDirectories, getLocalMachineName } from './config.js';
 import { initInbox, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 import { registerTools } from './tools.js';
@@ -68,7 +78,10 @@ import { startWatcher, stopWatcher, replayUndeliveredMessages } from './watcher.
 import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 
-const VERSION = '3.7.0';
+// 3.7.1 — version is sourced from config.ts (single source of truth shared
+// with watcher.ts so lease files carry our build version for Patch F's
+// stale-version peer-kill path).
+const VERSION = MCP_SERVER_VERSION;
 
 // 3.5.5 — Patch B (mirror of Telegram plugin server.ts:31-51): persistent
 // stderr tee. Claude Code can close diagnostic stderr between tool turns; once
@@ -97,16 +110,54 @@ try {
   process.on('exit', () => { try { stderrLogStream.end(); } catch { /* ignore */ } });
 } catch { /* if we cannot install the tee, just keep going */ }
 
-// 3.7.0 — Patch F (heartbeat-recency guard against parallel spawn).
-// If the existing watcher lease is held by a DIFFERENT live PID and was
-// updated within the last 90 s, this is a healthy peer (another running
-// agent-bridge instance — typically a sibling subagent spawn). Back off and
-// exit cleanly so the healthy peer keeps its lease. We use the watcher
-// lease's `updatedAt` field as the recency signal.
+// 3.7.1 — Patch F (heartbeat-recency guard against parallel spawn) — REVISED.
+//
+// The 3.7.0 form of Patch F **exited** when an existing fresh peer held the
+// lease. That created a race during version migrations and `/reload-plugins`
+// flows: the OLD plugin was about to die, but the NEW plugin saw its still-
+// fresh heartbeat, exited, and left no successor. Once the old plugin actually
+// terminated, no live process owned channel delivery until the next plugin
+// spawn. Live evidence on MBP-Claude (2026-04-26 ~20:29 BST) showed exactly
+// this: NEW pids 95679 and 98451 hit `patch_f.backoff_exit` while OLD pid
+// 34781 (3.6.1 channel-only) held the lease; OLD got SIGTERM at 20:29:03 and
+// MBP was left without a channel-owner.
+//
+// 3.7.1 replaces the exit with **standby + retry**:
+//   - We log `patch_f.standby` and fall through to `main()`.
+//   - `startWatcher` returns 'busy', `scheduleStandbyRetry` polls every 2 s.
+//   - When the peer's heartbeat goes stale (>15 s old per
+//     watcherLeaseIsStale), the standby steals the lease and activates
+//     channel delivery. No race window, no orphan period.
+//
+// 3.7.1 also adds a **stale-version peer-kill**: if the existing lease's
+// `version` field is older than our build, send the holder SIGTERM, wait 2 s
+// for a clean shutdown, then SIGKILL as a fallback. This forces version
+// migrations through `/reload-plugins` without leaving the older peer
+// blocking the lease for the full heartbeat-stale window. We never kill a
+// same-version peer, and we never kill when the version is unknown (treat as
+// same-version — safer default).
 //
 // Skipped when AGENT_BRIDGE_ROLE=tools-only — tools-only hosts (OpenClaw,
 // Codex sidekicks) do not contend for the inbox lease, so they have no
-// reason to back off.
+// reason to back off or kill peers.
+function compareSemver(a: string, b: string): number | null {
+  // Returns negative if a < b, 0 if equal, positive if a > b. Returns null
+  // when either input is not a parseable dotted-numeric semver-ish string —
+  // caller treats that as "same-version" for safety.
+  const parse = (s: string): number[] | null => {
+    const m = s.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return null;
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  };
+  const av = parse(a);
+  const bv = parse(b);
+  if (!av || !bv) return null;
+  for (let i = 0; i < 3; i += 1) {
+    if (av[i] !== bv[i]) return av[i] - bv[i];
+  }
+  return 0;
+}
+
 {
   const requestedRole = process.env.AGENT_BRIDGE_ROLE?.trim() || 'channel-owner';
   if (
@@ -120,9 +171,10 @@ try {
     try {
       if (existsSync(leasePath)) {
         const raw = readFileSync(leasePath, 'utf8');
-        const meta = JSON.parse(raw) as { pid?: number; updatedAt?: number };
+        const meta = JSON.parse(raw) as { pid?: number; updatedAt?: number; version?: string };
         const holder = Number(meta?.pid);
         const updatedAt = Number(meta?.updatedAt);
+        const peerVersion = typeof meta?.version === 'string' ? meta.version : undefined;
         if (
           Number.isInteger(holder)
           && holder > 0
@@ -131,9 +183,9 @@ try {
           && Date.now() - updatedAt < 90_000
         ) {
           // Probe holder liveness — kill(pid, 0) on a live process is a
-          // no-op; ESRCH means dead and we should NOT back off (the lease is
-          // stale, tryAcquireWatcherLease will steal it). Any other error
-          // means the process exists from our POV — back off.
+          // no-op; ESRCH means dead and we should NOT enter standby (the
+          // lease is stale, tryAcquireWatcherLease will steal it). Any other
+          // error means the process exists from our POV — handle below.
           let holderAlive = false;
           try {
             process.kill(holder, 0);
@@ -143,34 +195,138 @@ try {
             holderAlive = code !== 'ESRCH';
           }
           if (holderAlive) {
-            try {
-              process.stderr.write(
-                `agent-bridge: existing watcher pid=${holder} heartbeat fresh (age=${Date.now() - updatedAt}ms); this instance exiting without steal\n`,
-              );
-            } catch { /* best-effort */ }
-            try {
-              logEvent({
-                event: 'patch_f.backoff',
-                level: 'warn',
-                msg: 'Patch F: backing off because a healthy peer holds the watcher lease',
-                context: { holder, age_ms: Date.now() - updatedAt, pid: process.pid },
-              });
-            } catch { /* best-effort */ }
-            try {
-              mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
-              appendFileSync(
-                join(LOGS_DIR, 'mcp-server-sync-exit.log'),
-                JSON.stringify({
-                  ts: new Date().toISOString(),
-                  event: 'patch_f.backoff_exit',
-                  pid: process.pid,
-                  ppid: process.ppid,
-                  holder,
-                  age_ms: Date.now() - updatedAt,
-                }) + '\n',
-              );
-            } catch { /* best-effort */ }
-            process.exit(0);
+            // ── Stale-version peer-kill ───────────────────────────────────
+            // If we know the peer's version and it is strictly older than
+            // ours, force migration by SIGTERMing it. Wait 2 s for clean
+            // shutdown, then SIGKILL as a fallback. Same- or unknown-version
+            // peers are NEVER killed.
+            const versionCompare = peerVersion
+              ? compareSemver(peerVersion, MCP_SERVER_VERSION)
+              : null;
+            const peerIsOlder = versionCompare !== null && versionCompare < 0;
+            if (peerIsOlder) {
+              try {
+                process.stderr.write(
+                  `agent-bridge: peer pid=${holder} version=${peerVersion} is older than our ${MCP_SERVER_VERSION}; sending SIGTERM to force migration\n`,
+                );
+              } catch { /* best-effort */ }
+              try {
+                logEvent({
+                  event: 'patch_f.peer_version_kill',
+                  level: 'warn',
+                  msg: 'Patch F: SIGTERM-killing stale-version peer to force migration',
+                  context: {
+                    peer_pid: holder,
+                    peer_version: peerVersion,
+                    our_version: MCP_SERVER_VERSION,
+                    pid: process.pid,
+                  },
+                });
+              } catch { /* best-effort */ }
+              try {
+                process.kill(holder, 'SIGTERM');
+              } catch { /* best-effort — peer may have just died */ }
+
+              // Synchronously wait up to 2 s for the peer to release. Poll
+              // its liveness every 100 ms via kill(pid, 0). We use
+              // Atomics.wait on a SharedArrayBuffer-backed Int32Array for a
+              // truly blocking sleep (no event loop required at module-load
+              // time). The poll lets us short-circuit as soon as the peer
+              // exits.
+              const sab = new SharedArrayBuffer(4);
+              const view = new Int32Array(sab);
+              const deadline = Date.now() + 2_000;
+              let peerStillAlive = true;
+              while (Date.now() < deadline) {
+                try {
+                  process.kill(holder, 0);
+                } catch (e) {
+                  if ((e as { code?: string }).code === 'ESRCH') {
+                    peerStillAlive = false;
+                    break;
+                  }
+                }
+                Atomics.wait(view, 0, 0, 100);
+              }
+              if (peerStillAlive) {
+                try {
+                  process.stderr.write(
+                    `agent-bridge: peer pid=${holder} did not exit within 2s of SIGTERM; sending SIGKILL\n`,
+                  );
+                } catch { /* best-effort */ }
+                try {
+                  logEvent({
+                    event: 'patch_f.peer_version_sigkill',
+                    level: 'warn',
+                    msg: 'Patch F: SIGKILL fallback after 2s SIGTERM grace expired',
+                    context: {
+                      peer_pid: holder,
+                      peer_version: peerVersion,
+                      our_version: MCP_SERVER_VERSION,
+                      pid: process.pid,
+                    },
+                  });
+                } catch { /* best-effort */ }
+                try {
+                  process.kill(holder, 'SIGKILL');
+                } catch { /* best-effort */ }
+                // Brief grace for the kernel to release the PID. Acquire
+                // logic is robust to transient EEXIST anyway.
+                Atomics.wait(view, 0, 0, 200);
+              }
+              // Fall through into main(); startWatcher will steal the lease
+              // (the holder is dead and the lease is now stale).
+            } else {
+              // ── Standby + retry path (3.7.1) ─────────────────────────────
+              // Same-version (or unknown-version) healthy peer holds the
+              // lease. Do NOT exit. Log evidence and fall through; the
+              // normal startWatcher → scheduleStandbyRetry flow will keep
+              // this process alive, polling every 2 s, and steal once the
+              // peer's heartbeat goes stale (>15 s in
+              // watcherLeaseIsStale). This eliminates the orphan-period
+              // race that the 3.7.0 backoff_exit form created.
+              try {
+                process.stderr.write(
+                  `agent-bridge: existing watcher pid=${holder} version=${peerVersion ?? 'unknown'} heartbeat fresh (age=${Date.now() - updatedAt}ms); this instance entering standby + retry\n`,
+                );
+              } catch { /* best-effort */ }
+              try {
+                logEvent({
+                  event: 'patch_f.standby',
+                  level: 'warn',
+                  msg: 'Patch F: peer holds watcher lease — entering standby + retry instead of exit (3.7.1)',
+                  context: {
+                    holder,
+                    age_ms: Date.now() - updatedAt,
+                    peer_version: peerVersion,
+                    our_version: MCP_SERVER_VERSION,
+                    version_compare: versionCompare,
+                    pid: process.pid,
+                  },
+                });
+              } catch { /* best-effort */ }
+              // Compatibility breadcrumb so existing post-mortem tooling
+              // still finds the historical 3.7.0 marker. Note the suffix
+              // changed from `_exit` to `_standby` to make the new
+              // behaviour searchable.
+              try {
+                mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
+                appendFileSync(
+                  join(LOGS_DIR, 'mcp-server-sync-exit.log'),
+                  JSON.stringify({
+                    ts: new Date().toISOString(),
+                    event: 'patch_f.backoff_standby',
+                    pid: process.pid,
+                    ppid: process.ppid,
+                    holder,
+                    age_ms: Date.now() - updatedAt,
+                    peer_version: peerVersion,
+                    our_version: MCP_SERVER_VERSION,
+                  }) + '\n',
+                );
+              } catch { /* best-effort */ }
+              // Fall through to main(). DO NOT call process.exit() here.
+            }
           }
         }
       }

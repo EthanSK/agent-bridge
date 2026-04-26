@@ -1,5 +1,102 @@
 # Changelog
 
+## agent-bridge 3.7.1 — 2026-04-26
+
+### Patch F race fix (standby+retry) + stale-version peer kill
+
+Two follow-on fixes to 3.7.0's lifecycle posture, both observed live during the
+3.6.1 → 3.7.0 migration on MBP-Claude (2026-04-26 ~20:29 BST).
+
+#### Bug 1 — Patch F race during version migrations
+
+3.7.0's Patch F exited cleanly when a fresh peer held the watcher lease. That
+created a race during `/reload-plugins` and version migrations: a NEW plugin
+spawned, saw the OLD plugin's still-fresh heartbeat, and exited; the OLD
+plugin then died moments later (Claude Code reaping it as part of the reload),
+leaving no successor. Until the next plugin spawn, the machine had **no
+channel-owner**.
+
+Live evidence: NEW pids 95679 and 98451 (both 3.7.0) hit
+`patch_f.backoff_exit` while OLD pid 34781 (3.6.1 channel-only) held the
+lease. OLD got SIGTERM at 20:29:03 and released the lease — but no successor
+existed because both NEW plugins had already exited. MBP was left without a
+channel-owner.
+
+**Fix.** Replace `process.exit(0)` in Patch F with a "standby + retry" path.
+The new plugin:
+
+- Logs `patch_f.standby` (not `patch_f.backoff_exit`) and falls through to
+  `main()`.
+- `startWatcher` returns `'busy'` and `scheduleStandbyRetry` polls the lease
+  every 2 s.
+- When the peer's heartbeat goes stale (>15 s old, per
+  `watcherLeaseIsStale`), the standby plugin steals the lease and activates
+  channel delivery. No race window, no orphan period.
+
+The standby+retry machinery itself is reused from `watcher.ts` —
+`scheduleStandbyRetry` was already present for the `tryAcquireWatcherLease`
+busy path. 3.7.1 just stops short-circuiting through it.
+
+A compatibility breadcrumb at `~/.agent-bridge/logs/mcp-server-sync-exit.log`
+now writes `patch_f.backoff_standby` (suffix changed from `_exit` to
+`_standby` so post-mortem tooling can tell new behaviour from old).
+
+#### Bug 2 — Stale-version peers blocking the lease
+
+When a NEW plugin starts and detects that the lease is held by a peer running
+an OLDER version, it now actively forces migration:
+
+1. Reads the peer's `version` field from the lock file.
+2. If `peer.version < our.version` (semver compare), sends `SIGTERM` to the
+   peer pid.
+3. Synchronously waits up to 2 s for the peer to exit (polling
+   `kill(pid, 0)` every 100 ms via `Atomics.wait` on a SharedArrayBuffer
+   `Int32Array` — module-load context, no event loop yet).
+4. If the peer is still alive after 2 s, sends `SIGKILL` as a fallback, waits
+   200 ms for the kernel to release the pid, and falls through.
+5. `main()` runs normally; `tryAcquireWatcherLease` steals the now-stale lease
+   and channel delivery activates immediately.
+
+Same-version peers and unknown-version peers are **never killed** — Patch F
+respects same/newer and treats unknown-version (lease written by 3.7.0 or
+earlier, no `version` field) as same-version for safety. New events for
+post-mortem visibility:
+
+- `patch_f.peer_version_kill` — `peer_pid`, `peer_version`, `our_version`.
+- `patch_f.peer_version_sigkill` — emitted when the 2 s SIGTERM grace expires.
+
+Lock file format: a new `version: string` field is now written by
+`tryAcquireWatcherLease` (sourced from a single `MCP_SERVER_VERSION` constant
+in `config.ts`). Older readers that don't know the field simply ignore it
+(JSON), so this is forward-compatible with 3.7.0 watchers in the rare case
+where a 3.7.1 lease is read by a 3.7.0 sibling.
+
+#### What this changes
+
+- `mcp-server/src/index.ts` — Patch F refactored from `backoff_exit` to a
+  branch that either kills (older peer) or stands by (same/unknown
+  version). `compareSemver` helper added.
+- `mcp-server/src/watcher.ts` — lock file `WatcherLeaseFile` gains an
+  optional `version` field; `tryAcquireWatcherLease` writes
+  `MCP_SERVER_VERSION`; `readWatcherLease` exposes it.
+- `mcp-server/src/config.ts` — new `MCP_SERVER_VERSION` constant (single
+  source of truth for tools/index/lease).
+- `mcp-server/test/unified-channel.test.mjs` — old `patch_f.backoff` exit
+  test rewritten as a standby test; new tests cover (a) standby plugin
+  acquiring the lease after the peer's heartbeat goes stale and (b) the
+  stale-version peer-kill path end-to-end.
+
+#### Compatibility
+
+- Wire format unchanged — channel notifications, BridgeMessage JSON, and
+  the SSH transport are all identical to 3.7.0.
+- Lock file format gained one optional field. Forward- and backward-
+  compatible with 3.7.0 readers.
+- All 8 lifecycle patches (A–H) remain in place. 3.7.1 only replaces
+  Patch F's exit path; G and H are untouched.
+
+---
+
 ## agent-bridge 3.7.0 — 2026-04-26
 
 ### Undo 3.6.0 split: combine tools + channel into one plugin (Telegram pattern)

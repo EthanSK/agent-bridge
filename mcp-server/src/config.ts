@@ -8,6 +8,15 @@ import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { homedir, hostname } from 'os';
 import { basename, join } from 'path';
 
+/**
+ * 3.7.1 — semver string for the agent-bridge MCP server build. Single source
+ * of truth shared between `index.ts` (server.version + status tool) and
+ * `watcher.ts` (lease file `version` field used by Patch F's stale-version
+ * peer-kill path). Bump this in lockstep with `package.json`,
+ * `.claude-plugin/plugin.json`, and the bash CLI's VERSION constant.
+ */
+export const MCP_SERVER_VERSION = '3.7.1';
+
 export const BRIDGE_DIR = join(homedir(), '.agent-bridge');
 export const CONFIG_FILE = join(BRIDGE_DIR, 'config');
 export const KEYS_DIR = join(BRIDGE_DIR, 'keys');

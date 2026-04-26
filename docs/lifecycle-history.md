@@ -942,4 +942,133 @@ patch doesn't accidentally regress.
 
 ---
 
+## 3.7.1 — Patch F race fix (standby+retry) + stale-version peer kill (2026-04-26)
+
+3.7.0 shipped earlier the same day with the unified-plugin design and all
+eight A–H patches kept as defence-in-depth. Within hours of deployment the
+MBP `/reload-plugins` migration from 3.6.1 → 3.7.0 surfaced two distinct
+failure modes that the 3.7.0 form of Patch F could not handle. 3.7.1 patches
+both.
+
+### Bug 1 — Patch F exit-vs-reload race
+
+The 3.7.0 form of Patch F was: "if a peer holds the lease and its heartbeat
+is fresh, exit cleanly so the peer keeps running." That assumed the peer was
+about to keep running. During a `/reload-plugins`-driven version migration
+the assumption is wrong: the peer is the OLD plugin and is being actively
+reaped. The NEW plugin sees a fresh heartbeat, exits, and leaves no successor
+once the OLD plugin actually dies.
+
+**Live evidence (2026-04-26 ~20:29 BST, MBP):**
+
+- 20:28:?? — `/reload-plugins` triggered, NEW pid 95679 spawned (3.7.0).
+- 20:28:?? — pid 95679 reads OLD pid 34781's lease (3.6.1, fresh heartbeat),
+  emits `patch_f.backoff_exit`, exits 0.
+- 20:28:?? — NEW pid 98451 spawned, same path, same result.
+- 20:29:03 — OLD pid 34781 receives SIGTERM, releases lease, exits.
+- 20:29:03 → indefinitely — no live channel-owner on MBP. Channel delivery
+  silently broken until the next plugin spawn.
+
+**Fix.** Replace the `process.exit(0)` in Patch F with a fall-through into
+`main()` so the normal `startWatcher` → `scheduleStandbyRetry` machinery
+(already present in `watcher.ts` for the `tryAcquireWatcherLease` busy path)
+takes over. The new plugin stays alive in standby, polls the lease every
+2 s, and steals it as soon as the peer's heartbeat goes stale per
+`watcherLeaseIsStale` (>15 s old). Net behaviour: no exit, no race window,
+no orphan period.
+
+Compatibility breadcrumb in `mcp-server-sync-exit.log` now writes
+`patch_f.backoff_standby` (suffix changed from `_exit` to `_standby`) so
+post-mortem tooling can distinguish new from old behaviour.
+
+### Bug 2 — Stale-version peers blocking the lease
+
+Even with Bug 1 fixed, a stale-version peer (e.g. 3.6.1 still running while
+the host has already loaded 3.7.1's manifest) would block the lease for the
+full 15 s heartbeat-stale window before the standby could steal. During
+version migrations that's 15 s of channel-delivery downtime per spawn.
+
+**Fix.** When the existing lease's `version` field is strictly older than
+our build's version, force migration:
+
+1. Send `SIGTERM` to the peer pid.
+2. Synchronously wait up to 2 s for the peer to exit (poll `kill(pid, 0)`
+   every 100 ms via `Atomics.wait` on a SharedArrayBuffer `Int32Array` —
+   the Patch F block runs at module-load time, before the event loop is
+   doing real work, so a synchronous wait is safe and concise).
+3. If still alive after 2 s, `SIGKILL`.
+4. Fall through to `main()`. The lease is now stale and `startWatcher`
+   steals it.
+
+Same-version peers are never killed (Patch F respects same/newer).
+Unknown-version peers (lease written by 3.7.0 or earlier, no `version`
+field) are treated as same-version for safety — no kill.
+
+### Lock file format change
+
+`WatcherLeaseFile` gains one optional field:
+
+```ts
+type WatcherLeaseFile = {
+  // ... existing fields ...
+  /** Optional, 3.7.1+. semver string. Absent on leases written by 3.7.0
+   *  or earlier; treated as "same-version" by Patch F's peer-kill path. */
+  version?: string;
+};
+```
+
+`tryAcquireWatcherLease` now writes `MCP_SERVER_VERSION` (a single constant
+in `config.ts` shared with `index.ts`). Forward- and backward-compatible
+with 3.7.0 watchers — the field is JSON-extra, so older readers ignore it.
+
+### New events
+
+- `patch_f.standby` — emitted when a same- or unknown-version healthy peer
+  holds the lease and we enter standby+retry instead of exiting.
+- `patch_f.peer_version_kill` — emitted when we SIGTERM an older peer.
+  Context: `peer_pid`, `peer_version`, `our_version`, `pid`.
+- `patch_f.peer_version_sigkill` — emitted when the 2 s SIGTERM grace
+  expires and we escalate to SIGKILL.
+
+The legacy `patch_f.backoff` and `patch_f.backoff_exit` events are gone.
+`patch_f.check_error` is unchanged.
+
+### What this changes
+
+- `mcp-server/src/index.ts` — Patch F block (`index.ts:100-190` in 3.7.0)
+  refactored. Old form: probe fresh peer → `process.exit(0)`. New form:
+  probe fresh peer → branch on `compareSemver(peer.version, our.version)`
+  → either kill+steal (older) or fall through to standby (same/unknown).
+- `mcp-server/src/watcher.ts` — `WatcherLeaseFile` extended with optional
+  `version`; `readWatcherLease` exposes it; `tryAcquireWatcherLease`
+  writes it from `MCP_SERVER_VERSION`.
+- `mcp-server/src/config.ts` — new `MCP_SERVER_VERSION = '3.7.1'`
+  constant; both `index.ts` and `watcher.ts` import from here.
+- `mcp-server/test/unified-channel.test.mjs` — replaces the 3.7.0 exit-on-
+  backoff test with a standby test, adds a "standby promotes after stale
+  heartbeat" test, and adds an end-to-end stale-version peer-kill test.
+
+### Compatibility
+
+- Wire format unchanged. Channel notifications, BridgeMessage JSON, and
+  SSH transport are all identical to 3.7.0.
+- Lock file format gained one optional field. Forward- and backward-
+  compatible with 3.7.0 readers.
+- Patches G and H untouched. 3.7.1 only changes Patch F's behaviour
+  inside the `holderAlive === true` branch.
+
+### Migration story (live, MBP, 2026-04-26)
+
+- Pre-3.7.1: NEW plugins exited via `patch_f.backoff_exit`, OLD plugin
+  died unannounced, MBP had no channel-owner until next spawn.
+- Post-3.7.1: NEW plugin sees OLD's older `version` in the lease,
+  `SIGTERM`s OLD, waits 2 s, OLD has exited cleanly, NEW steals the
+  lease via `tryAcquireWatcherLease`. Channel delivery has zero
+  observable downtime.
+- If a 3.7.1 NEW plugin sees a SAME-version 3.7.1 peer, it standbys
+  + retries. The peer keeps owning delivery; the standby is ready to
+  take over within 2 s of the peer dying.
+
+---
+
 *End of lifecycle history.*
