@@ -1,5 +1,80 @@
 # Changelog
 
+## agent-bridge 3.6.3 — 2026-04-26
+
+### Register no-op MCP tool to prevent channel-plugin reaping
+
+3.6.2 added Patch G: when SIGTERM lands on the channel plugin and the parent
+Claude Code session is still alive, ignore the signal. The Mac Mini restart
+that followed proved Patch G works as designed — `signal.ignored_channel_owner`
+fires reliably — but production then revealed the next layer: Claude Code's
+plugin host escalates to **uncatchable SIGKILL ~2 s after** the ignored
+SIGTERM. The plugin disappears regardless of any in-process resistance.
+
+#### Empirical evidence (Mac Mini, 2026-04-26 12:26 BST)
+
+- pid 89205 received an inbound notification at 12:26:34Z, pushed to channel
+  successfully (heartbeats and watcher healthy throughout).
+- 12:26:36Z: SIGTERM landed; Patch G logged `signal.ignored_channel_owner`
+  and returned without shutting down.
+- 12:26:36Z: process gone (no exit breadcrumb, no shutdown log) — only the
+  stale lease file remained. Process uptime at death: 172 s.
+
+The host was clearly using two-stage termination (SIGTERM → SIGKILL) on
+plugins it considers reapable. Patch G can survive the first stage but not
+the second.
+
+#### Why Telegram (also a channel plugin) does not get reaped
+
+Telegram registers four MCP tools (`reply`, `react`, `download_attachment`,
+`edit_message`) via the standard `tools/list` handler. The plugin host
+classifies tool-capable plugins as **active / interactive** and excludes
+them from the idle reaper sweep entirely. Channel-only plugins (no tools
+registered) are classified as **disposable** — and even when they ignore
+SIGTERM, the host follows through with SIGKILL.
+
+3.6.2's `claude-code-channel` plugin registered zero tools. That's why the
+host kept reaping it.
+
+#### Patch H — register a no-op informational tool
+
+`claude-code-channel/src/index.ts` now registers a single MCP tool,
+`claude_code_channel_status`, that returns a small JSON status object
+(`pid`, `ppid`, `uptime_s`, `version`, `machine`, `watcher_active`,
+`lease`, `tool_calls_received_count`, `tool_boot_time_ms`). The tool's
+description discourages calling it for normal use — agents should use
+`bridge_send_message` from the sibling agent-bridge plugin — but its
+existence registers the channel plugin as tool-capable in the host's
+classification, mirroring Telegram's effective behaviour.
+
+Patch G is retained as defence-in-depth for the SIGTERM-only escape window
+before any future host-side classification change.
+
+#### Patch H evidence logging
+
+To distinguish "Patch H prevented reaping" from "different failure mode" if
+the issue resurfaces, every signal arrival now logs a `signal.evidence`
+event with: `parent_alive`, `stdin_destroyed`, `stdin_readable_ended`,
+`last_notification_at_ms`, `last_notification_age_ms`,
+`tool_calls_received_count`, `uptime_s`. The same fields are added to the
+existing `signal.ignored_channel_owner` event and to the
+`signal.received` sync exit breadcrumb.
+
+#### Files touched
+
+- `claude-code-channel/src/index.ts` — register
+  `claude_code_channel_status`; track `lastNotificationAtMs` and
+  `toolCallsReceivedCount`; emit `signal.evidence` on every signal arrival;
+  bump VERSION constant.
+- `claude-code-channel/test/tool-registration.test.mjs` — new test file:
+  source-level guard + behavioural test that initiates an MCP handshake,
+  calls `tools/list`, calls `tools/call`, and asserts on the returned
+  status shape.
+- `claude-code-channel/{package.json, package-lock.json, .claude-plugin/plugin.json}` — 3.6.3.
+- `mcp-server/{package.json, package-lock.json, .claude-plugin/plugin.json, src/index.ts}` — 3.6.3 in lockstep.
+- `agent-bridge` (bash CLI) — `VERSION="3.6.3"`.
+- `claude-code-channel/test/lifecycle.test.mjs`, `mcp-server/test/heartbeat-shutdown-diag.test.mjs` — version assertions bumped to 3.6.3.
+
 ## agent-bridge 3.6.2 — 2026-04-26
 
 ### Fix channel plugin not respawning after Claude Code SIGTERMs it

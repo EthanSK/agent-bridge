@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * agent-bridge — claude-code-channel plugin (3.6.2).
+ * agent-bridge — claude-code-channel plugin (3.6.3).
  *
  * Long-lived, session-scoped MCP server. Owns:
  *   1. The watcher lease for `~/.agent-bridge/inbox/claude-code/`.
@@ -38,6 +38,19 @@
  *                watchdog (Patch A) and the stdout/stdin EPIPE handlers
  *                still terminate us when the parent actually dies.
  *                SIGINT/SIGHUP remain explicit shutdown signals.
+ *   - Patch H  — register a no-op MCP tool (3.6.3). Patch G ignored SIGTERM
+ *                successfully but the plugin host escalated to uncatchable
+ *                SIGKILL ~2 s later (Mac Mini pid 89205, 2026-04-26: SIGTERM
+ *                logged-and-ignored at 12:26:36Z, process gone by next poll).
+ *                Telegram (also a channel plugin) survives 21+ hours through
+ *                identical lifecycle because it registers 4 MCP tools — tool
+ *                registration tells Claude Code's plugin host "I'm
+ *                interactive, don't reap me." Registering a single
+ *                informational/diagnostic no-op tool here puts us in the
+ *                same tool-capable classification, so the idle reaper never
+ *                fires SIGTERM in the first place. Patch G is retained as
+ *                belt-and-braces for the SIGTERM-only escape window before
+ *                SIGKILL escalation.
  *
  * IMPORTANT: stdout is the JSON-RPC transport for this MCP server's own
  * face — never `console.log`. Use stderr (teed by Patch B) for diagnostics.
@@ -75,7 +88,7 @@ import {
 } from './watcher.js';
 import { logEvent } from './log.js';
 
-const VERSION = '3.6.2';
+const VERSION = '3.6.3';
 const SERVER_NAME = 'agent-bridge-channel';
 
 // ─── Patch B — persistent stderr tee ────────────────────────────────────────
@@ -332,14 +345,77 @@ async function main(): Promise<void> {
     },
   );
 
-  // No tools registered on the channel server — outbound MCP tools live in
-  // mcp-server. Listing tools returns an empty array so callers don't crash;
-  // bridge_* tools come from the sibling agent-bridge plugin.
+  // ─── Patch H (3.6.3) — register a no-op MCP tool ────────────────────────
+  // Patch G ignored SIGTERM but Claude Code's plugin host escalated to
+  // uncatchable SIGKILL ~2 s later. Telegram (also a channel plugin) survives
+  // because it registers 4 MCP tools — registration tells the plugin host
+  // "I'm interactive, don't reap me." We register ONE informational/diagnostic
+  // tool to put ourselves in the same tool-capable classification. Calling
+  // this tool is harmless: it returns a small JSON status object. The
+  // description discourages calling it for normal use, pointing the agent at
+  // bridge_send_message in the sibling agent-bridge plugin instead.
+  //
+  // Outbound MCP tools (bridge_send_message, bridge_run_command, etc.) still
+  // live in the sibling agent-bridge mcp-server plugin; coordination between
+  // the two plugins is filesystem-only.
+  const TOOL_BOOT_TIME_MS = Date.now();
+  let toolCallsReceivedCount = 0;
+  server.registerTool(
+    'claude_code_channel_status',
+    {
+      title: 'Claude Code Channel Status',
+      description:
+        'Returns the current claude-code-channel plugin status (pid, uptime, lease, version). '
+        + 'Used internally to verify the channel host is healthy. The bridge_send_message '
+        + 'tool from the agent-bridge plugin is what you actually use to send messages.',
+    },
+    async () => {
+      toolCallsReceivedCount += 1;
+      const leasePath = join(
+        LOCKS_DIR,
+        `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`,
+      );
+      let lease: Record<string, unknown> | null = null;
+      let watcherActive = false;
+      try {
+        if (existsSync(leasePath)) {
+          const raw = readFileSync(leasePath, 'utf8');
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          lease = parsed;
+          watcherActive = Number(parsed?.pid) === process.pid;
+        }
+      } catch {
+        // best-effort — never fail the tool because the lease file is in flux
+      }
+      const status = {
+        pid: process.pid,
+        ppid: process.ppid,
+        uptime_s: Math.floor(process.uptime()),
+        version: VERSION,
+        machine: localName,
+        watcher_active: watcherActive,
+        lease,
+        tool_boot_time_ms: TOOL_BOOT_TIME_MS,
+        tool_calls_received_count: toolCallsReceivedCount,
+      };
+      return {
+        content: [
+          { type: 'text' as const, text: JSON.stringify(status, null, 2) },
+        ],
+      };
+    },
+  );
 
   // Start the inbox watcher with the channel-notification callback. This is
   // the heart of the plugin: poll inbox/claude-code/ at 2 s, and for each
   // new message, push notifications/claude/channel back to Claude Code via
   // the MCP transport.
+  //
+  // Track the timestamp of the most recent push so the SIGTERM evidence
+  // logger (Patch H, 3.6.3) can report how recently the channel was active
+  // — useful for distinguishing "host SIGTERMed us right after a notification
+  // burst" from "host SIGTERMed us during sustained idle".
+  let lastNotificationAtMs: number | null = null;
   const watcherStarted = await startWatcher(
     (newFiles) => {
       logEvent({
@@ -349,6 +425,7 @@ async function main(): Promise<void> {
       });
     },
     (message: BridgeMessage) => {
+      lastNotificationAtMs = Date.now();
       logEvent({
         event: 'message.pushed_to_channel',
         msg: `Pushing channel notification for message ${message.id} from ${message.from}`,
@@ -565,13 +642,53 @@ async function main(): Promise<void> {
 
   function handleSignal(signal: NodeJS.Signals): void {
     const parentAlive = signalParentAlive();
+
+    // Patch H evidence (3.6.3) — log the parent / stdin / activity state at
+    // the moment the signal arrives. If the no-op tool registration doesn't
+    // fully prevent reaping, this evidence lets us distinguish between
+    // "different failure mode" and "host SIGTERMed despite tool registration
+    // (followed by SIGKILL)" without re-running the experiment.
+    const stdinDestroyed = process.stdin.destroyed === true;
+    const stdinReadableEnded = process.stdin.readableEnded === true;
+    const lastNotifAgeMs = lastNotificationAtMs === null
+      ? null
+      : Date.now() - lastNotificationAtMs;
+
     syncExitBreadcrumb('signal.received', {
       signal,
       watcherStarted,
       parent_alive: parentAlive,
       bootPpid,
       ppid: process.ppid,
+      stdin_destroyed: stdinDestroyed,
+      stdin_readable_ended: stdinReadableEnded,
+      last_notification_at_ms: lastNotificationAtMs,
+      last_notification_age_ms: lastNotifAgeMs,
+      tool_calls_received_count: toolCallsReceivedCount,
     });
+
+    try {
+      logEvent({
+        event: 'signal.evidence',
+        level: 'warn',
+        msg: `${signal} received — capturing evidence (Patch H 3.6.3)`,
+        context: {
+          signal,
+          pid: process.pid,
+          ppid: process.ppid,
+          bootPpid,
+          parent_alive: parentAlive,
+          watcherStarted,
+          uptime_s: Math.floor(process.uptime()),
+          stdin_destroyed: stdinDestroyed,
+          stdin_readable_ended: stdinReadableEnded,
+          last_notification_at_ms: lastNotificationAtMs,
+          last_notification_age_ms: lastNotifAgeMs,
+          tool_calls_received_count: toolCallsReceivedCount,
+        },
+      });
+    } catch { /* never let logging break a signal handler */ }
+
     if (
       signal === 'SIGTERM'
       && watcherStarted
@@ -594,6 +711,11 @@ async function main(): Promise<void> {
             bootPpid,
             watcherStarted,
             uptime_s: Math.floor(process.uptime()),
+            stdin_destroyed: stdinDestroyed,
+            stdin_readable_ended: stdinReadableEnded,
+            last_notification_at_ms: lastNotificationAtMs,
+            last_notification_age_ms: lastNotifAgeMs,
+            tool_calls_received_count: toolCallsReceivedCount,
           },
         });
       } catch { /* never let logging break a signal handler */ }

@@ -84,7 +84,7 @@ test('plugin starts, acquires lease, emits channel.starting + channel.ready, the
     const events = await readUnifiedEvents(home);
     const starting = events.find((e) => e.event === 'channel.starting');
     assert.ok(starting, 'expected channel.starting event');
-    assert.equal(starting.context.version, '3.6.2', 'startup event should report version 3.6.2');
+    assert.equal(starting.context.version, '3.6.3', 'startup event should report version 3.6.3');
     assert.equal(starting.component, 'claude-code-channel', 'log component should be claude-code-channel');
 
     const ready = events.find((e) => e.event === 'channel.ready');

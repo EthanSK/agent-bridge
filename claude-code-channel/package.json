@@ -1,6 +1,6 @@
 {
   "name": "@agent-bridge/claude-code-channel",
-  "version": "3.6.2",
+  "version": "3.6.3",
   "description": "agent-bridge Claude Code channel plugin. Long-lived, session-scoped MCP server that watches ~/.agent-bridge/inbox/claude-code/ and pushes incoming messages from paired machines into the running Claude Code session as <channel source=\"agent-bridge\"> events. Companion to the agent-bridge mcp-server (tools-only) plugin.",
   "type": "module",
   "main": "build/index.js",
