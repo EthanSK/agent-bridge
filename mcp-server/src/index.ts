@@ -1,29 +1,58 @@
 #!/usr/bin/env node
 /**
- * agent-bridge MCP server — channel plugin for real-time bidirectional
- * communication between running AI agent sessions across machines via SSH.
+ * agent-bridge MCP server — unified tools-and-channel plugin (3.7.0).
  *
- * This is the v2 component of agent-bridge. It runs as an MCP server /
- * channel plugin that Claude Code (or any MCP-compatible client) connects
- * to, exposing tools for cross-machine messaging and remote command execution.
+ * 3.7.0 — Undo of the 3.6.0 split. The dedicated `claude-code-channel` plugin
+ * has been merged BACK into this MCP server. We now host:
  *
- * Channel capability: When new messages arrive in the local inbox, they are
- * PUSHED into the running Claude session via `notifications/claude/channel`
- * — no polling required. Messages appear as:
- *   <channel source="agent-bridge" from="MachineName" ...>content</channel>
+ *   1. The 7 user-facing bridge tools (bridge_send_message, bridge_status,
+ *      bridge_list_machines, bridge_run_command, bridge_inbox_stats,
+ *      bridge_clear_inbox, bridge_receive_messages) — registered by
+ *      `tools.ts::registerTools()`.
+ *   2. The diagnostic no-op tool `claude_code_channel_status` originally
+ *      added by 3.6.3 Patch H. Retained because it doubles as a useful
+ *      health probe.
+ *   3. The channel watcher itself: lease acquisition for
+ *      `~/.agent-bridge/inbox/claude-code/`, the 2 s polling loop, and
+ *      `notifications/claude/channel` push of incoming BridgeMessages back
+ *      into the running Claude Code session.
  *
- * Design philosophy: enable EXISTING running agent sessions to communicate
- * with each other, NOT spawn new agent processes. Machine A's Claude sends
- * a message to Machine B's inbox, and Machine B's already-running Claude
- * receives it automatically via the channel.
+ * Why we re-merged: the 3.6.0 split assumed Claude Code's plugin host would
+ * keep channel-only plugins alive (since they own a long-lived channel
+ * capability). The empirical evidence (Mac Mini production, 2026-04-26)
+ * showed the host actually decides reapability based on **MCP tool-call
+ * frequency on stdio JSON-RPC**. Telegram (also a channel plugin) survives
+ * indefinitely because its 4 tools — `reply`, `react`, `download_attachment`,
+ * `edit_message` — get called constantly. A channel-only plugin with no tool
+ * calls gets reaped after every notification delivery, regardless of:
+ *   - Patch G (ignore SIGTERM) — host escalates to uncatchable SIGKILL.
+ *   - Patch H (no-op tool registered but rarely called) — registration alone
+ *     was insufficient because the host gates on call FREQUENCY, not
+ *     registration.
+ *   - Heartbeats / file polling — internal, plugin host doesn't see them.
  *
- * Communication protocol:
- * - Messages are JSON files written to ~/.agent-bridge/inbox/<target>/ on the target
- * - SSH is used for delivery (reusing v1 key pairs from ~/.agent-bridge/keys/)
- * - A file watcher detects incoming messages and pushes them via channel notifications
+ * The fix: combine everything back into one plugin so every
+ * `bridge_send_message` (and other bridge tool) call resets the plugin
+ * host's idle counter. Same lifetime guarantees as Telegram.
  *
- * IMPORTANT: Never use console.log() — stdout is the JSON-RPC transport.
- * Use console.error() or the logger module for diagnostics.
+ * IMPORTANT: stdout is the JSON-RPC transport — never `console.log`. Use
+ * `console.error()` or the logger module for diagnostics.
+ *
+ * Lifecycle posture (all 3.5.x → 3.6.x diagnostic + recovery improvements
+ * are retained):
+ *   - Patch B  — persistent stderr tee (Telegram pattern)
+ *   - Patch F  — heartbeat-recency guard against parallel-spawn from
+ *                subagents murdering the parent's poller
+ *   - Patch G  — channel-owner SIGTERM ignore (defence-in-depth; tools
+ *                that get called regularly will normally avoid the reap
+ *                window in the first place)
+ *   - 60s heartbeat (refed when channel-owner)
+ *   - shutdown_diag with handles dump
+ *   - syncExitBreadcrumb to durable log
+ *   - 3-poll orphan watchdog (15s confirmation window) — gated on
+ *     parent-pid liveness AND stdin destroyed/errored
+ *   - sibling-MCP-step-down via lease file
+ *   - fatalTransportExit on stdout EPIPE
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -38,6 +67,8 @@ import { registerTools } from './tools.js';
 import { startWatcher, stopWatcher, replayUndeliveredMessages } from './watcher.js';
 import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
+
+const VERSION = '3.7.0';
 
 // 3.5.5 — Patch B (mirror of Telegram plugin server.ts:31-51): persistent
 // stderr tee. Claude Code can close diagnostic stderr between tool turns; once
@@ -65,6 +96,98 @@ try {
   });
   process.on('exit', () => { try { stderrLogStream.end(); } catch { /* ignore */ } });
 } catch { /* if we cannot install the tee, just keep going */ }
+
+// 3.7.0 — Patch F (heartbeat-recency guard against parallel spawn).
+// If the existing watcher lease is held by a DIFFERENT live PID and was
+// updated within the last 90 s, this is a healthy peer (another running
+// agent-bridge instance — typically a sibling subagent spawn). Back off and
+// exit cleanly so the healthy peer keeps its lease. We use the watcher
+// lease's `updatedAt` field as the recency signal.
+//
+// Skipped when AGENT_BRIDGE_ROLE=tools-only — tools-only hosts (OpenClaw,
+// Codex sidekicks) do not contend for the inbox lease, so they have no
+// reason to back off.
+{
+  const requestedRole = process.env.AGENT_BRIDGE_ROLE?.trim() || 'channel-owner';
+  if (
+    requestedRole !== 'tools-only'
+    && process.env.AGENT_BRIDGE_DISABLE_PATCH_F !== '1'
+  ) {
+    const leasePath = join(
+      LOCKS_DIR,
+      `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`,
+    );
+    try {
+      if (existsSync(leasePath)) {
+        const raw = readFileSync(leasePath, 'utf8');
+        const meta = JSON.parse(raw) as { pid?: number; updatedAt?: number };
+        const holder = Number(meta?.pid);
+        const updatedAt = Number(meta?.updatedAt);
+        if (
+          Number.isInteger(holder)
+          && holder > 0
+          && holder !== process.pid
+          && Number.isFinite(updatedAt)
+          && Date.now() - updatedAt < 90_000
+        ) {
+          // Probe holder liveness — kill(pid, 0) on a live process is a
+          // no-op; ESRCH means dead and we should NOT back off (the lease is
+          // stale, tryAcquireWatcherLease will steal it). Any other error
+          // means the process exists from our POV — back off.
+          let holderAlive = false;
+          try {
+            process.kill(holder, 0);
+            holderAlive = true;
+          } catch (err) {
+            const code = (err as { code?: string }).code;
+            holderAlive = code !== 'ESRCH';
+          }
+          if (holderAlive) {
+            try {
+              process.stderr.write(
+                `agent-bridge: existing watcher pid=${holder} heartbeat fresh (age=${Date.now() - updatedAt}ms); this instance exiting without steal\n`,
+              );
+            } catch { /* best-effort */ }
+            try {
+              logEvent({
+                event: 'patch_f.backoff',
+                level: 'warn',
+                msg: 'Patch F: backing off because a healthy peer holds the watcher lease',
+                context: { holder, age_ms: Date.now() - updatedAt, pid: process.pid },
+              });
+            } catch { /* best-effort */ }
+            try {
+              mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
+              appendFileSync(
+                join(LOGS_DIR, 'mcp-server-sync-exit.log'),
+                JSON.stringify({
+                  ts: new Date().toISOString(),
+                  event: 'patch_f.backoff_exit',
+                  pid: process.pid,
+                  ppid: process.ppid,
+                  holder,
+                  age_ms: Date.now() - updatedAt,
+                }) + '\n',
+              );
+            } catch { /* best-effort */ }
+            process.exit(0);
+          }
+        }
+      }
+    } catch (err) {
+      // Best-effort. A malformed lease file is the watcher's problem and it
+      // already handles it on acquire.
+      try {
+        logEvent({
+          event: 'patch_f.check_error',
+          level: 'warn',
+          msg: 'Patch F: error checking existing lease (continuing)',
+          context: { error: String(err) },
+        });
+      } catch { /* best-effort */ }
+    }
+  }
+}
 
 // Global error handlers. Most errors are logged and swallowed so the server
 // stays up, BUT broken-pipe errors (EPIPE) mean the parent Claude process
@@ -237,27 +360,27 @@ async function main(): Promise<void> {
   initInbox();
 
   const localName = getLocalMachineName();
-  // 3.6.0: this MCP server is now tools-only by default. The session-scoped
-  // channel watcher lives in the agent-bridge-channel plugin
-  // (`claude-code-channel/`). Set AGENT_BRIDGE_ROLE=channel-owner explicitly
-  // to opt back into the legacy all-in-one behaviour (e.g. for non-Claude
-  // hosts like Codex or Gemini-CLI that don't run the channel plugin).
+  // 3.7.0 default flip: this MCP server is now channel-owner by default
+  // again (re-merging the 3.6.0 split). Set AGENT_BRIDGE_ROLE=tools-only
+  // explicitly to opt out — only useful for non-Claude hosts (OpenClaw,
+  // Codex, etc.) that want the bridge_* tools but DO NOT need to own the
+  // inbox watcher.
   logInfo(
     `agent-bridge mcp-server starting on "${localName}" `
-    + '(tools-only by default — channel watcher lives in the agent-bridge-channel plugin; '
-    + 'set AGENT_BRIDGE_ROLE=channel-owner to opt into the legacy all-in-one mode)',
+    + '(unified plugin: tools + channel watcher) '
+    + '— set AGENT_BRIDGE_ROLE=tools-only to disable the watcher for tools-only hosts',
   );
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: '3.6.3', pid: process.pid, nodeVersion: process.version },
+    context: { machineName: localName, version: VERSION, pid: process.pid, nodeVersion: process.version },
   });
 
-  // Create MCP server with channel capability
+  // Create MCP server with channel capability + tools capability.
   const server = new McpServer(
     {
       name: 'agent-bridge',
-      version: '3.6.3',
+      version: VERSION,
     },
     {
       capabilities: {
@@ -267,7 +390,7 @@ async function main(): Promise<void> {
         },
       },
       instructions: [
-        `You are connected to the agent-bridge channel plugin on machine "${localName}".`,
+        `You are connected to the agent-bridge unified plugin on machine "${localName}".`,
         'This server enables real-time communication between RUNNING AI agent sessions on different machines.',
         'It does NOT spawn new agent processes — it connects existing, already-running sessions.',
         '',
@@ -285,11 +408,12 @@ async function main(): Promise<void> {
         '- bridge_run_command: Run a shell command on a remote machine',
         '- bridge_clear_inbox: Clear all messages from the local inbox',
         '- bridge_inbox_stats: Get inbox statistics and watcher health',
+        '- claude_code_channel_status: Diagnostic — returns plugin pid/uptime/lease/version (rarely called directly)',
         '',
         'Communication flow:',
         '1. Machine A\'s Claude calls bridge_send_message to deliver a message to Machine B via SSH',
         '2. Machine B\'s file watcher detects the new message file',
-        '3. Machine B\'s channel plugin pushes the message into the running Claude session',
+        '3. Machine B\'s plugin pushes the message into the running Claude session',
         '4. Machine B\'s Claude sees it and responds via bridge_send_message back to Machine A using the incoming from_target when present; Claude Code-originated sends include from_target=claude-code by default',
         '',
         'All communication is authenticated via SSH keys (managed in ~/.agent-bridge/keys/).',
@@ -307,24 +431,77 @@ async function main(): Promise<void> {
     },
   );
 
-  // Register all tools
+  // Register all 7 user-facing bridge tools.
   registerTools(server);
 
-  // Watcher ownership (3.4.4+): only the process that is ACTUALLY meant to
-  // push `notifications/claude/channel` should watch `inbox/claude-code/` and
-  // call markDelivered(). Tool-only hosts (for example OpenClaw using this MCP
-  // server only for outbound bridge_* tools) must disable watching entirely.
-  // We now support explicit roles plus a single-owner lease with stale-lock
-  // recovery so a crashed/zombie session cannot permanently block the next run.
+  // 3.7.0 — `claude_code_channel_status` no-op informational tool.
+  // Originally added in 3.6.3 (Patch H) to keep a tool-only channel plugin
+  // alive in Claude Code's plugin host. With 3.7.0 unifying tools + channel,
+  // the plugin already has 7 user-facing tools that get called frequently —
+  // so this is no longer load-bearing for liveness. We keep it because it's
+  // a useful diagnostic probe (returns pid, uptime, watcher lease state,
+  // version). Not harmful, and the tool-registration test still asserts on
+  // it.
+  const TOOL_BOOT_TIME_MS = Date.now();
+  let toolCallsReceivedCount = 0;
+  server.registerTool(
+    'claude_code_channel_status',
+    {
+      title: 'Claude Code Channel Status',
+      description:
+        'Returns the current agent-bridge plugin status (pid, uptime, lease, version). '
+        + 'Used internally to verify the channel host is healthy. The bridge_send_message '
+        + 'tool is what you actually use to send messages.',
+    },
+    async () => {
+      toolCallsReceivedCount += 1;
+      const leasePath = join(
+        LOCKS_DIR,
+        `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`,
+      );
+      let lease: Record<string, unknown> | null = null;
+      let watcherActive = false;
+      try {
+        if (existsSync(leasePath)) {
+          const raw = readFileSync(leasePath, 'utf8');
+          const parsed = JSON.parse(raw) as Record<string, unknown>;
+          lease = parsed;
+          watcherActive = Number(parsed?.pid) === process.pid;
+        }
+      } catch {
+        // best-effort — never fail the tool because the lease file is in flux
+      }
+      const status = {
+        pid: process.pid,
+        ppid: process.ppid,
+        uptime_s: Math.floor(process.uptime()),
+        version: VERSION,
+        machine: localName,
+        watcher_active: watcherActive,
+        lease,
+        tool_boot_time_ms: TOOL_BOOT_TIME_MS,
+        tool_calls_received_count: toolCallsReceivedCount,
+      };
+      return {
+        content: [
+          { type: 'text' as const, text: JSON.stringify(status, null, 2) },
+        ],
+      };
+    },
+  );
+
+  // Watcher ownership.
   //
-  // 3.6.0 default flip: when AGENT_BRIDGE_ROLE is unset, default to
-  // 'tools-only'. The channel watcher now lives in the claude-code-channel
-  // plugin (a separate Claude Code plugin packaged at ../claude-code-channel/),
-  // whose lifetime matches the Claude Code session rather than the MCP tool
-  // turn. Setting AGENT_BRIDGE_ROLE=channel-owner explicitly remains
-  // supported as a legacy opt-in for non-Claude hosts that want the
-  // all-in-one behaviour.
-  const requestedBridgeRole = process.env.AGENT_BRIDGE_ROLE?.trim() || 'tools-only';
+  // 3.7.0: AGENT_BRIDGE_ROLE defaults to 'channel-owner' (re-merge of the
+  // 3.6.0 split). Setting AGENT_BRIDGE_ROLE=tools-only opts out — only
+  // useful for non-Claude hosts that want bridge_* tools but do NOT want to
+  // contend for the claude-code inbox lease.
+  //
+  // Lease arbitration (single owner with stale-lock recovery) lives in
+  // watcher.ts:tryAcquireWatcherLease — multiple agent-bridge processes can
+  // start, but only one holds the lease at any moment. Late starters go to
+  // standby and retry every 2 s.
+  const requestedBridgeRole = process.env.AGENT_BRIDGE_ROLE?.trim() || 'channel-owner';
   const parentCommandLine = readParentCommandLine();
   let bridgeRole = requestedBridgeRole;
   if (
@@ -354,6 +531,9 @@ async function main(): Promise<void> {
     process.env.AGENT_BRIDGE_DISABLE_WATCHER === '1'
     || bridgeRole === 'tools-only';
   let watcherStarted = false;
+  // Track the timestamp of the most recent channel push so signal evidence
+  // logging can report how recently the channel was active.
+  let lastNotificationAtMs: number | null = null;
 
   if (watcherDisabled) {
     logInfo(
@@ -369,24 +549,6 @@ async function main(): Promise<void> {
       },
     });
   } else {
-    // 3.6.0: bridgeRole always has a value here (defaults to 'tools-only' at
-    // env parse, can be set to 'channel-owner' as legacy opt-in). The pre-3.6
-    // implicit/auto branch is no longer reachable. We log channel-owner as a
-    // legacy notice so non-Claude hosts that opt in see what's happening.
-    if (bridgeRole === 'channel-owner') {
-      logWarn(
-        'Watcher running in legacy channel-owner mode. New Claude Code installs should use the '
-        + 'claude-code-channel plugin instead — this mode is retained for non-Claude hosts that do '
-        + 'not load the channel plugin (Codex, Gemini-CLI, etc).',
-      );
-      logEvent({
-        event: 'watcher.legacy_channel_owner',
-        level: 'warn',
-        msg: 'Watcher running in legacy channel-owner mode (claude-code-channel plugin not in use)',
-        context: { pid: process.pid },
-      });
-    }
-
     // Start the inbox file watcher with channel notification callback.
     // When new messages arrive, we push them into Claude's conversation
     // via the MCP channel notification protocol.
@@ -398,6 +560,7 @@ async function main(): Promise<void> {
         // Push the message into the running Claude session via channel notification.
         // This makes it appear as <channel source="agent-bridge" ...>content</channel>
         // in Claude's conversation — no polling needed.
+        lastNotificationAtMs = Date.now();
         logInfo(`Pushing channel notification for message ${message.id} from ${message.from}`);
         logEvent({
           event: 'message.pushed_to_channel',
@@ -431,11 +594,6 @@ async function main(): Promise<void> {
           },
         }).catch((err) => {
           logError(`Failed to push channel notification for ${message.id}: ${err}`);
-          // Kept for backward compatibility with 3.5.4 and earlier log
-          // consumers. The deliberate notification.push_failed event with
-          // decision=leave_pending_for_next_owner is emitted in watcher.ts
-          // (3.5.5+) once this rejection propagates back through the catch
-          // around savedChannelCallback().
           logEvent({
             event: 'message.push_failed',
             level: 'error',
@@ -471,10 +629,10 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  logInfo('agent-bridge MCP server connected and ready (channel mode)');
+  logInfo('agent-bridge MCP server connected and ready (unified tools + channel)');
   logEvent({
     event: 'server.ready',
-    msg: 'agent-bridge MCP server connected and ready (channel mode)',
+    msg: 'agent-bridge MCP server connected and ready (unified tools + channel)',
     context: { machineName: localName },
   });
 
@@ -593,12 +751,89 @@ async function main(): Promise<void> {
     }
   };
 
+  // 3.7.0 — Patch G (channel-owner SIGTERM ignore) is retained as
+  // defence-in-depth. The unified plugin should rarely face the original
+  // reaping issue (Claude Code's plugin host gates idle-reaping on tool-call
+  // frequency, and this plugin now exposes 7+ frequently-called tools), but
+  // keeping Patch G prevents transient host glitches from killing a healthy
+  // channel-owner watcher. Override with AGENT_BRIDGE_DISABLE_PATCH_G=1.
+  //
+  // SIGINT and SIGHUP remain explicit shutdown signals so users can still
+  // kill us with Ctrl-C or terminal hangup.
   const handleSignal = (signal: NodeJS.Signals) => {
-    syncExitBreadcrumb('signal.received', { signal, watcherStarted, bridgeRole, parent_alive: signalParentAlive() });
-    // Claude Code owns the MCP stdio child lifecycle. If it sends SIGTERM,
-    // treating that as a host-requested shutdown is the only reliable option:
-    // ignoring it causes Claude to escalate to SIGKILL, which cannot release
-    // the watcher lease or write diagnostics.
+    const parentAlive = signalParentAlive();
+    const stdinDestroyed = process.stdin.destroyed === true;
+    const stdinReadableEnded = process.stdin.readableEnded === true;
+    const lastNotifAgeMs = lastNotificationAtMs === null
+      ? null
+      : Date.now() - lastNotificationAtMs;
+
+    syncExitBreadcrumb('signal.received', {
+      signal,
+      watcherStarted,
+      bridgeRole,
+      parent_alive: parentAlive,
+      stdin_destroyed: stdinDestroyed,
+      stdin_readable_ended: stdinReadableEnded,
+      last_notification_at_ms: lastNotificationAtMs,
+      last_notification_age_ms: lastNotifAgeMs,
+      tool_calls_received_count: toolCallsReceivedCount,
+    });
+
+    try {
+      logEvent({
+        event: 'signal.evidence',
+        level: 'warn',
+        msg: `${signal} received — capturing evidence`,
+        context: {
+          signal,
+          pid: process.pid,
+          ppid: process.ppid,
+          parent_alive: parentAlive,
+          watcherStarted,
+          bridgeRole,
+          uptime_s: Math.floor(process.uptime()),
+          stdin_destroyed: stdinDestroyed,
+          stdin_readable_ended: stdinReadableEnded,
+          last_notification_at_ms: lastNotificationAtMs,
+          last_notification_age_ms: lastNotifAgeMs,
+          tool_calls_received_count: toolCallsReceivedCount,
+        },
+      });
+    } catch { /* never let logging break a signal handler */ }
+
+    if (
+      signal === 'SIGTERM'
+      && watcherStarted
+      && bridgeRole === 'channel-owner'
+      && parentAlive
+      && process.env.AGENT_BRIDGE_DISABLE_PATCH_G !== '1'
+    ) {
+      try {
+        process.stderr.write(
+          `agent-bridge: ${signal} ignored (channel-owner watcher healthy, parent ppid=${process.ppid} alive)\n`,
+        );
+      } catch { /* best-effort */ }
+      try {
+        logEvent({
+          event: 'signal.ignored_channel_owner',
+          level: 'warn',
+          msg: `${signal} ignored for channel-owner watcher`,
+          context: {
+            pid: process.pid,
+            parentPid: process.ppid,
+            watcherStarted,
+            uptime_s: Math.floor(process.uptime()),
+            stdin_destroyed: stdinDestroyed,
+            stdin_readable_ended: stdinReadableEnded,
+            last_notification_at_ms: lastNotificationAtMs,
+            last_notification_age_ms: lastNotifAgeMs,
+            tool_calls_received_count: toolCallsReceivedCount,
+          },
+        });
+      } catch { /* never let logging break a signal handler */ }
+      return;
+    }
     shutdown(signal);
   };
 
@@ -644,23 +879,6 @@ async function main(): Promise<void> {
     stdinErrored = { reason: `stdin error: ${err}` };
   });
 
-  // Parent-PID liveness watchdog.
-  //
-  // Motivation (2026-04-21 zombie incident): when a Claude Code session exits
-  // ungracefully (terminal killed, laptop sleep, crash), stdio 'end'/'close'
-  // events don't always fire on the MCP child. The child keeps running
-  // indefinitely. If the file watcher is still active, it continues to receive
-  // inbox files and markDelivered() them — but there's no Claude to push the
-  // channel into. Result: messages silently disappear.
-  //
-  // Design: check every 5s whether the ORIGINAL parent PID is still alive via
-  // kill(pid, 0). On ESRCH (process gone), shutdown. We deliberately DO NOT
-  // check for ppid reassignment — that false-positives when a shell wrapper
-  // exec-chains into node and the intermediate shell exits (ppid flips to 1
-  // even though the real owner is still alive).
-  //
-  // Opt-out: set AGENT_BRIDGE_DISABLE_PARENT_CHECK=1 for diagnostic scenarios
-  // (e.g. intentional detachment, debugging).
   // Periodic heartbeat (3.5.2+). Writes one line every 60s to the durable
   // mcp-server.log so a post-mortem can see EXACTLY when the process went
   // silent. Without this, a silent reaping leaves the log frozen at the last
@@ -688,7 +906,7 @@ async function main(): Promise<void> {
       });
     } catch { /* never let a heartbeat take us down */ }
   }, 60_000);
-  if (!(watcherStarted && bridgeRole === 'channel-owner')) {
+  if (!isChannelOwner) {
     heartbeatInterval.unref?.();
   }
 

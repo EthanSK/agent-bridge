@@ -304,7 +304,12 @@ function tryAcquireWatcherLease(role: string): WatcherLeaseAcquireResult {
         closeSync(fd);
       }
       const heartbeat = setInterval(renewWatcherLease, WATCHER_LEASE_HEARTBEAT_MS);
-      heartbeat.unref?.();
+      // 3.7.0 — refed for channel-owner mode (long-lived, must keep the
+      // event loop alive across idle gaps), unref'd for tools-only / auto
+      // mode (must NOT pin Node alive after stdio closes).
+      if (role !== 'channel-owner') {
+        heartbeat.unref?.();
+      }
       watcherLease = { filePath, heartbeat, meta };
       logInfo(`Watcher lease acquired for ${meta.target} (role=${role}, pid=${process.pid})`);
       logEvent({

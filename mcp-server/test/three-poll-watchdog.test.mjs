@@ -166,10 +166,13 @@ test('3.6.1: idle stdin (handshake delivered, pipe held open) does not trigger s
 test('3.6.1: SIGTERM still triggers clean shutdown (orphan watchdog not regressing other paths)', { timeout: 10_000 }, async () => {
   // Sanity — make sure removing the stdin_ended check didn't break the rest
   // of the lifecycle. Explicit SIGTERM must still drive shutdown promptly.
+  // 3.7.0: Patch G now ignores SIGTERM when parent is alive in channel-owner
+  // mode; disable it here so the test can exercise the SIGTERM shutdown path.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-sigterm-'));
   const server = startServer(home, {
     AGENT_BRIDGE_ROLE: 'channel-owner',
     AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+    AGENT_BRIDGE_DISABLE_PATCH_G: '1',
   });
   try {
     await sleep(800);

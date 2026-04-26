@@ -6,12 +6,14 @@
 #
 # Steps:
 #   1. git fetch + fast-forward pull on main
-#   2. npm install + npm run build in mcp-server/ (tools-only)
-#   3. npm install + npm run build in claude-code-channel/ (3.6.0+ channel host)
-#   4. sync any installed Claude Code plugin cache copies
-#   5. (optional) restart the OpenClaw gateway
-#   6. (macOS only) trigger /reload-plugins in the running Claude Code terminal
+#   2. npm install + npm run build in mcp-server/ (unified tools + channel)
+#   3. sync any installed Claude Code plugin cache copies
+#   4. (optional) restart the OpenClaw gateway
+#   5. (macOS only) trigger /reload-plugins in the running Claude Code terminal
 #      if ~/.claude/skills/self-reload-plugins is present
+#
+# 3.7.0+: the dedicated claude-code-channel package was deleted and merged
+# back into mcp-server/. There's nothing else to build for Claude Code.
 #
 # Usage:
 #   scripts/update.sh [--yes] [--skip-openclaw] [--skip-reload]
@@ -137,34 +139,15 @@ else
   popd >/dev/null
 fi
 
-# ---------- 3. Claude Code channel plugin rebuild (3.6.0+) ------------------
+# ---------- 3. Claude plugin cache sync -------------------------------------
 
 hr
-echo "==> Step 3/5: rebuild claude-code-channel"
+echo "==> Step 3/5: Claude plugin cache sync"
 
-if [[ ! -d "claude-code-channel" ]]; then
-  echo "no claude-code-channel/ dir — skipping (pre-3.6.0 layout)"
-else
-  pushd claude-code-channel >/dev/null
-  if [[ ! -f package.json ]]; then
-    echo "no claude-code-channel/package.json — skipping"
-  else
-    if (( NOTHING_CHANGED )) && [[ -d build ]]; then
-      echo "no new commits AND build/ already exists — skipping npm install+build"
-    else
-      echo "    running: npm install"
-      npm install --no-fund --no-audit
-      echo "    running: npm run build"
-      npm run build
-    fi
-  fi
-  popd >/dev/null
+# 3.7.0+: clean up any old claude-code-channel install if it's still around.
+if [[ -d "claude-code-channel" ]]; then
+  echo "    found legacy claude-code-channel/ dir — this was deleted in 3.7.0; ignoring"
 fi
-
-# ---------- 4. Claude plugin cache sync -------------------------------------
-
-hr
-echo "==> Step 4/6: Claude plugin cache sync"
 
 sync_cache_dir() {
   local cache_dir="$1"
@@ -194,7 +177,7 @@ fi
 # ---------- 5. OpenClaw gateway restart -------------------------------------
 
 hr
-echo "==> Step 5/6: OpenClaw gateway restart"
+echo "==> Step 4/5: OpenClaw gateway restart"
 
 if (( SKIP_OPENCLAW )); then
   echo "--skip-openclaw — skipping."
@@ -221,7 +204,7 @@ fi
 # ---------- 6. /reload-plugins via self-reload-plugins skill ----------------
 
 hr
-echo "==> Step 6/6: Claude Code /reload-plugins"
+echo "==> Step 5/5: Claude Code /reload-plugins"
 
 if (( SKIP_RELOAD )); then
   echo "--skip-reload — skipping."

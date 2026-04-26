@@ -223,27 +223,27 @@ If the agent-bridge MCP server is configured, you have direct access to these to
 | `bridge_clear_inbox` | Clear the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics and watcher health |
 
-### Claude Code channel plugin (3.6.0+)
+### Claude Code unified plugin (3.7.0+)
 
-For Claude Code, agent-bridge ships **two cooperating plugins**:
+For Claude Code, agent-bridge ships **one unified plugin** at `mcp-server/`. It hosts both:
 
-- **`agent-bridge`** — tools-only MCP server (`mcp-server/`). Exposes the `bridge_*` tools. Respawned per turn by the MCP plugin host.
-- **`agent-bridge-channel`** — long-lived channel host (`claude-code-channel/`). Owns the `~/.agent-bridge/locks/claude-code.watcher-lock.json` lease, polls `inbox/claude-code/`, and emits `notifications/claude/channel` for the whole Claude session. Models the Telegram plugin's session-scoped lifetime.
+- The 7 user-facing `bridge_*` tools (and the diagnostic `claude_code_channel_status` no-op tool).
+- The long-lived inbox watcher that owns the `~/.agent-bridge/locks/claude-code.watcher-lock.json` lease, polls `inbox/claude-code/`, and emits `notifications/claude/channel` back to the running session.
 
 Incoming messages are pushed directly into the conversation as:
 ```
 <channel source="agent-bridge" from="MachineName" message_id="..." ts="...">content</channel>
 ```
-No polling needed — respond using `bridge_send_message` (from the tools-only server).
+No polling needed — respond using `bridge_send_message`.
 
-The two plugins coordinate exclusively via the filesystem (inbox subdir + lease file). Pre-3.6.0 the watcher lived inside the same MCP child as the tools, which meant the watcher died whenever Claude Code reaped the MCP child between turns or on `/reload-plugins`. The 3.6.0 split fixes that root cause; see `docs/3.6.0-channel-plugin-migration.md` for the full rationale.
+**Why one plugin?** 3.6.0 split the channel host into a separate `claude-code-channel` plugin assuming "channel-only plugins survive longer in Claude's plugin host." That was empirically wrong — the host gates idle reaping on **MCP tool-call frequency on stdio JSON-RPC**. Telegram (also a channel plugin) survives indefinitely because its 4 tools (`reply`, `react`, `download_attachment`, `edit_message`) get called constantly. A channel-only plugin gets reaped after every notification delivery, and Patches G/H (SIGTERM ignore + no-op tool) didn't fix the root cause. 3.7.0 re-merged everything into one plugin so every `bridge_send_message` call resets the host's idle counter — same lifetime guarantees as Telegram. See `CHANGELOG.md` for the full rationale.
 
 ### Messaging workflow
 
 For Claude Code push:
 1. Machine A's agent calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code" })`
 2. The message is written to Machine B's `~/.agent-bridge/inbox/claude-code/<id>.json` via SSH
-3. Machine B's `agent-bridge-channel` plugin watcher detects the new file and emits `notifications/claude/channel` into the running Claude session
+3. Machine B's `agent-bridge` plugin watcher detects the new file and emits `notifications/claude/channel` into the running Claude session
 4. Machine B responds via `bridge_send_message` back to Machine A with an explicit `target`
 
 For OpenClaw push, the gateway loads `openclaw-channel/`, watches `inbox/openclaw/<target>/`, and injects inbound messages into the matching running OpenClaw/Telegram session. Codex/Gemini/Aider inbound receive/reply loops remain scaffolded until tested end-to-end; `bridge_receive_messages` is only a manual Claude Code-target inbox fallback today.
@@ -253,13 +253,9 @@ For OpenClaw push, the gateway loads `openclaw-channel/`, watches `inbox/opencla
 ```bash
 cd ~/Projects/agent-bridge/mcp-server
 npm install && npm run build
-
-# 3.6.0+: also build the channel plugin if you're on Claude Code
-cd ~/Projects/agent-bridge/claude-code-channel
-npm install && npm run build
 ```
 
-Register in your harness's MCP configuration. For Claude Code, install BOTH plugins from the local marketplace (`agent-bridge` for tools, `agent-bridge-channel` for channel push). For non-Claude harnesses (Codex, Gemini-CLI, Aider, OpenClaw), just register the tools-only MCP server:
+Register in your harness's MCP configuration. For Claude Code, install the unified `agent-bridge` plugin from the local marketplace. For non-Claude harnesses (Codex, Gemini-CLI, Aider, OpenClaw), register the same MCP server with `AGENT_BRIDGE_ROLE=tools-only` if you don't want it to contend for the claude-code inbox lease:
 
 ```json
 {
@@ -273,7 +269,7 @@ Register in your harness's MCP configuration. For Claude Code, install BOTH plug
 }
 ```
 
-To opt into the legacy all-in-one mode (pre-3.6.0 behaviour, watcher lives inside the MCP child), set `AGENT_BRIDGE_ROLE=channel-owner` instead. Most setups should leave this alone.
+The default role (when `AGENT_BRIDGE_ROLE` is unset) is `channel-owner` — it acquires the inbox lease and pushes channel notifications. Tools-only mode is for non-Claude hosts that just need the outbound `bridge_*` tools.
 
 ## Troubleshooting
 

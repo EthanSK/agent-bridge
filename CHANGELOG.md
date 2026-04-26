@@ -1,5 +1,151 @@
 # Changelog
 
+## agent-bridge 3.7.0 — 2026-04-26
+
+### Undo 3.6.0 split: combine tools + channel into one plugin (Telegram pattern)
+
+3.7.0 reverses the 3.6.0 plugin split. The dedicated `claude-code-channel`
+plugin is **deleted** and its responsibilities (long-lived inbox watcher +
+channel push) are merged BACK into the `agent-bridge` MCP server. There is
+now exactly one Claude Code plugin: `agent-bridge`, hosting both the 7
+user-facing `bridge_*` tools and the `notifications/claude/channel`
+push pipeline in a single process.
+
+#### Why we're doing this — 3.6.0 was based on incomplete root-cause analysis
+
+3.6.0 split the channel watcher out of the MCP server into its own plugin
+(`claude-code-channel`) on the assumption that "channel-only plugins survive
+longer in Claude Code's plugin host than tool MCP children." That assumption
+proved empirically wrong:
+
+- 3.6.0: split shipped. Channel plugin still got reaped within minutes.
+- 3.6.1: stopped treating idle stdin as an orphan signal. Reaping continued.
+- 3.6.2: Patch G — channel-owner ignores SIGTERM when parent is alive. Host
+  escalated to uncatchable SIGKILL ~2 s later (Mac Mini production evidence,
+  2026-04-26 12:26 BST: pid 89205 SIGTERM-ignored at 12:26:36Z, gone by next
+  poll). Patch G survives the first stage of two-stage termination but not
+  the second.
+- 3.6.3: Patch H — register a no-op MCP tool (`claude_code_channel_status`)
+  on the assumption that tool registration alone tells the host "I'm
+  interactive, don't reap me." Reaping continued. Production logs showed the
+  no-op tool was never called by the running session, so registration alone
+  did NOT cross whatever liveness threshold the host actually checks.
+
+The Mac Mini deployment continued to lose channel delivery roughly every
+session-internal idle window, regardless of patches.
+
+#### What the host actually gates on
+
+Telegram (also a channel plugin) survives 21+ hours indefinitely. Telegram
+registers four MCP tools (`reply`, `react`, `download_attachment`,
+`edit_message`) — and crucially, **those tools get called constantly** during
+normal Telegram use. Every reaction, reply, voice-note download, and edit is
+an MCP tool call on stdio JSON-RPC. The plugin host's idle-reaper is gated
+on **MCP tool-call frequency**, not on tool registration alone. A registered
+tool that's never called is functionally invisible to the host.
+
+3.6.3's `claude_code_channel_status` tool was almost never called (Claude
+Code agents prefer `bridge_send_message` for actual work), so the channel
+plugin still presented as idle to the host. Patches G and H bought a few
+seconds at best before the SIGKILL escalation.
+
+#### The fix: one plugin, frequently-called tools
+
+Merge everything back. With the unified plugin:
+
+- Every `bridge_send_message` an agent sends resets the host's idle counter.
+- Every `bridge_status` / `bridge_inbox_stats` poll resets the counter.
+- The channel watcher and channel push live in the same process, so
+  inbound messages are delivered without a second plugin lifecycle to manage.
+
+This is precisely how Telegram works. Same pattern, same lifetime
+guarantees. The channel-only architecture was a wrong turn.
+
+#### Architecture changes
+
+- **One plugin.** `agent-bridge` (the existing tools-only plugin name).
+  Hosts BOTH the 7 user-facing tools AND the channel watcher. Channel
+  capability is declared via `experimental.claude/channel`. Default
+  `AGENT_BRIDGE_ROLE` is now `channel-owner` (acquires the inbox lease at
+  startup and pushes channel notifications). `tools-only` remains supported
+  for non-Claude hosts (OpenClaw / Codex / Gemini-CLI sidekicks that just
+  want outbound bridge_* tools without contending for the lease).
+- **Lifecycle improvements retained from 3.5.x → 3.6.x.** Persistent stderr
+  tee (Patch B), 60s heartbeat (refed when channel-owner), shutdown_diag
+  with handles dump, syncExitBreadcrumb to durable log, 3-poll orphan
+  watchdog (15s confirmation across `parent dead` OR `stdin destroyed` OR
+  `stdin errored`), Patch F (heartbeat-recency guard against parallel
+  subagent spawn), Patch G (channel-owner SIGTERM ignore — kept as
+  defence-in-depth even though tool-call frequency now does the heavy
+  lifting), sibling-MCP step-down via lease file, fatalTransportExit on
+  stdout EPIPE.
+- **`claude_code_channel_status` no-op tool retained.** From 3.6.3. No
+  longer load-bearing for liveness, but useful as a status diagnostic — it
+  returns `pid`, `ppid`, `uptime_s`, `version`, `machine`, `watcher_active`,
+  `lease`, `tool_calls_received_count`, `tool_boot_time_ms`. The
+  `signal.evidence` event from 3.6.3 is also retained, with the same
+  forensic fields.
+- **Lease heartbeat refed for channel-owner.** `mcp-server/src/watcher.ts`'s
+  lease-renewal interval is now refed when `role === 'channel-owner'`
+  (previously always unref'd). The unified plugin must keep the event loop
+  alive across idle gaps — same posture as the 3.6.0 channel plugin had.
+
+#### Migration steps
+
+After updating to 3.7.0:
+
+1. `claude plugin uninstall agent-bridge-channel@agent-bridge` — drops the
+   now-deleted plugin from your install.
+2. `claude plugin install agent-bridge@agent-bridge` — reinstalls the
+   unified plugin so the cache reflects 3.7.0.
+3. **Update your launch alias.** Remove
+   `--dangerously-load-development-channels plugin:agent-bridge-channel@agent-bridge`
+   from your `claude-tel` (or equivalent) alias. Only
+   `--dangerously-load-development-channels plugin:agent-bridge@agent-bridge`
+   is needed now.
+4. Restart your Claude session. The unified plugin spawns once and stays
+   alive throughout (same lifetime as Telegram).
+
+The on-disk wire format is unchanged — `BridgeMessage` JSON shape, the
+per-target inbox subdir layout, the `.delivered` / `.processed` ledgers,
+the watcher lease path/format, and the SCP outbound path all match
+3.6.x byte-for-byte. A 3.6.x peer (running both plugins) and a 3.7.0 peer
+(running the unified plugin) interoperate fully — the lease file mediates
+ownership when both are present transiently on the same machine.
+**Per-machine rollout is supported**: upgrade Mac Mini to 3.7.0 while MBP
+stays on 3.6.x and messages flow both ways throughout.
+
+#### Files touched
+
+- **Deleted:** `claude-code-channel/` (the entire package — `src/`, `test/`,
+  `package.json`, `package-lock.json`, `.mcp.json`, `.claude-plugin/`,
+  `README.md`, `tsconfig.json`, `build/`, `node_modules/`).
+- **Updated:** `mcp-server/src/index.ts` — combined channel-owner and
+  tools-only paths into one entry point. Default role flipped to
+  `channel-owner`. Patches F, G, and H ported in. Heartbeat refed for
+  channel-owner. `claude_code_channel_status` tool registered. `signal.evidence`
+  event emitted on every signal arrival.
+- **Updated:** `mcp-server/src/watcher.ts` — lease heartbeat refed for
+  channel-owner role.
+- **Updated:** `mcp-server/.mcp.json` — removed `AGENT_BRIDGE_ROLE=tools-only`
+  env block (default is now `channel-owner`).
+- **Updated:** `mcp-server/package.json`,
+  `mcp-server/.claude-plugin/plugin.json` — version bumped to 3.7.0,
+  description updated to reflect unified posture.
+- **Updated:** `.claude-plugin/marketplace.json` — removed
+  `agent-bridge-channel` entry; updated `agent-bridge` description.
+- **Updated:** `agent-bridge` (bash CLI) — `VERSION="3.7.0"`.
+- **Updated:** `scripts/update.sh` — dropped step 3 (rebuild
+  claude-code-channel); renumbered remaining steps.
+- **Updated:** `README.md`, `INSTRUCTIONS.md`, `AGENTS.md` — replaced
+  3.6.0 split docs with 3.7.0 unified plugin docs and migration notes.
+- **Updated:** `mcp-server/test/heartbeat-shutdown-diag.test.mjs`,
+  `mcp-server/test/three-poll-watchdog.test.mjs` — version assertions bumped
+  to 3.7.0; channel-owner SIGTERM tests opt out of Patch G.
+- **New:** `mcp-server/test/unified-channel.test.mjs` — Patch F backoff,
+  Patch G SIGTERM ignore, Patch H tool registration + tools/list / tools/call,
+  end-to-end inbox delivery via the unified watcher.
+
 ## agent-bridge 3.6.3 — 2026-04-26
 
 ### Register no-op MCP tool to prevent channel-plugin reaping

@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "agent-bridge-channel": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/build/index.js"]
-    }
-  }
-}

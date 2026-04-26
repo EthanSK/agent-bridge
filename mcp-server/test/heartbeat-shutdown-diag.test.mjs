@@ -78,7 +78,7 @@ test('server.shutdown_diag dumps active handles and request counts on shutdown',
     const events = await readEvents(home);
     const starting = events.find((e) => e.event === 'server.starting');
     assert.ok(starting, 'expected server.starting event');
-    assert.equal(starting.context.version, '3.6.3', 'startup event should report version 3.6.3');
+    assert.equal(starting.context.version, '3.7.0', 'startup event should report version 3.7.0');
 
     const diag = events.find((e) => e.event === 'server.shutdown_diag');
     assert.ok(diag, 'expected server.shutdown_diag event on shutdown');
@@ -159,6 +159,10 @@ test('3.6.1: channel-owner survives idle stdin and shuts down cleanly on SIGTERM
   const server = startServer(home, {
     AGENT_BRIDGE_ROLE: 'channel-owner',
     AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+    // Patch G ignores SIGTERM when parent is alive; in unit tests the test
+    // runner IS the parent, so SIGTERM would be ignored. Disable Patch G
+    // so the SIGTERM-driven shutdown path can be exercised here.
+    AGENT_BRIDGE_DISABLE_PATCH_G: '1',
   });
   const lockPath = join(home, '.agent-bridge', 'locks', 'claude-code.watcher-lock.json');
   try {
