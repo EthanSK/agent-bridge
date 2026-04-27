@@ -414,12 +414,28 @@ v2 adds an MCP server that enables running AI agent sessions to communicate dire
 | `bridge_list_machines` | List paired machines and their connection details |
 | `bridge_status` | Check if a machine is reachable via SSH (single or all) |
 | `bridge_send_message` | Send a message to a running agent on another machine |
-| `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox (not needed in normal push mode). 3.8.0+ supports long-poll (`wait: true`, `timeout_seconds`) for subagents — see "Push vs polling" above. |
+| `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox (not needed in normal push mode). 3.8.0+ supports long-poll: pass `wait: true` to block until a new message arrives, `timeout_seconds` (default 30, server cap 60) to bound the wait. On timeout the tool returns `{ count: 0, messages: [], timed_out: true }`. See ["Subagent receive pattern"](#subagent-receive-pattern-380) below. |
 | `bridge_run_command` | Run a shell command on a remote machine via SSH |
 | `bridge_clear_inbox` | Clear all messages from the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics: pending count, oldest message age, watcher health, etc. |
 
 > **Note:** The MCP server does NOT spawn new agent processes. It enables _existing running_ agent sessions to communicate. Machine A's agent sends a message to Machine B's inbox, and Machine B's already-running agent picks it up via Claude Code channel push, the OpenClaw native channel plugin, or a manual `bridge_receive_messages` fallback where that harness has been explicitly wired and tested.
+
+### Subagent receive pattern (3.8.0+)
+
+Channel-push notifications (`<channel source="agent-bridge" ...>`) reach the **parent** Claude Code session, not subagents spawned by the Task tool. A subagent that needs to wait for a bridge reply should long-poll `bridge_receive_messages`:
+
+```js
+// In a subagent that needs to receive replies:
+while (true) {
+  const res = await bridge_receive_messages({ wait: true, timeout_seconds: 30, peek: true });
+  if (res.timed_out) continue;  // re-poll
+  // process res.messages...
+  break;
+}
+```
+
+`wait: true` makes the MCP tool block until a new message arrives in `inbox/claude-code/` or the timeout fires (server caps `timeout_seconds` at 60). On timeout, the response is `{ count: 0, messages: [], timed_out: true }`. The watcher's in-process arrival registry broadcasts to every concurrent waiter (parent + N subagents), so use `peek: true` to leave the file in place for the parent's channel-push consumer to also see; `peek: false` is destructive first-come-first-served. For real fan-out to a specific subagent, send each subagent a unique `from_target` so replies route to per-subagent inbox subdirs.
 
 ### Same-machine delivery (3.5.0+)
 

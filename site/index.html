@@ -52,7 +52,7 @@
           </span>
           <span class="logo-copy">
             <span class="logo-title">
-              agent-bridge <span class="logo-version">v3.5.0</span>
+              agent-bridge <span class="logo-version">v3.8.0</span>
             </span>
             <span class="logo-sub">channel-mode · peer-to-peer · SSH</span>
           </span>
@@ -69,7 +69,7 @@
       <header class="hero wrap">
         <div class="hero-meta reveal reveal-1">
           <span><span class="dot" aria-hidden="true"></span> channel open</span>
-          <span class="ver">v3.5.0</span>
+          <span class="ver">v3.8.0</span>
           <span>Claude Code + OpenClaw</span>
           <span>tested end-to-end</span>
         </div>
@@ -414,7 +414,7 @@
           </div>
           <div class="tool">
             <div class="tool-name">bridge_receive_messages</div>
-            <p>Manually inspect/consume the local Claude Code-target inbox. Usually not needed under Claude Code push; useful for diagnostics, tools-only setups, and future polling experiments. Supports <code>peek</code> for non-destructive reads.</p>
+            <p>Manually inspect/consume the local Claude Code-target inbox. Usually not needed under Claude Code push; useful for diagnostics, tools-only setups, and (3.8.0+) <strong>subagent long-poll</strong> &mdash; pass <code>wait: true, timeout_seconds: 30</code> to block until a new message arrives. Supports <code>peek</code> for non-destructive reads.</p>
           </div>
           <div class="tool">
             <div class="tool-name">bridge_list_machines</div>
@@ -537,6 +537,18 @@
         <h2 class="section-title">What&rsquo;s <span class="accent">new.</span></h2>
         <ul class="changelog-list">
           <li class="cl-item">
+            <div class="cl-version">3.8.0</div>
+            <div class="cl-body">
+              <strong>Long-poll receive for subagents.</strong> <code>bridge_receive_messages</code> now accepts <code>wait: true</code> and <code>timeout_seconds</code> (default 30, server cap 60) so a subagent &mdash; which doesn&rsquo;t see the parent&rsquo;s <code>&lt;channel&gt;</code> pushes &mdash; can block on the inbox until a new message lands. Broadcast semantics: parent + every subagent waiting all wake on the same arrival; pair with <code>peek: true</code> so the parent&rsquo;s channel-push consumer still sees the file.
+            </div>
+          </li>
+          <li class="cl-item">
+            <div class="cl-version">3.7.0</div>
+            <div class="cl-body">
+              <strong>Unified plugin (undo of 3.6.0 split).</strong> Tools and channel run inside a single MCP stdio child again. Production evidence showed Claude Code&rsquo;s plugin host gates idle reaping on tool-call frequency &mdash; a channel-only plugin gets reaped after every notification regardless of SIGTERM ignore. Frequent <code>bridge_*</code> calls now keep the watcher alive (same lifetime model as Telegram).
+            </div>
+          </li>
+          <li class="cl-item">
             <div class="cl-version">3.5.0</div>
             <div class="cl-body">
               <strong>Same-machine delivery + Claude watcher recovery.</strong> Local/self/localhost sends now land directly in the local target inbox with no SSH loopback, and Claude Code channel-capable standbys can promote when the active watcher owner goes stale.
@@ -586,7 +598,7 @@
             <circle cx="25" cy="16" r="3.5" fill="#4dd0e1"/>
             <path d="M11 16 L21 16" stroke="#ff7a1a" stroke-width="1.3" stroke-dasharray="2 2"/>
           </svg>
-          <span>agent-bridge / v3.5.0</span>
+          <span>agent-bridge / v3.8.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/EthanSK/agent-bridge" target="_blank" rel="noopener">GitHub</a>
