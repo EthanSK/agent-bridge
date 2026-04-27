@@ -417,7 +417,23 @@ Write-Host "If using Tailscale, also share your tailnet IP after `tailscale up`:
 
 After this completes, share `user@LAN_IP:22` (or `user@TAILSCALE_IP:22`) with the agent on the other machine and let it run `agent-bridge pair --name "<windows-machine-name>" --host <ip> --port 22 --user <user> --token <token-from-other-side> --pubkey "<windows-side-pubkey>"`.
 
-The Windows side currently doesn't run the `agent-bridge` CLI itself — it only needs to be a reachable SSH endpoint. Pairing/messaging is driven from the macOS or Linux peer.
+### Running the `agent-bridge` CLI on Windows
+
+Pairing/messaging can be driven from either side. The Windows machine can be a passive SSH endpoint (the path above) **or** run the `agent-bridge` CLI itself via Git Bash:
+
+```powershell
+# 1. Install Git for Windows (provides Git Bash + bundled SSH tools)
+winget install --id Git.Git -e --accept-source-agreements --accept-package-agreements
+
+# 2. Install agent-bridge (no admin needed — installs to %LOCALAPPDATA%\agent-bridge\bin)
+irm https://raw.githubusercontent.com/EthanSK/agent-bridge/main/install.ps1 | iex
+
+# 3. Open a NEW PowerShell window (PATH update only applies to new shells)
+agent-bridge --version
+agent-bridge setup
+```
+
+The installer drops the bash `agent-bridge` script and an `agent-bridge.cmd` shim (which invokes Git Bash) into `%LOCALAPPDATA%\agent-bridge\bin\` and adds that directory to the user PATH. After install, `agent-bridge` works from PowerShell, Command Prompt, or Git Bash itself.
 
 ---
 

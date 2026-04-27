@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Windows install path (cross-platform CLI)
+
+The `agent-bridge` bash script already runs unmodified on Windows under Git Bash — all required tools (`ssh`, `ssh-keygen`, `scp`, `ssh-keyscan`, `tar`, `base64`, `openssl`) ship with Git for Windows or Windows OpenSSH, and the script's existing `command -v jq` checks fall through cleanly when `jq` isn't present. Two new files make that usable from any Windows shell:
+
+- `agent-bridge.cmd` — thin shim at the repo root that detects Git Bash and invokes `bash agent-bridge "$@"`. Lets users call `agent-bridge` from PowerShell or Command Prompt, not just Git Bash.
+- `install.ps1` — PowerShell 5.1+ installer that downloads `agent-bridge` + `agent-bridge.cmd` into `%LOCALAPPDATA%\agent-bridge\bin\` and adds the directory to the user PATH. No administrator privileges required.
+
+Quick install on Windows:
+
+```powershell
+winget install --id Git.Git -e   # one-time, if Git Bash isn't present
+irm https://raw.githubusercontent.com/EthanSK/agent-bridge/main/install.ps1 | iex
+```
+
+Removes the previous "Windows side doesn't run the agent-bridge CLI itself" caveat — it now does. Pairing flows can be driven from either side.
+
 ## agent-bridge 3.8.0 — 2026-04-26
 
 ### Long-poll / blocking receive (`bridge_receive_messages`)
