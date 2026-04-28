@@ -591,6 +591,143 @@ If you don't want the plugin marketplace machinery — e.g. on a non-Claude-Code
 
 Note: this exposes the `bridge_*` tools but does **not** wire up the Claude Code channel push (the `claude/channel` capability is only emitted when the same process is loaded as a plugin in a Claude Code session). For agent-to-agent push semantics, prefer the plugin route.
 
+#### `extraKnownMarketplaces` alone is NOT enough
+
+A subtle gotcha: declaring the marketplace in `settings.json` is necessary but **not sufficient**. Claude Code's plugin loader requires the plugin to actually be *installed* (registered + cached), not just declared. If only the `extraKnownMarketplaces` block is present, `claude /doctor` reports:
+
+```
+Plugin Agent Bridge not found in Marketplace
+```
+
+…and the MCP child never spawns. The full registration takes two CLI steps:
+
+```powershell
+# Run in a regular shell (not Claude Code itself)
+claude plugin marketplace add C:\Users\<you>\path\to\agent-bridge
+claude plugin install agent-bridge@agent-bridge
+```
+
+Both `install.ps1` and `install.sh` perform these steps automatically when run from a local clone (commit `50c560f`+). If you installed via the `irm | iex` one-liner from a non-cloned location, clone the repo and re-run the installer to trigger plugin registration — the one-liner alone cannot register the marketplace because it has no source path to point at.
+
+#### Plugin cache directory naming
+
+After `claude plugin install`, Claude Code copies the plugin into `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/` and **loads the MCP server from THERE, not from the marketplace source path**. The `<version>` directory name is captured from the plugin manifest at install time — version bumps in the source repo do **not** auto-rename the cache dir. This causes confusion when, for example, a `git pull` brings in 3.9.0 source but the cache dir is still named `3.8.0/` and contains a mix of old + new files (or stale `build/` output).
+
+To force a clean cache refresh after pulling new versions:
+
+```powershell
+claude plugin update agent-bridge@agent-bridge
+```
+
+This re-copies the source into a fresh cache dir matching the new manifest version. Combine with a full Claude Code restart to ensure the running MCP child is actually the new code (the previous `node mcp-server/build/index.js` process keeps the old module loaded in memory until it dies).
+
+### Stale watcher-lease recovery
+
+The MCP child that owns channel-push has a self-recorded PID in `~/.agent-bridge/locks/claude-code.watcher-lock.json`. If that PID dies abnormally without releasing the lease (Claude Code crash, force-kill, OS reboot mid-session), the next MCP child to start will:
+
+1. Detect the recorded PID is dead via `process.kill(pid, 0)` returning ESRCH.
+2. Notice the heartbeat `updatedAt` is stale (> 90 s old).
+3. Reap the stale lease and claim channel-owner role.
+
+That auto-recovery covers the clean case. The pathological case is when the recorded PID is still alive but it isn't the actual channel-owner — e.g. an old MCP child orphaned by a previous Claude Code session, or a `bun`/`node` process surviving past its parent. In that case the new spawn falls back to **tools-only** role: `bridge_send_message` works, but inbound messages stage in `inbox/.pending-ack/<target>/` forever and never reach the running Claude session.
+
+Symptoms:
+- `bridge_send_message` succeeds in the sender, the file lands on the receiver's disk under `~/.agent-bridge/inbox/.pending-ack/claude-code/<id>.json`.
+- The receiver's Claude session never sees a `<channel source="agent-bridge" ...>` block.
+- `bridge_inbox_stats` reports a non-zero pending count that never drains.
+
+Recovery:
+
+```powershell
+# 1. Find and inspect the recorded lease
+Get-Content $env:USERPROFILE\.agent-bridge\locks\claude-code.watcher-lock.json
+
+# 2. Look for orphaned bun/node processes whose parent is no longer Claude
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -match 'bun|node' } |
+  Select-Object ProcessId, ParentProcessId, CreationDate, CommandLine |
+  Format-List
+
+# 3. Restart Claude Code FULLY (exit + relaunch).
+#    /reload-plugins alone does NOT respawn the MCP child holding the
+#    in-memory module — only a full session bounce will.
+```
+
+Do **not** manually kill the suspected orphan with `Stop-Process` mid-session — on Claude Code that severs the MCP transport for any *other* plugins (Telegram, etc.) connected through the same parent, requiring a Claude Code restart anyway. Just restart the whole session.
+
+### Pending-ack delivery model (3.9.0+)
+
+Pre-3.9.0, the watcher archived every inbound message the moment `notifications/claude/channel` was written to stdout. Stdout-write success is **not** proof the receiving Claude harness rendered the message into its conversation context, and a crashing/dying child silently dropped messages — Windows reproduced 6 silent drops in one session under that model.
+
+3.9.0 introduces a hybrid pending-ack scheme. Every push goes through a per-target staging dir before archive:
+
+| Directory | Purpose |
+|-----------|---------|
+| `~/.agent-bridge/inbox/<target>/<id>.json` | Inbound, not yet pushed. |
+| `~/.agent-bridge/inbox/.pending-ack/<target>/<id>.json` | Pushed to stdout, awaiting render confirmation. Sidecar `<id>.meta.json` carries `pushedAt`, retry count, listener-count snapshot. |
+| `~/.agent-bridge/inbox/.archive/<target>/<id>.json` | Confirmed delivered (alive-evidence + ≥ 5 s elapsed). |
+| `~/.agent-bridge/inbox/.failed/.exhausted/<id>.json` | Retry cap (3) exceeded — channel is presumed dead. |
+
+A poll-cycle tick (~2 s cadence) decides between three actions per pending entry:
+
+- **Finalize** if `pushedAt > 5 s` ago AND alive-evidence is present (a tool call landed after `pushedAt`, OR a `bridge_receive_messages` long-poll listener is currently parked, OR the channel-callback was re-registered post-push). Move file to `.archive/`.
+- **Re-inject** if `pushedAt > 60 s` ago AND no alive-evidence. Move file back to `inbox/<target>/` for another push attempt; increment retries.
+- **Exhaust** if retries hit 3. Move file to `.failed/.exhausted/` and emit `channel.pending_exhausted`.
+
+An additional **escape-hatch** trips when 5+ pushes within 30 s yield zero alive-evidence: the channel is flagged dead, future emissions skip the JSON-RPC notification entirely and stage straight to `.pending-ack/` for the next plugin reload to replay (`channel.dead_escape_hatch` event).
+
+This means a crashed/zombie MCP child or a rendering-broken Claude session no longer silently drops messages — they accumulate in `.pending-ack/` and replay on the next clean watcher startup. Senders see no behavior change. **Versions 3.8.0 and 3.8.1 contained an unrelated SFTP `-E` flag bug** that broke cross-platform sends on macOS and older Windows OpenSSH; if you're still on 3.8.x, upgrade to ≥ 3.8.2 (`b08160c`).
+
+### Surfshark / VPN DNS hijack vs Tailscale
+
+Surfshark (and similar consumer VPNs that ship their own DNS resolvers) hijacks DNS for `controlplane.tailscale.com`, returning sinkhole IPs in the `192.200.0.0/16` range. The Tailscale daemon's first task on `tailscale up` is to reach `controlplane.tailscale.com` to register the device — when DNS returns a sinkhole IP, the connection silently times out and the browser auth URL never opens. Symptoms:
+
+- `tailscale up` hangs without printing a login URL.
+- `Resolve-DnsName controlplane.tailscale.com` returns `192.200.0.x` instead of a real `*.tailscale.com` AAAA/A record.
+- `tailscale status` shows `NoState` indefinitely.
+
+Two workarounds:
+
+1. **Disconnect Surfshark for the auth step.** Run `tailscale up`, complete the browser auth, wait for `tailscale status` to show `Logged in` and an assigned `100.x.y.z` IP, then re-enable Surfshark. The persistent auth state survives the VPN reconnect.
+2. **Surfshark Bypasser exemption.** Add `tailscaled.exe` (the daemon binary, typically `C:\Program Files\Tailscale\tailscaled.exe`) plus the hostnames `controlplane.tailscale.com` and `login.tailscale.com` to Surfshark's Bypasser list. This routes Tailscale traffic outside the VPN tunnel.
+
+Mullvad and other DNS-hijacking VPNs exhibit identical symptoms — same workaround applies.
+
+### Cold-bootstrap (one manual auth click)
+
+Tailscale's CLI does not include a subcommand to mint auth keys — that operation lives behind the admin API (PAT or OAuth client). Without preconfigured credentials, a brand-new device joining the tailnet for the first time **must** complete one browser-based auth click. There is no fully-zero-touch flow available from `tailscale up` alone.
+
+For repeat-friendly automated provisioning, generate a one-time Personal Access Token from the Tailscale admin console (`https://login.tailscale.com/admin/settings/keys`), then mint reusable auth keys via the API:
+
+```powershell
+$pat = '<your-pat>'
+$tailnet = '<your-tailnet>'
+$body = @{
+  capabilities = @{
+    devices = @{
+      create = @{
+        reusable = $true
+        ephemeral = $false
+        preauthorized = $true
+        tags = @('tag:bridge')
+      }
+    }
+  }
+  expirySeconds = 7776000  # 90 days
+} | ConvertTo-Json -Depth 5
+
+$auth = "Bearer $pat"
+$resp = Invoke-RestMethod -Method Post `
+  -Uri "https://api.tailscale.com/api/v2/tailnet/$tailnet/keys" `
+  -Headers @{ Authorization = $auth } `
+  -ContentType 'application/json' `
+  -Body $body
+
+$resp.key  # tskey-auth-... — feed this to `tailscale up --auth-key=...`
+```
+
+Subsequent devices can join with `tailscale up --auth-key=$key --hostname=<name>` and skip the browser entirely. The PAT itself still requires a one-time click in the admin console to create.
+
 ---
 
 ## CLI reference
