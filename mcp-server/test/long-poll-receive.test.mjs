@@ -23,6 +23,7 @@ import { join } from 'node:path';
 const sandbox = mkdtempSync(join(tmpdir(), 'ab-longpoll-'));
 mkdirSync(join(sandbox, '.agent-bridge'), { recursive: true });
 process.env.HOME = sandbox;
+process.env.USERPROFILE = sandbox; // Node's os.homedir() reads USERPROFILE on Windows, not HOME
 process.env.AGENT_BRIDGE_MACHINE_NAME = 'TestMachine';
 // Disable the orphan watchdog and parent-PID watchdog so the test process
 // doesn't try to gracefully shut down when stdio briefly hiccups.

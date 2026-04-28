@@ -39,6 +39,7 @@ import { randomUUID } from 'node:crypto';
 const sandbox = mkdtempSync(join(tmpdir(), 'ab-consume-race-'));
 mkdirSync(join(sandbox, '.agent-bridge'), { recursive: true });
 process.env.HOME = sandbox;
+process.env.USERPROFILE = sandbox; // Node's os.homedir() reads USERPROFILE on Windows, not HOME
 process.env.AGENT_BRIDGE_MACHINE_NAME = 'TestMachine';
 process.env.AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG = '1';
 process.env.AGENT_BRIDGE_DISABLE_PARENT_CHECK = '1';
