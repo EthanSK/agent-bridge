@@ -74,7 +74,7 @@ import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, MCP_SERVER_VERSION, ensureDire
 import { initInbox, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 import { registerTools } from './tools.js';
-import { startWatcher, stopWatcher, replayUndeliveredMessages } from './watcher.js';
+import { startWatcher, stopWatcher, replayUndeliveredMessages, registerAliveSignals } from './watcher.js';
 import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 
@@ -587,6 +587,31 @@ async function main(): Promise<void> {
     },
   );
 
+  // 3.9.0 [CONSUME-RACE] — Wrap server.registerTool so EVERY tool invocation
+  // (not just claude_code_channel_status) increments toolCallsReceivedCount.
+  // The count drives the alive-heuristic in watcher.ts: a fresh tool call
+  // since a pending-ack push is positive evidence that the harness is awake
+  // and processing, which lets us finalize the pending entry on the
+  // early-defer (5 s) path instead of waiting the full 60 s safety net.
+  const TOOL_BOOT_TIME_MS = Date.now();
+  let toolCallsReceivedCount = 0;
+  let channelCallbackRegisteredAt = 0;
+  registerAliveSignals({
+    getToolCallsReceivedCount: () => toolCallsReceivedCount,
+    getChannelCallbackRegisteredAt: () => channelCallbackRegisteredAt,
+  });
+  const origRegisterTool = server.registerTool.bind(server);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (server as any).registerTool = (name: string, schema: unknown, handler: any) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const wrapped = async (...args: any[]) => {
+      toolCallsReceivedCount += 1;
+      return handler(...args);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (origRegisterTool as any)(name, schema, wrapped);
+  };
+
   // Register all 7 user-facing bridge tools.
   registerTools(server);
 
@@ -598,8 +623,6 @@ async function main(): Promise<void> {
   // a useful diagnostic probe (returns pid, uptime, watcher lease state,
   // version). Not harmful, and the tool-registration test still asserts on
   // it.
-  const TOOL_BOOT_TIME_MS = Date.now();
-  let toolCallsReceivedCount = 0;
   server.registerTool(
     'claude_code_channel_status',
     {
@@ -610,7 +633,9 @@ async function main(): Promise<void> {
         + 'tool is what you actually use to send messages.',
     },
     async () => {
-      toolCallsReceivedCount += 1;
+      // 3.9.0 [CONSUME-RACE] — toolCallsReceivedCount is incremented by the
+      // server.registerTool shim above, BEFORE the handler runs. We do not
+      // double-count here (the shim already covers this tool).
       const leasePath = join(
         LOCKS_DIR,
         `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`,
@@ -708,6 +733,13 @@ async function main(): Promise<void> {
     // Start the inbox file watcher with channel notification callback.
     // When new messages arrive, we push them into Claude's conversation
     // via the MCP channel notification protocol.
+    // 3.9.0 [CONSUME-RACE] — record the moment the channel callback becomes
+    // active. Used by the alive-heuristic in watcher.ts: if the callback was
+    // registered AFTER a pending entry's pushedAt, the fresh registration
+    // implies a plugin reload / channel-owner change that resets harness
+    // state, so we treat it as positive alive evidence (the new owner will
+    // pick up replays).
+    channelCallbackRegisteredAt = Date.now();
     watcherStarted = await startWatcher(
       (newFiles) => {
         logInfo(`New messages detected: ${newFiles.length} file(s)`);

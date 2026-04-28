@@ -15,7 +15,7 @@ import { basename, join } from 'path';
  * peer-kill path). Bump this in lockstep with `package.json`,
  * `.claude-plugin/plugin.json`, and the bash CLI's VERSION constant.
  */
-export const MCP_SERVER_VERSION = '3.8.2';
+export const MCP_SERVER_VERSION = '3.9.0';
 
 export const BRIDGE_DIR = join(homedir(), '.agent-bridge');
 export const CONFIG_FILE = join(BRIDGE_DIR, 'config');
@@ -29,6 +29,16 @@ export const IDENTITY_FILE = join(BRIDGE_DIR, '.identity');
 export const FAILED_DIR = join(INBOX_DIR, '.failed');
 export const ARCHIVE_DIR = join(INBOX_DIR, '.archive');
 export const UNROUTED_DIR = join(FAILED_DIR, '_unrouted');
+/**
+ * 3.9.0 [CONSUME-RACE] — Pending-ack staging area. After the channel callback
+ * resolves (stdout JSON-RPC write succeeded) the file is moved here from the
+ * inbox/<target>/ subdir while we wait for evidence the harness actually
+ * rendered the message. Files in this directory are owned by the watcher
+ * lease holder and are recovered on lease handover by `replayUndeliveredMessages`.
+ */
+export const PENDING_ACK_DIR = join(INBOX_DIR, '.pending-ack');
+/** 3.9.0 [CONSUME-RACE] — exhausted retries land in `.failed/.exhausted/` */
+export const EXHAUSTED_DIR = join(FAILED_DIR, '.exhausted');
 export const PROCESSED_FILE = join(INBOX_DIR, '.processed');
 export const DELIVERED_FILE = join(INBOX_DIR, '.delivered');
 
@@ -59,6 +69,19 @@ export function archiveSubdir(target: string): string {
 /** Per-target failed subdir. */
 export function failedSubdir(target: string): string {
   return join(FAILED_DIR, target);
+}
+
+/**
+ * 3.9.0 [CONSUME-RACE] — Per-target pending-ack subdir. Files here are
+ * post-callback-resolve but pre-finalize: the channel notification has been
+ * written to stdout, but we have not yet confirmed the harness actually
+ * rendered the message. The hybrid AC tick either finalizes (archive +
+ * markDelivered) after the early-defer window with positive alive-evidence,
+ * or re-injects back into inbox/<target>/ after the 60 s safety-net window
+ * with no alive-evidence.
+ */
+export function pendingAckSubdir(target: string): string {
+  return join(PENDING_ACK_DIR, target);
 }
 
 /**
@@ -135,9 +158,12 @@ export function ensureDirectories(): void {
     FAILED_DIR,
     ARCHIVE_DIR,
     UNROUTED_DIR,
+    PENDING_ACK_DIR,
+    EXHAUSTED_DIR,
     inboxSubdir(CLAUDE_CODE_TARGET),
     archiveSubdir(CLAUDE_CODE_TARGET),
     failedSubdir(CLAUDE_CODE_TARGET),
+    pendingAckSubdir(CLAUDE_CODE_TARGET),
   ]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });

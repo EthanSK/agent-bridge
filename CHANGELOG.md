@@ -1,5 +1,79 @@
 # Changelog
 
+## agent-bridge 3.9.0 — 2026-04-28
+
+### [CONSUME-RACE] Hybrid AC pending-ack delivery — fixes silent message drops
+
+Pre-3.9 the channel watcher called `markDelivered` + `archiveDeliveredMessage`
+the moment `savedChannelCallback` resolved. The promise resolves when the
+JSON-RPC notification has been written to the MCP server's stdout — but
+**stdout-write success is NOT proof the receiving Claude harness rendered
+the message** into its conversation context. Windows reproduced 6 silent
+drops in one session under that model: each message was happily moved to
+`.archive/`, the `.delivered` ledger grew, and the Claude session never saw
+any of them.
+
+3.9.0 implements **Option AC (hybrid)**: every push goes through a
+`.pending-ack/<target>/` staging area, and a per-poll-cycle tick decides
+whether to finalize (early-defer + alive-evidence) or re-inject (safety-net
++ no alive-evidence) for retry.
+
+#### What changed
+
+- **Pending-deliveries map** in `mcp-server/src/watcher.ts`. Each entry
+  carries `{id, fileName, pendingPath, metaPath, pushedAt, retries, target,
+  listenersAtPushTime, toolCallsAtPushTime, hadError, escapeHatch}`.
+- **Replaced optimistic markDelivered**. After `savedChannelCallback(msg)`
+  resolves, the inbox file moves to `.pending-ack/<target>/<id>.json` with
+  a `<id>.meta.json` sidecar. `markDelivered` and archive happen only after
+  positive confirmation.
+- **`processPendingDeliveries` tick**, run every poll cycle (~2 s):
+  - **C-style early defer (5 s window)** — if `pushedAt < now - 5000`,
+    watcher still owns the lease, no error was seen, AND alive-heuristic
+    returns TRUE → finalize: archive + markDelivered + drop entry.
+  - **A-style safety net (60 s window)** — if `pushedAt < now - 60000`
+    AND alive-heuristic returns FALSE → re-inject: move file from
+    `.pending-ack/` back to `inbox/`, increment retries.
+  - **Retry cap (3)** — fourth re-inject attempt moves the file to
+    `.failed/.exhausted/` and emits a fatal-level
+    `channel.pending_exhausted` event.
+  - **Escape-hatch** — 5+ pushes within 30 s with no new tool calls AND
+    no long-poll listeners flips the channel dead. Future emissions skip
+    the callback and stage straight to `.pending-ack/` for the next
+    plugin reload to replay (`channel.dead_escape_hatch` /
+    `channel.dead_escape_hatch_skip` events).
+- **Alive-heuristic** — returns TRUE when ANY of:
+  1. `toolCallsReceivedCount > pending.toolCallsAtPushTime`
+  2. `inboxArrivalListenerCount() > 0` (a `bridge_receive_messages` long-poll
+     is currently parked, proving the harness is alive and waiting).
+  3. `savedChannelCallbackRegisteredAt > pending.pushedAt` (a plugin
+     reload happened mid-flight; the new owner gets a clean retry).
+- **Lease-handover compatibility** — files left in `.pending-ack/` after a
+  lease loss are recovered by `replayUndeliveredMessages`. Sidecars are
+  cleaned up; pushedAt is reconstructed from file mtime; anything older
+  than 30 s gets re-injected back into `inbox/`.
+- **`server.registerTool` shim** in `index.ts` — every tool invocation
+  (not just `claude_code_channel_status`) increments
+  `toolCallsReceivedCount` so the alive-heuristic sees ALL Claude tool
+  traffic as positive evidence.
+
+#### Tests
+
+- `mcp-server/test/consume-race.test.mjs` — 6 new cases: silent-drop
+  reinject, early-defer finalize, 60 s safety-net reinject, retry-cap
+  exhaustion, lease-handover replay, escape-hatch.
+- `mcp-server/test/unified-channel.test.mjs` — end-to-end delivery test
+  updated to assert the new `.pending-ack/` staging behaviour and the
+  `channel.pending_staged` event.
+- 48 existing + 6 new = **54 tests, 0 failures.**
+
+#### Compatibility
+
+The `.delivered` ledger format and the `.archive/<target>/` layout are
+unchanged. The new `.pending-ack/<target>/` and `.failed/.exhausted/`
+subdirs are created on first run by `ensureDirectories` —
+no migration required. Senders see no behaviour change.
+
 ## agent-bridge 3.8.2 — 2026-04-26
 
 ### Fix: drop unsupported `-E` flag from sftp args (macOS)

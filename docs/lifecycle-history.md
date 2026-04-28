@@ -1250,4 +1250,124 @@ cases including a regression guard that the script never contains `$`,
 
 ---
 
+## 3.9.0 — [CONSUME-RACE] consume-race fix (2026-04-28)
+
+### The bug
+
+3.4.x → 3.8.x marked messages delivered the moment
+`savedChannelCallback`'s Promise resolved. The promise resolves when the
+JSON-RPC `notifications/claude/channel` packet has been written to the
+MCP server's stdout — but **stdout-write success is not proof the
+receiving Claude harness rendered the message** into its conversation
+context. Production Windows reproduced 6 silent drops in one session
+(2026-04-28): each message was happily moved to `.archive/`, the
+`.delivered` ledger grew, and the running Claude session never saw any
+of them. No process churn, no stderr breadcrumbs — purely an optimistic-
+ack failure.
+
+The fingerprint:
+
+```
+{
+  "event": "message.pushed_to_channel",   // we wrote stdout — succeeded
+  "msg_id": "msg-…",
+}
+… (no further evidence the harness saw it) …
+{
+  "event": "message.delivered",           // we marked it delivered anyway
+  "msg_id": "msg-…",                      // file moved to .archive/
+}
+```
+
+### The fix — Option AC (hybrid)
+
+Splits delivery into two phases with positive-confirmation finalize and
+timeout-bounded reinject:
+
+```
+push  → stage to .pending-ack/<target>/<id>.json + sidecar meta
+        (file leaves inbox/<target>/ — no double-fire on next poll)
+
+tick (every ~2 s in the watcher polling loop):
+  ┌──────────── early-defer (5 s + alive-evidence + lease) ───┐
+  │ → archive + markDelivered + drop entry                    │
+  ├──────────── safety-net (60 s + no alive-evidence) ────────┤
+  │ → re-inject back into inbox/<target>/, retries++          │
+  │ → if retries > 3, move to .failed/.exhausted/             │
+  ├──────────── escape-hatch (5+ pushes/30 s, no acks) ───────┤
+  │ → channelMarkedDead = true                                │
+  │ → future emits stage straight to .pending-ack/, no callback │
+  │   (next plugin reload's handover-replay picks them up)    │
+  └────────────────────────────────────────────────────────────┘
+
+handover (replayUndeliveredMessages on new lease holder):
+  scan .pending-ack/<target>/ for files older than 30 s
+  → move back to inbox/<target>/ for a fresh retry
+```
+
+### Alive-heuristic
+
+The gate for early-defer (and the inverse gate for safety-net) is
+`isHarnessAliveSincePush(pending: PendingEntry): boolean`. Returns TRUE
+when ANY of:
+
+1. `toolCallsReceivedCount > pending.toolCallsAtPushTime` — the harness
+   has invoked an MCP tool since the push, proving the JSON-RPC pipe is
+   still live and being read.
+2. `inboxArrivalListenerCount() > 0` — at least one
+   `bridge_receive_messages` long-poll subscriber is parked inside the
+   plugin, proving the harness is in normal request/response cadence.
+3. `savedChannelCallbackRegisteredAt > pushedAt` — a plugin reload
+   happened after the push; the new owner's handover-replay will pump
+   the message through cleanly.
+
+Notably absent: notification.push_failed events, stderr breadcrumbs, or
+file-watcher poll counts. Those are all internal to the plugin and tell
+us nothing about whether the harness rendered the message.
+
+### What's preserved
+
+- `.delivered` ledger format unchanged.
+- `.archive/<target>/` and `.failed/<target>/` layouts unchanged.
+- `notification.push_failed` event (3.5.5) and the
+  `decision: 'leave_pending_for_next_owner'` contract retained for the
+  callback-rejected path. The pending-ack flow is layered on top of that
+  pre-existing failure path, not a replacement.
+- `BridgeMessage` JSON wire format unchanged. A 3.9 receiver consumes
+  3.4.x → 3.8.x sender output identically.
+
+### What's new on disk
+
+- `~/.agent-bridge/inbox/.pending-ack/<target>/<id>.json` — staged file
+- `~/.agent-bridge/inbox/.pending-ack/<target>/<id>.meta.json` — sidecar
+  with `{id, fileName, pushedAt, retries, target, listenersAtPushTime,
+  toolCallsAtPushTime, mcpServerVersion}`
+- `~/.agent-bridge/inbox/.failed/.exhausted/<ts>_<id>.json` — files that
+  exceeded the 3-reinject cap
+
+### Code map
+
+- `mcp-server/src/watcher.ts:200+` — `pendingDeliveries: Map<id, PendingEntry>`
+  + `processPendingDeliveries` tick + `maybeMarkChannelDead` escape-hatch.
+- `mcp-server/src/watcher.ts:660+` — refactored `emitChannelNotification`
+  with the staging path on resolve and the existing `notification.push_failed`
+  path on reject.
+- `mcp-server/src/watcher.ts:1316+` — `replayUndeliveredMessages` now
+  scans `.pending-ack/<target>/` first, recovering files older than 30 s.
+- `mcp-server/src/index.ts` — `server.registerTool` shim wraps every tool
+  handler so EVERY tool invocation (not just `claude_code_channel_status`)
+  increments `toolCallsReceivedCount` for the alive-heuristic.
+- `mcp-server/src/config.ts` — `PENDING_ACK_DIR`, `EXHAUSTED_DIR`,
+  `pendingAckSubdir(target)`. Added to `ensureDirectories`.
+- `mcp-server/test/consume-race.test.mjs` — 6 new regression tests
+  (cases A–F per the implementation spec).
+
+### Test coverage
+
+54 tests / 54 passing (48 pre-3.9 carried forward unchanged, except the
+end-to-end `unified plugin` test which now asserts pending-ack staging
++ `channel.pending_staged` event instead of immediate archive).
+
+---
+
 *End of lifecycle history.*

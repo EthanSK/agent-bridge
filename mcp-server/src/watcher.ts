@@ -34,11 +34,13 @@ import {
 import { join } from 'path';
 import {
   CLAUDE_CODE_TARGET,
+  EXHAUSTED_DIR,
   LOCKS_DIR,
   MCP_SERVER_VERSION,
   inboxSubdir,
   archiveSubdir,
   failedSubdir,
+  pendingAckSubdir,
   isValidTarget,
 } from './config.js';
 
@@ -50,6 +52,13 @@ import {
 const CLAUDE_CODE_INBOX_DIR = inboxSubdir(CLAUDE_CODE_TARGET);
 const CLAUDE_CODE_ARCHIVE_DIR = archiveSubdir(CLAUDE_CODE_TARGET);
 const CLAUDE_CODE_FAILED_DIR = failedSubdir(CLAUDE_CODE_TARGET);
+/**
+ * 3.9.0 [CONSUME-RACE] — pending-ack staging area for the claude-code target.
+ * Files live here between the channel callback resolving (stdout JSON-RPC
+ * write succeeded) and our hybrid AC tick deciding whether to finalize
+ * (archive + markDelivered) or re-inject back into the inbox.
+ */
+const CLAUDE_CODE_PENDING_ACK_DIR = pendingAckSubdir(CLAUDE_CODE_TARGET);
 const INBOX_DIR = CLAUDE_CODE_INBOX_DIR;
 import { logInfo, logError, logDebug, logWarn } from './logger.js';
 import { logEvent } from './log.js';
@@ -196,6 +205,237 @@ function fireInboxArrivalListeners(): void {
  */
 export function inboxArrivalListenerCount(): number {
   return inboxArrivalListeners.size;
+}
+
+// ── 3.9.0 [CONSUME-RACE] — Pending-ack delivery (Hybrid AC) ─────────────────
+//
+// Pre-3.9 (`b08160c` and earlier) the watcher called markDelivered + archive
+// the moment savedChannelCallback's promise resolved. The promise resolves
+// when the JSON-RPC notification has been written to the MCP server's stdout
+// — but stdout-write success is NOT proof that the receiving Claude harness
+// rendered the message into its conversation context. The Windows side
+// reproduced 6 silent drops in one session: the plugin happily moved each
+// message to .archive/, the .delivered ledger grew, but the running Claude
+// session never saw any of them.
+//
+// Hybrid AC: every push goes through a pending-ack staging area:
+//
+//   1. Push   — savedChannelCallback resolves → file moves to
+//               `.pending-ack/<target>/<id>.json` + sidecar `<id>.meta.json`
+//               with pushedAt timestamp, listeners count, tool-call count.
+//   2. Tick   — every poll cycle (~2 s), `processPendingDeliveries` decides:
+//      - Early-defer (5 s + alive-evidence + still own lease): finalize
+//        (archive + markDelivered, drop entry).
+//      - Safety-net (60 s + no alive-evidence): re-inject back into
+//        inbox/<target>/, increment retries (cap 3 → .failed/.exhausted/).
+//   3. Handover — files left in `.pending-ack/` after a lease loss are
+//      recovered by `replayUndeliveredMessages` on the new owner: anything
+//      older than 30 s gets re-injected.
+//   4. Escape-hatch — if the channel itself looks dead (5+ pushes in 30 s
+//      with no tool calls and no long-poll listeners), mark dead and
+//      bypass the callback for new files (they still queue to .pending-ack/
+//      so a future plugin reload picks them up). Emits fatal-level log.
+
+type PendingEntry = {
+  id: string;
+  fileName: string;          // basename, e.g. "msg-abcd.json"
+  pendingPath: string;       // .pending-ack/<target>/<id>.json
+  metaPath: string;          // .pending-ack/<target>/<id>.meta.json
+  pushedAt: number;
+  retries: number;
+  target: string;
+  listenersAtPushTime: number;
+  toolCallsAtPushTime: number;
+  hadError: boolean;
+  /**
+   * 3.9.0 [CONSUME-RACE] — set TRUE when the entry was staged during the
+   * escape-hatch (channel marked dead). The hybrid AC tick must NOT
+   * finalize OR re-inject these — they sit until a plugin reload triggers
+   * handover-replay, which moves them back to inbox/ for a fresh channel.
+   */
+  escapeHatch: boolean;
+};
+
+const pendingDeliveries = new Map<string, PendingEntry>();
+
+/** 3.9.0 [CONSUME-RACE] — windows for the hybrid AC tick. */
+const PENDING_EARLY_DEFER_MS = 5_000;
+const PENDING_REINJECT_MS = 60_000;
+const PENDING_REINJECT_MAX_RETRIES = 3;
+const PENDING_HANDOVER_REINJECT_MS = 30_000;
+
+/**
+ * Escape-hatch state. If 5+ pushes happen within ESCAPE_HATCH_WINDOW_MS with
+ * no tool calls and no long-poll listeners, the channel is declared dead and
+ * subsequent emits skip the callback (file still moves into pending-ack/ so
+ * the next live plugin can replay it).
+ */
+const ESCAPE_HATCH_WINDOW_MS = 30_000;
+const ESCAPE_HATCH_PUSH_THRESHOLD = 5;
+const recentPushes: number[] = [];        // pushedAt timestamps within window
+let channelMarkedDead = false;
+let channelMarkedDeadAt = 0;
+
+// ── Alive-heuristic plumbing ────────────────────────────────────────────────
+//
+// The alive-heuristic is the gate for the safety-net re-injection path.
+// It returns TRUE if there is positive evidence the receiving Claude harness
+// is still alive since the message was pushed:
+//   (a) any tool call has been received since pushedAt;
+//   (b) at least one long-poll listener is currently registered (the
+//       harness is parked inside `bridge_receive_messages` waiting for us);
+//   (c) the channel callback itself was registered AFTER pushedAt
+//       (a plugin reload happened — likely the harness is restarting and
+//       will pick up replays).
+//
+// `index.ts` owns `toolCallsReceivedCount` and the channel-callback
+// registration timestamp. It pushes them in via the setter below.
+type AliveSignals = {
+  getToolCallsReceivedCount: () => number;
+  getChannelCallbackRegisteredAt: () => number;
+};
+
+let aliveSignals: AliveSignals = {
+  getToolCallsReceivedCount: () => 0,
+  getChannelCallbackRegisteredAt: () => 0,
+};
+
+/**
+ * 3.9.0 [CONSUME-RACE] — register accessors for alive-heuristic signals.
+ * Called by `index.ts::main()` after it sets up the toolCallsReceivedCount
+ * counter and channel-callback registration timestamp.
+ */
+export function registerAliveSignals(signals: AliveSignals): void {
+  aliveSignals = signals;
+}
+
+function isHarnessAliveSincePush(pending: PendingEntry): boolean {
+  // (a) any new tool call since push?
+  const tc = aliveSignals.getToolCallsReceivedCount();
+  if (tc > pending.toolCallsAtPushTime) return true;
+  // (b) any active long-poll listeners currently waiting?
+  if (inboxArrivalListenerCount() > 0) return true;
+  // (c) channel-callback freshness: was it registered AFTER pushedAt?
+  const regAt = aliveSignals.getChannelCallbackRegisteredAt();
+  if (regAt > pending.pushedAt) return true;
+  return false;
+}
+
+function ensurePendingAckDir(): void {
+  if (!existsSync(CLAUDE_CODE_PENDING_ACK_DIR)) {
+    mkdirSync(CLAUDE_CODE_PENDING_ACK_DIR, { recursive: true, mode: 0o700 });
+  }
+}
+
+function ensureExhaustedDir(): void {
+  if (!existsSync(EXHAUSTED_DIR)) {
+    mkdirSync(EXHAUSTED_DIR, { recursive: true, mode: 0o700 });
+  }
+}
+
+/**
+ * Test/diagnostic helper: peek at the current pending-deliveries map.
+ * Returns a shallow snapshot — callers must not mutate.
+ */
+export function _getPendingDeliveriesForTesting(): PendingEntry[] {
+  return Array.from(pendingDeliveries.values());
+}
+
+/**
+ * Test/diagnostic helper: returns whether the escape-hatch has been triggered.
+ */
+export function _isChannelMarkedDeadForTesting(): boolean {
+  return channelMarkedDead;
+}
+
+/**
+ * Test-only: drive one polling tick of the hybrid AC pipeline (process
+ * pending entries + evaluate escape-hatch). Production code path is the
+ * 2 s polling loop in `startPolling`. Tests use this to assert state
+ * transitions without depending on the polling interval.
+ */
+export function _processPendingDeliveriesForTesting(): void {
+  processPendingDeliveries();
+  maybeMarkChannelDead();
+}
+
+/**
+ * Test-only: reset escape-hatch state. The state is intentionally process-
+ * scoped sticky in production (a dead channel stays dead until next process),
+ * but tests need to interleave dead/healthy scenarios cleanly.
+ */
+export function _resetChannelDeadStateForTesting(): void {
+  channelMarkedDead = false;
+  channelMarkedDeadAt = 0;
+  recentPushes.length = 0;
+}
+
+/**
+ * Test-only: reset pending-deliveries map in addition to the dead-channel
+ * state. Used by the consume-race tests to start each scenario from a clean
+ * pending-ack ledger.
+ */
+export function _resetPendingDeliveriesForTesting(): void {
+  pendingDeliveries.clear();
+  _resetChannelDeadStateForTesting();
+}
+
+function trimRecentPushes(now: number): void {
+  while (recentPushes.length > 0 && now - recentPushes[0] > ESCAPE_HATCH_WINDOW_MS) {
+    recentPushes.shift();
+  }
+}
+
+function maybeMarkChannelDead(): void {
+  if (channelMarkedDead) return;
+  const now = Date.now();
+  trimRecentPushes(now);
+  if (recentPushes.length < ESCAPE_HATCH_PUSH_THRESHOLD) return;
+  // Threshold met. Check alive-evidence across the window: any tool calls,
+  // any long-poll listeners. If both are zero, declare dead.
+  // NOTE: we approximate "no NEW tool calls in the window" as "no tool calls
+  // since the FIRST push in the window happened" (we don't snapshot per
+  // window-entry to keep state small). Listeners-count is sampled live.
+  // The first entry's toolCalls snapshot is not directly available here;
+  // instead, we cross-reference the oldest pending entry pushed within the
+  // window. If none, fall back to the conservative path (do not mark dead).
+  const windowStart = recentPushes[0];
+  let firstSnapshot: number | null = null;
+  for (const entry of pendingDeliveries.values()) {
+    if (entry.pushedAt >= windowStart) {
+      if (firstSnapshot === null || entry.toolCallsAtPushTime < firstSnapshot) {
+        firstSnapshot = entry.toolCallsAtPushTime;
+      }
+    }
+  }
+  if (firstSnapshot === null) return;
+  const tcNow = aliveSignals.getToolCallsReceivedCount();
+  const noNewToolCalls = tcNow <= firstSnapshot;
+  const noListeners = inboxArrivalListenerCount() === 0;
+  if (noNewToolCalls && noListeners) {
+    channelMarkedDead = true;
+    channelMarkedDeadAt = now;
+    logError(
+      'Channel: ESCAPE-HATCH triggered — '
+      + `${recentPushes.length} pushes within ${ESCAPE_HATCH_WINDOW_MS}ms, `
+      + 'no new tool calls, no long-poll listeners. Channel marked dead. '
+      + 'Future pushes will queue to .pending-ack/ without invoking the callback. '
+      + 'Next plugin reload / channel-owner takeover will replay them.',
+    );
+    logEvent({
+      event: 'channel.dead_escape_hatch',
+      level: 'error',
+      msg: 'ESCAPE-HATCH: channel marked dead (no acks within window)',
+      context: {
+        recent_pushes: recentPushes.length,
+        window_ms: ESCAPE_HATCH_WINDOW_MS,
+        tool_calls_at_window_start: firstSnapshot,
+        tool_calls_now: tcNow,
+        listeners_now: 0,
+        marked_dead_at_ms: now,
+      },
+    });
+  }
 }
 
 /**
@@ -563,9 +803,23 @@ function quarantineFailed(fileName: string, reason: string): void {
 }
 
 function archiveDeliveredMessage(fileName: string, id: string, reason: string): void {
-  const filePath = join(INBOX_DIR, fileName);
+  archiveDeliveredMessageFrom(join(INBOX_DIR, fileName), fileName, id, reason);
+}
+
+/**
+ * 3.9.0 [CONSUME-RACE] — archive from an arbitrary source path. Used to
+ * finalize files that were staged in `.pending-ack/<target>/` after the
+ * early-defer window expires. Mirrors `archiveDeliveredMessage` but does
+ * not assume the file lives in INBOX_DIR.
+ */
+function archiveDeliveredMessageFrom(
+  sourcePath: string,
+  fileName: string,
+  id: string,
+  reason: string,
+): void {
   try {
-    if (!existsSync(filePath)) {
+    if (!existsSync(sourcePath)) {
       knownFiles.delete(fileName);
       invalidateCache();
       return;
@@ -574,7 +828,7 @@ function archiveDeliveredMessage(fileName: string, id: string, reason: string): 
       mkdirSync(CLAUDE_CODE_ARCHIVE_DIR, { recursive: true, mode: 0o700 });
     }
     const stamped = `${new Date().toISOString().replace(/[:.]/g, '-')}_${fileName}`;
-    renameSync(filePath, join(CLAUDE_CODE_ARCHIVE_DIR, stamped));
+    renameSync(sourcePath, join(CLAUDE_CODE_ARCHIVE_DIR, stamped));
     knownFiles.delete(fileName);
     invalidateCache();
     logDebug(`Channel: archived delivered message ${id} (${reason})`);
@@ -583,6 +837,213 @@ function archiveDeliveredMessage(fileName: string, id: string, reason: string): 
     // retry/duplicate the channel notification just because debug archival
     // failed. Leave the file in place; .delivered prevents re-emission.
     logWarn(`Channel: failed to archive delivered message ${id} (${fileName}): ${err}`);
+  }
+}
+
+/**
+ * 3.9.0 [CONSUME-RACE] — Move a fully-parsed inbox file into .pending-ack/
+ * staging and write a sidecar metadata file. Returns the new pending entry,
+ * or null if the move failed (in which case the caller should leave the
+ * file in inbox/ for the next poll).
+ */
+function stagePendingAck(
+  fileName: string,
+  id: string,
+  retries: number,
+  escapeHatch = false,
+): PendingEntry | null {
+  ensurePendingAckDir();
+  const sourcePath = join(INBOX_DIR, fileName);
+  const pendingPath = join(CLAUDE_CODE_PENDING_ACK_DIR, fileName);
+  const metaPath = join(CLAUDE_CODE_PENDING_ACK_DIR, `${id}.meta.json`);
+  const pushedAt = Date.now();
+  const entry: PendingEntry = {
+    id,
+    fileName,
+    pendingPath,
+    metaPath,
+    pushedAt,
+    retries,
+    target: CLAUDE_CODE_TARGET,
+    listenersAtPushTime: inboxArrivalListenerCount(),
+    toolCallsAtPushTime: aliveSignals.getToolCallsReceivedCount(),
+    hadError: false,
+    escapeHatch,
+  };
+  try {
+    renameSync(sourcePath, pendingPath);
+  } catch (err) {
+    logWarn(`Channel: failed to stage ${fileName} into .pending-ack/: ${err}`);
+    return null;
+  }
+  try {
+    writeFileSync(metaPath, JSON.stringify({
+      id,
+      fileName,
+      pushedAt,
+      retries,
+      target: CLAUDE_CODE_TARGET,
+      listenersAtPushTime: entry.listenersAtPushTime,
+      toolCallsAtPushTime: entry.toolCallsAtPushTime,
+      mcpServerVersion: MCP_SERVER_VERSION,
+    }, null, 2), { mode: 0o600 });
+  } catch (err) {
+    // Sidecar is a recovery aid only; missing sidecar means handover-replay
+    // can't read the original pushedAt (we use file mtime as a fallback).
+    logWarn(`Channel: failed to write meta sidecar ${metaPath}: ${err}`);
+  }
+  pendingDeliveries.set(id, entry);
+  knownFiles.delete(fileName);
+  invalidateCache();
+  return entry;
+}
+
+/**
+ * 3.9.0 [CONSUME-RACE] — Finalize a pending entry: archive the file,
+ * mark the message delivered in the dedup ledger, drop the entry from
+ * the pending map, and remove the sidecar.
+ */
+function finalizePending(entry: PendingEntry, reason: string): void {
+  archiveDeliveredMessageFrom(entry.pendingPath, entry.fileName, entry.id, reason);
+  markDelivered(entry.id);
+  try {
+    if (existsSync(entry.metaPath)) unlinkSync(entry.metaPath);
+  } catch { /* best-effort */ }
+  pendingDeliveries.delete(entry.id);
+  logEvent({
+    event: 'channel.pending_finalized',
+    msg: `Pending-ack finalized for ${entry.id} (${reason})`,
+    context: {
+      msg_id: entry.id,
+      reason,
+      retries: entry.retries,
+      age_ms: Date.now() - entry.pushedAt,
+    },
+  });
+}
+
+/**
+ * 3.9.0 [CONSUME-RACE] — Re-inject a pending entry back into the inbox so
+ * the watcher picks it up on the next poll. Increments retries; if the
+ * cap is exceeded, move to `.failed/.exhausted/` instead and emit a
+ * fatal-level log event.
+ */
+function reinjectPending(entry: PendingEntry, reason: string): void {
+  const newRetries = entry.retries + 1;
+  if (newRetries > PENDING_REINJECT_MAX_RETRIES) {
+    ensureExhaustedDir();
+    const stamped = `${new Date().toISOString().replace(/[:.]/g, '-')}_${entry.fileName}`;
+    try {
+      renameSync(entry.pendingPath, join(EXHAUSTED_DIR, stamped));
+    } catch (err) {
+      logError(`Channel: failed to move ${entry.fileName} to .exhausted/: ${err}`);
+    }
+    try {
+      if (existsSync(entry.metaPath)) unlinkSync(entry.metaPath);
+    } catch { /* best-effort */ }
+    pendingDeliveries.delete(entry.id);
+    logError(
+      `Channel: pending-ack RETRY-EXHAUSTED for ${entry.id} after `
+      + `${PENDING_REINJECT_MAX_RETRIES} re-injections (${reason}); moved to .failed/.exhausted/`,
+    );
+    logEvent({
+      event: 'channel.pending_exhausted',
+      level: 'error',
+      msg: `Pending-ack retries exhausted for ${entry.id}`,
+      context: {
+        msg_id: entry.id,
+        retries: entry.retries,
+        max_retries: PENDING_REINJECT_MAX_RETRIES,
+        reason,
+        age_ms: Date.now() - entry.pushedAt,
+      },
+    });
+    return;
+  }
+
+  const inboxPath = join(INBOX_DIR, entry.fileName);
+  try {
+    if (!existsSync(INBOX_DIR)) mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 });
+    renameSync(entry.pendingPath, inboxPath);
+  } catch (err) {
+    logError(`Channel: failed to re-inject ${entry.fileName} → inbox: ${err}`);
+    return;
+  }
+  try {
+    if (existsSync(entry.metaPath)) unlinkSync(entry.metaPath);
+  } catch { /* best-effort */ }
+  pendingDeliveries.delete(entry.id);
+  // Force a re-emit on the next poll: drop from knownFiles so the
+  // checkForNewFiles diff includes it again.
+  knownFiles.delete(entry.fileName);
+  invalidateCache();
+  logWarn(`Channel: re-injected ${entry.id} (retry ${newRetries}/${PENDING_REINJECT_MAX_RETRIES}) — ${reason}`);
+  logEvent({
+    event: 'channel.pending_reinjected',
+    level: 'warn',
+    msg: `Re-injected pending message ${entry.id} for retry ${newRetries}`,
+    context: {
+      msg_id: entry.id,
+      retries: newRetries,
+      max_retries: PENDING_REINJECT_MAX_RETRIES,
+      reason,
+      age_ms: Date.now() - entry.pushedAt,
+    },
+  });
+}
+
+/**
+ * 3.9.0 [CONSUME-RACE] — Hybrid AC tick. Runs every poll cycle (~2 s).
+ * Walks the pending-deliveries map and decides for each entry whether to
+ * finalize (early-defer + alive-evidence) or re-inject (safety-net + no
+ * alive-evidence).
+ *
+ * The two windows are NOT overlapping early-defer rules — they are
+ * complementary:
+ *   - 5 s + alive   → finalize. Trust the channel push because the
+ *                     harness is demonstrably alive AND the stdout write
+ *                     succeeded; further waiting buys nothing.
+ *   - 60 s + ¬alive → reinject. After a full minute with zero positive
+ *                     evidence the harness saw it, treat the push as lost
+ *                     and put it back in the inbox for another try.
+ *   - Between 5–60 s — keep waiting (alive evidence may yet appear; if
+ *                     it doesn't by 60 s, reinject path triggers).
+ */
+function processPendingDeliveries(): void {
+  if (pendingDeliveries.size === 0) return;
+  const now = Date.now();
+  // Snapshot — finalize/reinject mutate the map.
+  const entries = Array.from(pendingDeliveries.values());
+  for (const entry of entries) {
+    // Escape-hatch entries are parked indefinitely — only handover replay
+    // (next plugin reload) recovers them, never the in-process tick.
+    if (entry.escapeHatch) continue;
+    if (entry.hadError) {
+      // The notification path saw an error AFTER stdout-write resolved
+      // (rare — typically logged in a downstream catch). Reinject ASAP
+      // rather than wait the full safety-net window.
+      reinjectPending(entry, 'callback_post_resolve_error');
+      continue;
+    }
+    const age = now - entry.pushedAt;
+
+    // Safety-net: oldest goes to reinject if no alive evidence at 60 s.
+    if (age >= PENDING_REINJECT_MS) {
+      if (!isHarnessAliveSincePush(entry)) {
+        reinjectPending(entry, `safety_net_${PENDING_REINJECT_MS}ms_no_alive_evidence`);
+      } else {
+        // Alive evidence appeared late (>60 s). Honour it and finalize.
+        finalizePending(entry, `safety_net_alive_after_${age}ms`);
+      }
+      continue;
+    }
+
+    // Early-defer: at 5+ s, IF the watcher still owns the lease AND we have
+    // positive alive-evidence, finalize. Without alive-evidence we keep the
+    // entry parked — the safety-net branch above handles the long tail.
+    if (age >= PENDING_EARLY_DEFER_MS && watcherLease !== null && isHarnessAliveSincePush(entry)) {
+      finalizePending(entry, `early_defer_alive_at_${age}ms`);
+    }
   }
 }
 
@@ -625,10 +1086,72 @@ function emitChannelNotification(fileName: string): void {
         content_length: msg.content?.length ?? 0,
       },
     });
+
+    // 3.9.0 [CONSUME-RACE] — Escape-hatch short-circuit. If the channel was
+    // declared dead (5+ pushes within 30 s with no alive evidence), we
+    // immediately stage to .pending-ack/ WITHOUT calling the callback. The
+    // file is preserved for the next plugin reload / channel-owner takeover
+    // to replay. We deliberately stop the bleeding: callback invocation may
+    // be wedging the JSON-RPC pipe in some pathological state, and pumping
+    // more notifications at it just amplifies the silent drops.
+    if (channelMarkedDead) {
+      logWarn(`Channel: ESCAPE-HATCH active — staging ${msg.id} to .pending-ack/ without callback`);
+      logEvent({
+        event: 'channel.dead_escape_hatch_skip',
+        level: 'warn',
+        msg: `Skipping callback for ${msg.id}; channel marked dead`,
+        context: {
+          msg_id: msg.id,
+          marked_dead_at_ms: channelMarkedDeadAt,
+          age_ms: Date.now() - channelMarkedDeadAt,
+        },
+      });
+      // Stage the file but mark it as an escape-hatch entry so the
+      // hybrid AC tick leaves it alone. Escape-hatch entries sit in
+      // `.pending-ack/<target>/` indefinitely so the next plugin reload's
+      // handover-replay can pump them through a fresh channel. Reinjecting
+      // them here would just re-trigger the same dead callback.
+      stagePendingAck(fileName, msg.id, 0, true);
+      return;
+    }
+
+    // 3.9.0 [CONSUME-RACE] — Track pushes for escape-hatch detection BEFORE
+    // invoking the callback. The push timestamp goes into the recent-pushes
+    // ring; if 5+ accumulate in 30 s with no alive evidence, the next call
+    // to maybeMarkChannelDead() (driven from processPendingDeliveries) will
+    // flip channelMarkedDead.
+    const pushAt = Date.now();
+    recentPushes.push(pushAt);
+    trimRecentPushes(pushAt);
+
     withChannelNotifyTimeout(Promise.resolve(savedChannelCallback(msg)), msg.id)
       .then(() => {
-        markDelivered(msg.id);
-        archiveDeliveredMessage(fileName, msg.id, 'pushed to channel');
+        // 3.9.0 [CONSUME-RACE] — DO NOT markDelivered + archive optimistically.
+        // The promise resolved when the JSON-RPC notification was written to
+        // stdout; that is NOT proof the receiving Claude harness rendered it.
+        // Stage to .pending-ack/ instead and let the hybrid AC tick decide
+        // (early-defer + alive-evidence → finalize; safety-net + no
+        // alive-evidence → re-inject).
+        const entry = stagePendingAck(fileName, msg.id, 0);
+        if (!entry) {
+          // Staging failed (rename error). The file is still in inbox/ — the
+          // legacy fallback ledger-and-archive would lose it silently. Mark
+          // delivered + archive in place to preserve the pre-3.9 behaviour
+          // for that one error case (rare; typically EXDEV across mounts).
+          markDelivered(msg.id);
+          archiveDeliveredMessage(fileName, msg.id, 'pushed to channel (stage_pending_ack_failed)');
+          return;
+        }
+        logEvent({
+          event: 'channel.pending_staged',
+          msg: `Staged ${msg.id} to .pending-ack/ awaiting harness ack`,
+          context: {
+            msg_id: msg.id,
+            pushed_at_ms: entry.pushedAt,
+            tool_calls_at_push: entry.toolCallsAtPushTime,
+            listeners_at_push: entry.listenersAtPushTime,
+          },
+        });
       })
       .catch((err) => {
         knownFiles.delete(fileName);
@@ -713,6 +1236,18 @@ function checkForNewFiles(callback: MessageCallback): void {
       fireInboxArrivalListeners();
 
       callback(newFiles.map(f => join(INBOX_DIR, f)));
+    }
+
+    // 3.9.0 [CONSUME-RACE] — drive the hybrid AC tick on every poll cycle.
+    // This finalizes pending entries that have aged past the early-defer
+    // window (with alive evidence) and re-injects any that have gone past
+    // the safety-net window without alive evidence. Also evaluates the
+    // escape-hatch trigger condition.
+    try {
+      processPendingDeliveries();
+      maybeMarkChannelDead();
+    } catch (err) {
+      logError(`Watcher: processPendingDeliveries failed: ${err}`);
     }
   } catch (err) {
     logError(`Watcher error checking files: ${err}`);
@@ -801,6 +1336,55 @@ export async function replayUndeliveredMessages(): Promise<void> {
   if (!watcherLease) {
     logInfo('Replay: this process is standby (no watcher lease), skipping');
     return;
+  }
+
+  // 3.9.0 [CONSUME-RACE] — recover files left in `.pending-ack/<target>/`
+  // by a previous lease holder. Anything older than the handover-reinject
+  // window goes back into inbox/ so this fresh owner gets a clean retry.
+  // Sidecar `<id>.meta.json` files (if present) are removed; pushedAt is
+  // not needed once the file is back in inbox/.
+  try {
+    if (existsSync(CLAUDE_CODE_PENDING_ACK_DIR)) {
+      const ackEntries = readdirSync(CLAUDE_CODE_PENDING_ACK_DIR);
+      const nowMs = Date.now();
+      for (const ackName of ackEntries) {
+        if (!ackName.endsWith('.json')) continue;
+        if (ackName.endsWith('.meta.json')) continue;
+        const ackPath = join(CLAUDE_CODE_PENDING_ACK_DIR, ackName);
+        let mtimeMs = 0;
+        try { mtimeMs = statSync(ackPath).mtimeMs; } catch { mtimeMs = 0; }
+        const age = nowMs - mtimeMs;
+        if (mtimeMs > 0 && age < PENDING_HANDOVER_REINJECT_MS) {
+          // Too fresh — leave it in pending-ack/. The previous owner may
+          // still be running (lease handover happens during /reload-plugins
+          // and the old peer can briefly co-exist) and the hybrid AC tick
+          // there is still authoritative for this entry.
+          continue;
+        }
+        const inboxTargetPath = join(INBOX_DIR, ackName);
+        try {
+          if (!existsSync(INBOX_DIR)) mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 });
+          renameSync(ackPath, inboxTargetPath);
+          // Best-effort meta sidecar cleanup. Sidecar name format is
+          // `<id>.meta.json` where ackName is `<id>.json`.
+          const sidecarName = `${ackName.slice(0, -'.json'.length)}.meta.json`;
+          const sidecarPath = join(CLAUDE_CODE_PENDING_ACK_DIR, sidecarName);
+          try { if (existsSync(sidecarPath)) unlinkSync(sidecarPath); } catch { /* ignore */ }
+          knownFiles.delete(ackName);
+          logWarn(`Replay: re-injected handover-pending file ${ackName} (age=${age}ms)`);
+          logEvent({
+            event: 'channel.pending_handover_reinjected',
+            level: 'warn',
+            msg: `Handover replay re-injected ${ackName}`,
+            context: { file_name: ackName, age_ms: age },
+          });
+        } catch (err) {
+          logError(`Replay: failed to re-inject handover-pending ${ackName}: ${err}`);
+        }
+      }
+    }
+  } catch (err) {
+    logWarn(`Replay: failed to scan .pending-ack/${CLAUDE_CODE_TARGET}/: ${err}`);
   }
 
   try {

@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
   "description": "Bridge AI coding agents across machines via SSH. Unified MCP server hosting both the 7 outbound bridge tools (bridge_send_message, bridge_receive_messages, bridge_run_command, bridge_status, bridge_list_machines, bridge_clear_inbox, bridge_inbox_stats) AND the inbound channel watcher that pushes incoming messages to the running Claude session. Companion to the bash `agent-bridge` CLI used for pairing and SSH transport.",
-  "version": "3.8.2",
+  "version": "3.9.0",
   "author": {
     "name": "EthanSK",
     "url": "https://github.com/EthanSK/agent-bridge"
