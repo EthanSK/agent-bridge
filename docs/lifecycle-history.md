@@ -1151,4 +1151,103 @@ wait+timeout, wait+two-concurrent-pollers (broadcast), and the
 
 ---
 
+## 3.8.1 — Cross-platform send path via SFTP (2026-04-26)
+
+3.8.0 added long-poll receive but kept the legacy 3.4.x SSH heredoc for the
+send path:
+
+```ts
+// mcp-server/src/ssh.ts (≤3.8.0)
+const command = [
+  `dest=${destExpr}`,
+  'dir="$(dirname "$dest")"',
+  `tmp="$dir/${tmpName}"`,
+  'mkdir -p "$dir"',
+  'trap \'rm -f "$tmp"\' EXIT',
+  `echo '${b64}' | base64 -d > "$tmp"`,
+  'mv -f "$tmp" "$dest"',
+].join(' && ');
+return sshExec(machine, command, timeoutMs);
+```
+
+This worked fine cross-machine when both ends were Unix (macOS ↔ macOS,
+macOS ↔ Linux). After 3.8.0 added Windows install support (`install.ps1`,
+`agent-bridge.cmd`), Mac Mini tried to send to a freshly-paired Windows
+target and hit:
+
+```
+Failed to deliver message to SHITTYWINDOWS:
+  'dest' is not recognized as an internal or external command,
+  operable program or batch file.
+```
+
+Windows OpenSSH-server defaults to `cmd.exe` as the login shell.
+`dest=...` looks like a command name to cmd.exe (the `=` is not a
+separator), so the parser splits on the first space and tries to execute
+`dest=...` as a program. None of `mkdir -p`, `mv`, `cat`, `echo '<b64>'
+| base64 -d`, or `trap` exist on a default Windows install either, so
+even if the first command had run, every subsequent one would have
+failed.
+
+### The fix
+
+Switch the send path to the **SFTP subsystem**. SFTP runs `sftp-server`
+(`sftp-server.exe` on Windows) directly via the SSH `subsystem` channel,
+bypassing the login shell entirely. SFTP has native `put`, `rename`, and
+`mkdir` operations — so we can keep atomic temp+rename delivery without a
+remote `mv`/`move` shim.
+
+New helpers in `mcp-server/src/ssh.ts`:
+
+| Function | Role |
+| --- | --- |
+| `normalizeSftpPath(path)` | Strips leading `~/` (Windows OpenSSH-sftp does not expand it; SFTP's session cwd is the user's home dir on every platform). |
+| `sftpParentDirs(path)` | Walks the directory chain so we can `-mkdir` each ancestor in turn (sftp's `mkdir` is single-level, not recursive). |
+| `buildSftpBatch(local, remoteTmp, remoteFinal)` | Emits `-mkdir <ancestor>` ✕ N, `put <local> <remoteTmp>`, `rename <remoteTmp> <remoteFinal>`, `bye`. |
+| `sftpExecSingle(...)` | Runs `sftp -i <key> -o ... -P <port> -b - user@host`, piping the batch script on stdin. Same endpoint selection (Tailscale-first, no fallback) and transient-retry handling as `sshExecSingle`. |
+
+`sshWriteFile` itself becomes:
+
+1. Stage `content` in a local temp file.
+2. Compute `normalized = normalizeSftpPath(remotePath)` and
+   `remoteTmp = ${normalized}.tmp.${randomUUID()}`.
+3. `buildSftpBatch(localFile, remoteTmp, normalized)`.
+4. `sftpExecSingle(...)` with the same retry loop the SSH path used.
+5. `rmSync(localTmpDir)` in `finally` so we don't leak payloads on disk.
+
+The watcher contract is preserved — it still only fires on `*.json`
+creation, the `.tmp.<uuid>` file is invisible to its glob, and the
+`rename` is what surfaces the message. No partial-JSON quarantine path
+can fire under load.
+
+### Why not "SCP-only" or per-platform branches?
+
+- **SCP-only:** would need a separate cross-platform rename to land
+  atomically (scp can only transfer, not rename remote files). Adding a
+  rename shim means another SSH hop with shell-flavor detection — the
+  exact thing we're trying to delete.
+- **Per-platform branches:** would need the sender to know whether the
+  remote is Unix or Windows. That state has to be discovered (a
+  test-and-cache dance) and invalidated (what if the user re-pairs the
+  same machine name as a different OS?). SFTP makes the question
+  irrelevant.
+
+### Wire-compatibility
+
+`BridgeMessage` JSON, file naming, and inbox layout are unchanged. A
+3.8.1 sender talks to any 3.4.x → 3.8.0 receiver — the receiver never
+knew or cared whether the bytes arrived via `cat > $dest` vs `sftp put`.
+
+### Test coverage
+
+`mcp-server/test/sftp-write-file.test.mjs` — 10 tests covering
+`normalizeSftpPath` (4 cases), `sftpParentDirs` (4 cases including
+multi-segment `openclaw/<account>` targets), and `buildSftpBatch` (3
+cases including a regression guard that the script never contains `$`,
+`&&`, `mv -f`, `mkdir -p`, `cat `, `echo `, or `base64`).
+
+48 tests / 48 passing.
+
+---
+
 *End of lifecycle history.*

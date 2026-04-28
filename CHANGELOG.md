@@ -1,5 +1,56 @@
 # Changelog
 
+## agent-bridge 3.8.1 — 2026-04-26
+
+### Cross-platform send path (`bridge_send_message` works against Windows targets)
+
+`sshWriteFile` previously delivered messages by piping a POSIX shell pipeline
+(`dest=...; mkdir -p "$dir"; ... mv -f "$tmp" "$dest"`) over `ssh`. That broke
+against Windows OpenSSH-server because cmd.exe doesn't know `dest=`, `mkdir
+-p`, `mv`, or `$dest` syntax — every Windows-target send failed before any
+bytes hit the disk:
+
+```
+Failed to deliver message to SHITTYWINDOWS:
+  'dest' is not recognized as an internal or external command,
+  operable program or batch file.
+```
+
+3.8.1 switches the send path to the **SFTP subsystem**:
+
+- New helpers in `mcp-server/src/ssh.ts`: `normalizeSftpPath`,
+  `sftpParentDirs`, `buildSftpBatch`, plus an `sftpExecSingle` runner that
+  pipes a batch script into `sftp -b -`.
+- `sshWriteFile` now stages the message JSON in a local temp file, then
+  invokes `sftp` with `-mkdir <ancestor>`, `put localTmp remote.tmp.<uuid>`,
+  `rename remote.tmp.<uuid> remote.json`. Atomic delivery survives because
+  the inbox watcher only fires on the rename, never on a partial `*.json`.
+- No remote shell involved, so cmd.exe can't choke on the command. The SFTP
+  subsystem ships with Windows OpenSSH (`sftp-server.exe`) the same way it
+  ships with macOS / Linux OpenSSH. Forward-slash paths normalize to
+  backslashes server-side; leading `~/` is stripped because Windows
+  OpenSSH-sftp does not expand it.
+- Same retry / transient-failure handling as the old SSH path
+  (`isConnectionFailure` + `isTransientClientFailure`).
+
+#### Why SFTP and not "SCP-only"?
+
+Both are shell-free. SFTP wins because it has a native `rename` operation,
+so we keep atomic temp+rename delivery without needing a cross-platform
+`mv`/`move` shim. The watcher's "malformed JSON → quarantine to .failed/"
+code path makes non-atomic delivery dangerous; SFTP gives us atomicity for
+free on every platform.
+
+#### Tests
+
+- `mcp-server/test/sftp-write-file.test.mjs` — pins `normalizeSftpPath`,
+  `sftpParentDirs`, and `buildSftpBatch` (10 new cases, including a
+  regression guard that the batch script never contains `$`, `&&`, `mv -f`,
+  `mkdir -p`, `cat `, `echo `, or `base64`).
+- Existing version-pinned tests bumped to `3.8.1`.
+
+48 tests / 48 passing.
+
 ## Unreleased
 
 ### Windows install path (cross-platform CLI)

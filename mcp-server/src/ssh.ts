@@ -11,7 +11,7 @@
 
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { type MachineConfig } from './config.js';
@@ -220,15 +220,6 @@ function sleep(ms: number): Promise<void> {
  */
 const RETRY_BACKOFFS_MS = [0, 500, 1500] as const;
 
-function shellDoubleQuotePath(path: string): string {
-  const escapeDoubleQuoted = (value: string): string =>
-    value.replace(/(["\\$`])/g, '\\$1');
-  if (path.startsWith('~/')) {
-    return `"${'${HOME}'}/${escapeDoubleQuoted(path.slice(2))}"`;
-  }
-  return `"${escapeDoubleQuoted(path)}"`;
-}
-
 /**
  * Resolve the endpoint tuple for a given path attempt.
  */
@@ -394,9 +385,186 @@ export async function sshPing(
 }
 
 /**
- * Write content to a file on a remote machine via SSH.
- * Uses base64 encoding for safe transport of arbitrary content
- * (JSON with quotes, newlines, backslashes, etc.).
+ * Normalize a remote path for SFTP delivery.
+ *
+ * SFTP uses forward slashes on the wire; Windows OpenSSH-sftp-server normalizes
+ * forward slashes to backslashes server-side. A leading `~/` is NOT expanded by
+ * Windows OpenSSH's sftp implementation — strip it and rely on the per-user
+ * home directory being the SFTP session's starting cwd on every platform.
+ *
+ * Examples:
+ *   `~/.agent-bridge/inbox/claude-code/m.json`
+ *     → `.agent-bridge/inbox/claude-code/m.json`
+ *   `/Users/foo/.agent-bridge/inbox/...`
+ *     → `/Users/foo/.agent-bridge/inbox/...`  (left alone — absolute)
+ */
+export function normalizeSftpPath(remotePath: string): string {
+  if (remotePath.startsWith('~/')) {
+    return remotePath.slice(2);
+  }
+  if (remotePath === '~') {
+    return '.';
+  }
+  return remotePath;
+}
+
+/**
+ * Split a normalized SFTP path into its parent directory chain and filename.
+ * Returns the list of progressive directory paths (so we can `-mkdir` each
+ * one in turn — sftp's `mkdir` is single-level, not recursive). Hidden dirs
+ * (`.agent-bridge`) are included; if any directory already exists `-mkdir`
+ * silently ignores the error thanks to the leading `-`.
+ */
+export function sftpParentDirs(path: string): string[] {
+  const parts = path.split('/').filter(p => p.length > 0 && p !== '.');
+  // Drop the filename (last segment) — keep only directory components.
+  parts.pop();
+  if (parts.length === 0) return [];
+  const acc: string[] = [];
+  let prefix = path.startsWith('/') ? '' : '';
+  for (const p of parts) {
+    prefix = prefix ? `${prefix}/${p}` : (path.startsWith('/') ? `/${p}` : p);
+    acc.push(prefix);
+  }
+  return acc;
+}
+
+/**
+ * Run `sftp` against a specific endpoint with a batch script piped on stdin.
+ * Internal helper — does not do endpoint fallback (mirrors sshExecSingle).
+ */
+function sftpExecSingle(
+  machine: MachineConfig,
+  host: string,
+  port: number,
+  connectTimeoutS: number,
+  batch: string,
+  timeoutMs: number,
+): Promise<SSHResult> {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'ab-sftp-'));
+  const clientLog = join(tmpDir, 'client.log');
+  // Reuse buildSSHArgs to get identical key / port / connect-timeout / log
+  // wiring. sftp(1) accepts the same `-i / -o / -P / -E` flags as ssh, except
+  // port is `-P` instead of `-p` and the user@host is the LAST arg. We rebuild
+  // the arg list here so we can swap `-p` → `-P` cleanly.
+  const args = [
+    '-i', machine.key,
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'BatchMode=yes',
+    '-o', `ConnectTimeout=${connectTimeoutS}`,
+    '-o', 'LogLevel=ERROR',
+    '-P', String(port),
+    '-b', '-', // read batch from stdin
+    '-E', clientLog, '-o', 'LogLevel=INFO',
+    `${machine.user}@${host}`,
+  ];
+
+  const startedAt = Date.now();
+  return new Promise<SSHResult>((resolve, reject) => {
+    const proc = spawn('sftp', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+
+    const cleanup = () => {
+      try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    };
+
+    proc.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
+    proc.stderr.on('data', (c: Buffer) => { stderr += c.toString(); });
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      proc.kill('SIGKILL');
+      cleanup();
+      reject(new Error(`SFTP command timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      let clientLogText = '';
+      try { clientLogText = readFileSync(clientLog, 'utf8'); } catch { /* noop */ }
+      cleanup();
+      resolve({
+        exitCode: code ?? 1,
+        stdout,
+        stderr: stderr + clientLogText,
+        elapsedMs: Date.now() - startedAt,
+      });
+    });
+
+    proc.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(err);
+    });
+
+    // Write the batch script to stdin and close it so sftp processes it.
+    proc.stdin.write(batch);
+    proc.stdin.end();
+  });
+}
+
+/**
+ * Build the SFTP batch script for an atomic file delivery.
+ *
+ * `localFile` is the local source path (already populated). `remoteTmp` is a
+ * hidden tmp filename next to the destination. `remoteFinal` is the
+ * destination filename. We `-mkdir` each ancestor directory (errors ignored
+ * via the leading `-`), `put` to tmp, then `rename` tmp → final so the
+ * destination appears atomically.
+ *
+ * Exported for unit testing; do not call directly outside of tests.
+ */
+export function buildSftpBatch(
+  localFile: string,
+  remoteTmp: string,
+  remoteFinal: string,
+): string {
+  const lines: string[] = [];
+  for (const d of sftpParentDirs(remoteFinal)) {
+    lines.push(`-mkdir "${d}"`);
+  }
+  lines.push(`put "${localFile}" "${remoteTmp}"`);
+  lines.push(`rename "${remoteTmp}" "${remoteFinal}"`);
+  lines.push('bye');
+  return lines.join('\n') + '\n';
+}
+
+/**
+ * Write content to a file on a remote machine via SFTP (3.8.1+).
+ *
+ * Why SFTP and not `ssh "cat > $dest"`?
+ *   The previous implementation built a POSIX shell pipeline (`dest=...; mkdir
+ *   -p "$dir"; ... mv -f "$tmp" "$dest"`) and ran it via `ssh`. Windows
+ *   OpenSSH-server defaults to `cmd.exe` as the login shell, which doesn't
+ *   know `cat`, `mv`, `mkdir -p`, or `$dest` syntax — every Windows-target
+ *   send blew up with "'dest' is not recognized as an internal or external
+ *   command" before any bytes hit the disk. Switching to SFTP works because:
+ *
+ *   1. `sftp` runs the SFTP subsystem on the remote (sftp-server.exe on
+ *      Windows), bypassing the login shell entirely. Same pre-installed
+ *      subsystem on macOS, Linux, and Windows OpenSSH.
+ *   2. SFTP has native `put` and `rename` operations — atomic delivery
+ *      doesn't need a shell-level `mv`.
+ *   3. Forward-slash paths are normalized to native separators server-side
+ *      on Windows. `~/` doesn't expand on Windows-sftp, so we strip it and
+ *      rely on the SFTP session starting in the user's home dir on every
+ *      platform.
+ *
+ * Atomicity: write to a hidden `.tmp.<uuid>` filename next to the destination,
+ * then `rename` to the final path. Native inbox watchers listen for `*.json`
+ * creation; the rename event is what they see. No `*.tmp` file ever appears
+ * with the `.json` extension, so partial reads can't quarantine the message.
+ *
+ * The `SSHResult` shape is preserved so callers (only `inbox.ts:sendMessage`
+ * today) don't need to change — `exitCode === 0` means delivered.
  */
 export async function sshWriteFile(
   machine: MachineConfig,
@@ -404,25 +572,57 @@ export async function sshWriteFile(
   content: string,
   timeoutMs: number = 15000,
 ): Promise<SSHResult> {
-  logDebug(`SSH write file to ${machine.name}: ${remotePath} (${content.length}B)`);
-  // Base64-encode the content to avoid shell escaping issues with quotes,
-  // newlines, backslashes, dollar signs, etc. in JSON payloads.
-  const b64 = Buffer.from(content, 'utf8').toString('base64');
-  const destExpr = shellDoubleQuotePath(remotePath);
-  const tmpName = `.agent-bridge-${randomUUID()}.tmp`;
-  // Write to a hidden temp file in the target directory and atomically rename
-  // it into place. Native watchers listen for *.json creation, so direct writes
-  // can expose partial JSON and lose a message if the watcher quarantines it.
-  const command = [
-    `dest=${destExpr}`,
-    'dir="$(dirname "$dest")"',
-    `tmp="$dir/${tmpName}"`,
-    'mkdir -p "$dir"',
-    'trap \'rm -f "$tmp"\' EXIT',
-    `echo '${b64}' | base64 -d > "$tmp"`,
-    'mv -f "$tmp" "$dest"',
-  ].join(' && ');
-  return sshExec(machine, command, timeoutMs);
+  if (!existsSync(machine.key)) {
+    throw new Error(`SSH key not found: ${machine.key}`);
+  }
+  logDebug(`SFTP write file to ${machine.name}: ${remotePath} (${content.length}B)`);
+
+  // 1. Stage the message JSON in a local temp file. SFTP's `put` reads from
+  //    the local FS — we don't want to keep the bytes in argv or stdin.
+  const localTmpDir = mkdtempSync(join(tmpdir(), 'ab-sftp-payload-'));
+  const localFile = join(localTmpDir, `payload-${randomUUID()}.json`);
+  writeFileSync(localFile, content, { mode: 0o600 });
+
+  try {
+    const normalized = normalizeSftpPath(remotePath);
+    const remoteTmp = `${normalized}.tmp.${randomUUID()}`;
+    const batch = buildSftpBatch(localFile, remoteTmp, normalized);
+
+    // 2. Pick the same endpoint sshExec would (Tailscale-first, no fallback).
+    const kind = preferredEndpointKind(machine);
+    const ep = endpointFor(machine, kind);
+
+    let result: SSHResult | undefined;
+    for (let attempt = 0; attempt < RETRY_BACKOFFS_MS.length; attempt++) {
+      const backoff = RETRY_BACKOFFS_MS[attempt];
+      if (backoff > 0) {
+        logDebug(
+          `SFTP to ${machine.name} via ${ep.label}: transient failure, ` +
+          `backing off ${backoff}ms before retry ${attempt}/${RETRY_BACKOFFS_MS.length - 1}`,
+        );
+        await sleep(backoff);
+      }
+      result = await sftpExecSingle(
+        machine, ep.host, ep.port, ep.timeoutS, batch, timeoutMs,
+      );
+      if (
+        result.exitCode !== 0 &&
+        isConnectionFailure(result.stderr) &&
+        isTransientClientFailure(result.stderr) &&
+        attempt < RETRY_BACKOFFS_MS.length - 1
+      ) {
+        logWarn(
+          `SFTP to ${machine.name} via ${ep.label} hit transient client ` +
+          `failure (${result.stderr.trim().split('\n').pop()}), retrying`,
+        );
+        continue;
+      }
+      break;
+    }
+    return result!;
+  } finally {
+    try { rmSync(localTmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 }
 
 /**
