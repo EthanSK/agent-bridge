@@ -441,12 +441,15 @@ function sftpExecSingle(
   batch: string,
   timeoutMs: number,
 ): Promise<SSHResult> {
-  const tmpDir = mkdtempSync(join(tmpdir(), 'ab-sftp-'));
-  const clientLog = join(tmpDir, 'client.log');
-  // Reuse buildSSHArgs to get identical key / port / connect-timeout / log
-  // wiring. sftp(1) accepts the same `-i / -o / -P / -E` flags as ssh, except
-  // port is `-P` instead of `-p` and the user@host is the LAST arg. We rebuild
-  // the arg list here so we can swap `-p` → `-P` cleanly.
+  // sftp(1) shares most flags with ssh (`-i / -o / -P`), except port is `-P`
+  // instead of `-p` and the user@host is the LAST arg. We do NOT pass `-E
+  // <logfile>`: macOS ships an older OpenSSH fork whose sftp(1) does not
+  // accept `-E`, and adding it makes every send fail with
+  // `sftp: illegal option -- E` (regression introduced in 3.8.1, fixed in
+  // 3.8.2). Modern Linux/Windows OpenSSH-portable 8.6+ supports `-E` on sftp,
+  // but we don't need it — the spawn stdout/stderr capture below already
+  // surfaces any errors. If verbose logging is needed for ad-hoc debugging,
+  // add `-v` (universally supported) instead.
   const args = [
     '-i', machine.key,
     '-o', 'StrictHostKeyChecking=no',
@@ -456,7 +459,6 @@ function sftpExecSingle(
     '-o', 'LogLevel=ERROR',
     '-P', String(port),
     '-b', '-', // read batch from stdin
-    '-E', clientLog, '-o', 'LogLevel=INFO',
     `${machine.user}@${host}`,
   ];
 
@@ -467,10 +469,6 @@ function sftpExecSingle(
     let stderr = '';
     let settled = false;
 
-    const cleanup = () => {
-      try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
-    };
-
     proc.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
     proc.stderr.on('data', (c: Buffer) => { stderr += c.toString(); });
 
@@ -478,7 +476,6 @@ function sftpExecSingle(
       if (settled) return;
       settled = true;
       proc.kill('SIGKILL');
-      cleanup();
       reject(new Error(`SFTP command timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
@@ -486,13 +483,10 @@ function sftpExecSingle(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      let clientLogText = '';
-      try { clientLogText = readFileSync(clientLog, 'utf8'); } catch { /* noop */ }
-      cleanup();
       resolve({
         exitCode: code ?? 1,
         stdout,
-        stderr: stderr + clientLogText,
+        stderr,
         elapsedMs: Date.now() - startedAt,
       });
     });
@@ -501,7 +495,6 @@ function sftpExecSingle(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      cleanup();
       reject(err);
     });
 

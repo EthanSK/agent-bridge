@@ -1,5 +1,29 @@
 # Changelog
 
+## agent-bridge 3.8.2 — 2026-04-26
+
+### Fix: drop unsupported `-E` flag from sftp args (macOS)
+
+3.8.1's new SFTP send path passed `-E <clientLog>` to `sftp(1)` to capture
+client-side diagnostics. Modern Linux/Windows OpenSSH-portable 8.6+ supports
+that flag on sftp, but **macOS ships an older OpenSSH fork whose sftp does
+not accept `-E`** — every cross-machine `bridge_send_message` from a macOS
+host failed with:
+
+```
+sftp: illegal option -- E
+```
+
+making 3.8.1 effectively unusable for Mac→anywhere delivery.
+
+3.8.2 removes `-E clientLog` (and the paired `-o LogLevel=INFO`) from the
+`sftpExecSingle` arg list in `mcp-server/src/ssh.ts`. The spawn stdout/stderr
+capture already surfaces sftp errors, so no diagnostics are lost in practice
+— only the verbose per-connection client log file is gone. If verbose
+logging is needed for ad-hoc debugging, add `-v` (universally supported)
+instead. The ssh path (`sshExec` / `buildSSHArgs`) is unchanged because
+`ssh -E` is fine on every platform.
+
 ## agent-bridge 3.8.1 — 2026-04-26
 
 ### Cross-platform send path (`bridge_send_message` works against Windows targets)

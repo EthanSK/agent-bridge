@@ -101,10 +101,10 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant — 3.8.1, sourced from config.ts
+  // Version constant — 3.8.2, sourced from config.ts
   assert.ok(
-    /MCP_SERVER_VERSION\s*=\s*['"]3\.8\.1['"]/.test(configSrc),
-    'MCP_SERVER_VERSION must be 3.8.1 in config.ts',
+    /MCP_SERVER_VERSION\s*=\s*['"]3\.8\.2['"]/.test(configSrc),
+    'MCP_SERVER_VERSION must be 3.8.2 in config.ts',
   );
 });
 
@@ -124,7 +124,7 @@ test('Patch F (3.7.1): server stays in standby when a same-version healthy peer 
     token: `${process.pid}-fake-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    version: '3.8.1', // same version as our build → no kill
+    version: '3.8.2', // same version as our build → no kill
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
@@ -183,7 +183,7 @@ test('Patch F (3.7.1): standby plugin acquires lease once peer heartbeat goes st
     token: `${deadPid}-dead-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    version: '3.8.1',
+    version: '3.8.2',
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
@@ -280,7 +280,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
       const killEvent = events.find((e) => e.event === 'patch_f.peer_version_kill');
       assert.ok(killEvent, 'expected patch_f.peer_version_kill event for stale-version peer');
       assert.equal(killEvent.context.peer_version, '3.6.0', 'peer_version logged');
-      assert.equal(killEvent.context.our_version, '3.8.1', 'our_version logged');
+      assert.equal(killEvent.context.our_version, '3.8.2', 'our_version logged');
       assert.equal(killEvent.context.peer_pid, peer.pid, 'peer_pid logged');
     } finally {
       try { child.kill('SIGTERM'); } catch {}
@@ -442,7 +442,7 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
     assert.equal(typeof parsed.pid, 'number', 'status.pid is a number');
     assert.equal(parsed.pid, child.pid, 'status.pid matches the plugin child pid');
     assert.equal(typeof parsed.uptime_s, 'number', 'status.uptime_s is a number');
-    assert.equal(parsed.version, '3.8.1', 'status.version is 3.8.1');
+    assert.equal(parsed.version, '3.8.2', 'status.version is 3.8.2');
     assert.equal(typeof parsed.machine, 'string', 'status.machine is a string');
     assert.equal(parsed.machine, 'test-patch-h', 'status.machine reflects env override');
     assert.equal(typeof parsed.watcher_active, 'boolean', 'status.watcher_active is boolean');
