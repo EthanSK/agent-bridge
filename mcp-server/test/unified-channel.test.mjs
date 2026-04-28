@@ -101,10 +101,10 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant — 3.8.2, sourced from config.ts
+  // Version constant — 3.9.0, sourced from config.ts
   assert.ok(
-    /MCP_SERVER_VERSION\s*=\s*['"]3\.8\.2['"]/.test(configSrc),
-    'MCP_SERVER_VERSION must be 3.8.2 in config.ts',
+    /MCP_SERVER_VERSION\s*=\s*['"]3\.9\.0['"]/.test(configSrc),
+    'MCP_SERVER_VERSION must be 3.9.0 in config.ts',
   );
 });
 
@@ -124,7 +124,7 @@ test('Patch F (3.7.1): server stays in standby when a same-version healthy peer 
     token: `${process.pid}-fake-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    version: '3.8.2', // same version as our build → no kill
+    version: '3.9.0', // same version as our build → no kill
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
@@ -183,7 +183,7 @@ test('Patch F (3.7.1): standby plugin acquires lease once peer heartbeat goes st
     token: `${deadPid}-dead-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    version: '3.8.2',
+    version: '3.9.0',
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
@@ -280,7 +280,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
       const killEvent = events.find((e) => e.event === 'patch_f.peer_version_kill');
       assert.ok(killEvent, 'expected patch_f.peer_version_kill event for stale-version peer');
       assert.equal(killEvent.context.peer_version, '3.6.0', 'peer_version logged');
-      assert.equal(killEvent.context.our_version, '3.8.2', 'our_version logged');
+      assert.equal(killEvent.context.our_version, '3.9.0', 'our_version logged');
       assert.equal(killEvent.context.peer_pid, peer.pid, 'peer_pid logged');
     } finally {
       try { child.kill('SIGTERM'); } catch {}
@@ -442,7 +442,7 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
     assert.equal(typeof parsed.pid, 'number', 'status.pid is a number');
     assert.equal(parsed.pid, child.pid, 'status.pid matches the plugin child pid');
     assert.equal(typeof parsed.uptime_s, 'number', 'status.uptime_s is a number');
-    assert.equal(parsed.version, '3.8.2', 'status.version is 3.8.2');
+    assert.equal(parsed.version, '3.9.0', 'status.version is 3.9.0');
     assert.equal(typeof parsed.machine, 'string', 'status.machine is a string');
     assert.equal(parsed.machine, 'test-patch-h', 'status.machine reflects env override');
     assert.equal(typeof parsed.watcher_active, 'boolean', 'status.watcher_active is boolean');
@@ -458,11 +458,10 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
 });
 
 // ─── End-to-end inbox delivery via unified plugin ──────────────────────────
-test('unified plugin: watcher detects new inbox file, pushes channel notification, archives the file', { timeout: 25_000 }, async () => {
+test('unified plugin: watcher detects new inbox file, pushes channel notification, stages pending-ack (3.9.0)', { timeout: 25_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-unified-delivery-'));
   const inboxDir = join(home, '.agent-bridge', 'inbox', 'claude-code');
-  const archiveDir = join(home, '.agent-bridge', 'inbox', '.archive', 'claude-code');
-  const deliveredFile = join(home, '.agent-bridge', 'inbox', '.delivered');
+  const pendingAckDir = join(home, '.agent-bridge', 'inbox', '.pending-ack', 'claude-code');
 
   const child = startServer(home, {
     AGENT_BRIDGE_ROLE: 'channel-owner',
@@ -489,40 +488,52 @@ test('unified plugin: watcher detects new inbox file, pushes channel notificatio
     const msgPath = join(inboxDir, `${msgId}.json`);
     await writeFile(msgPath, JSON.stringify(msg, null, 2), { mode: 0o600 });
 
-    // Watcher polls every 2 s. Allow ~12 s for poll cycle + push attempt.
-    let archived = false;
+    // 3.9.0 [CONSUME-RACE] — under the hybrid AC delivery model, the file
+    // moves from inbox/<target>/ → .pending-ack/<target>/ once the channel
+    // callback resolves. Without any alive evidence (no tool calls in this
+    // test process, no long-poll listeners), it sits there until the 60 s
+    // safety net OR a positive ack arrives. Within the 12 s window we
+    // assert: file left the inbox, file landed in pending-ack/, and the
+    // sidecar meta json was written. Finalization (archive + .delivered)
+    // is the alive-evidence path and is covered by consume-race tests.
+    let staged = false;
     for (let i = 0; i < 12; i += 1) {
       await sleep(1000);
       try {
-        const archEntries = await readdir(archiveDir);
-        if (archEntries.some((f) => f.endsWith(`_${msgId}.json`))) {
-          archived = true;
+        const ackEntries = await readdir(pendingAckDir);
+        if (ackEntries.includes(`${msgId}.json`)) {
+          staged = true;
           break;
         }
       } catch {
-        /* archive dir may not exist yet */
+        /* pending-ack dir may not exist yet */
       }
     }
-    assert.ok(archived, `expected inbox file to be archived to ${archiveDir} within 12 s`);
+    assert.ok(staged, `expected inbox file to be staged into ${pendingAckDir} within 12 s`);
 
-    // .delivered ledger should contain the msg id.
-    assert.ok(existsSync(deliveredFile), '.delivered ledger should be written');
-    const delivered = await readFile(deliveredFile, 'utf8');
-    assert.ok(delivered.includes(msgId), `.delivered ledger should contain ${msgId}`);
+    // Sidecar metadata should accompany the staged file.
+    const ackEntries = await readdir(pendingAckDir);
+    assert.ok(
+      ackEntries.includes(`${msgId}.meta.json`),
+      'expected sidecar meta json alongside the pending-ack file',
+    );
 
-    // Inbox should no longer have the file.
+    // Inbox should no longer have the file (it was renamed into pending-ack/).
     const inboxRemaining = await readdir(inboxDir);
     assert.ok(
       !inboxRemaining.includes(`${msgId}.json`),
-      'inbox should no longer contain the delivered file',
+      'inbox should no longer contain the staged file',
     );
 
-    // Unified log should show message.received and message.pushed_to_channel.
+    // Unified log should show message.received, pushed_to_channel, and
+    // the new 3.9.0 channel.pending_staged event.
     const events = await readEvents(home);
     const received = events.find((e) => e.event === 'message.received' && e.context?.msg_id === msgId);
     assert.ok(received, 'expected message.received event for delivered msg');
     const pushed = events.find((e) => e.event === 'message.pushed_to_channel' && e.context?.msg_id === msgId);
     assert.ok(pushed, 'expected message.pushed_to_channel event for delivered msg');
+    const pending = events.find((e) => e.event === 'channel.pending_staged' && e.context?.msg_id === msgId);
+    assert.ok(pending, 'expected channel.pending_staged event for delivered msg (3.9.0)');
   } finally {
     try { child.kill('SIGTERM'); } catch {}
     try {
