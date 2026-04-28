@@ -91,7 +91,6 @@ async function runReceive({ peek = false, wait = false, timeout_seconds } = {}) 
       setImmediate(() => settle('timeout'));
     } else {
       timer = setTimeout(() => settle('timeout'), timeoutMs);
-      timer.unref?.();
     }
   });
 

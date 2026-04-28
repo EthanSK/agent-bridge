@@ -356,6 +356,23 @@ function ensureExhaustedDir(): void {
   }
 }
 
+function readPersistedRetryCount(metaPath: string, id: string, fileName: string): number | null {
+  if (!existsSync(metaPath)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(metaPath, 'utf8')) as {
+      id?: unknown;
+      fileName?: unknown;
+      retries?: unknown;
+    };
+    if (parsed.id !== id || parsed.fileName !== fileName) return null;
+    const retries = Number(parsed.retries);
+    if (!Number.isInteger(retries) || retries < 0) return null;
+    return retries;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Test/diagnostic helper: peek at the current pending-deliveries map.
  * Returns a shallow snapshot — callers must not mutate.
@@ -890,7 +907,8 @@ function stagePendingAck(
   // path (emitChannelNotification → stagePendingAck(..., 0)) would reset
   // retries to 0 every time the watcher re-detected the re-injected file.
   const persistedRetries = retriesByMsgId.get(id);
-  const effectiveRetries = persistedRetries ?? retries;
+  const sidecarRetries = readPersistedRetryCount(metaPath, id, fileName);
+  const effectiveRetries = Math.max(retries, persistedRetries ?? 0, sidecarRetries ?? 0);
   const entry: PendingEntry = {
     id,
     fileName,
@@ -930,6 +948,40 @@ function stagePendingAck(
   knownFiles.delete(fileName);
   invalidateCache();
   return entry;
+}
+
+function logPendingStaged(entry: PendingEntry): void {
+  logEvent({
+    event: 'channel.pending_staged',
+    msg: `Staged ${entry.id} to .pending-ack/ awaiting harness ack`,
+    context: {
+      msg_id: entry.id,
+      pushed_at_ms: entry.pushedAt,
+      retries: entry.retries,
+      tool_calls_at_push: entry.toolCallsAtPushTime,
+      listeners_at_push: entry.listenersAtPushTime,
+    },
+  });
+}
+
+function leavePendingAfterStageFailure(fileName: string, id: string, context: string): void {
+  knownFiles.delete(fileName);
+  invalidateCache();
+  logError(
+    `Channel: failed to stage ${id} into .pending-ack/ after ${context}; `
+    + 'leaving file pending for retry',
+  );
+  logEvent({
+    event: 'channel.pending_stage_failed',
+    level: 'error',
+    msg: `Failed to stage ${id} into .pending-ack/`,
+    context: {
+      msg_id: id,
+      file_name: fileName,
+      after: context,
+      decision: 'leave_pending_for_retry',
+    },
+  });
 }
 
 /**
@@ -1007,15 +1059,26 @@ function reinjectPending(entry: PendingEntry, reason: string): void {
     logError(`Channel: failed to re-inject ${entry.fileName} → inbox: ${err}`);
     return;
   }
-  try {
-    if (existsSync(entry.metaPath)) unlinkSync(entry.metaPath);
-  } catch { /* best-effort */ }
   // 3.9.1 [CONSUME-RACE] — persist newRetries BEFORE dropping from the
   // map so the next stagePendingAck (driven by the watcher re-picking
   // up the file from inbox/) restores the count instead of resetting
   // to 0. Without this, the cap of PENDING_REINJECT_MAX_RETRIES never
   // fires and the file ping-pongs forever.
   retriesByMsgId.set(entry.id, newRetries);
+  try {
+    writeFileSync(entry.metaPath, JSON.stringify({
+      id: entry.id,
+      fileName: entry.fileName,
+      pushedAt: entry.pushedAt,
+      retries: newRetries,
+      target: entry.target,
+      listenersAtPushTime: entry.listenersAtPushTime,
+      toolCallsAtPushTime: entry.toolCallsAtPushTime,
+      mcpServerVersion: MCP_SERVER_VERSION,
+    }, null, 2), { mode: 0o600 });
+  } catch (err) {
+    logWarn(`Channel: failed to persist retry sidecar for ${entry.id}: ${err}`);
+  }
   pendingDeliveries.delete(entry.id);
   // Force a re-emit on the next poll: drop from knownFiles so the
   // checkForNewFiles diff includes it again.
@@ -1178,24 +1241,10 @@ function emitChannelNotification(fileName: string): void {
         // alive-evidence → re-inject).
         const entry = stagePendingAck(fileName, msg.id, 0);
         if (!entry) {
-          // Staging failed (rename error). The file is still in inbox/ — the
-          // legacy fallback ledger-and-archive would lose it silently. Mark
-          // delivered + archive in place to preserve the pre-3.9 behaviour
-          // for that one error case (rare; typically EXDEV across mounts).
-          markDelivered(msg.id);
-          archiveDeliveredMessage(fileName, msg.id, 'pushed to channel (stage_pending_ack_failed)');
+          leavePendingAfterStageFailure(fileName, msg.id, 'channel_callback_resolve');
           return;
         }
-        logEvent({
-          event: 'channel.pending_staged',
-          msg: `Staged ${msg.id} to .pending-ack/ awaiting harness ack`,
-          context: {
-            msg_id: msg.id,
-            pushed_at_ms: entry.pushedAt,
-            tool_calls_at_push: entry.toolCallsAtPushTime,
-            listeners_at_push: entry.listenersAtPushTime,
-          },
-        });
+        logPendingStaged(entry);
       })
       .catch((err) => {
         knownFiles.delete(fileName);
@@ -1409,11 +1458,9 @@ export async function replayUndeliveredMessages(): Promise<void> {
         try {
           if (!existsSync(INBOX_DIR)) mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 });
           renameSync(ackPath, inboxTargetPath);
-          // Best-effort meta sidecar cleanup. Sidecar name format is
-          // `<id>.meta.json` where ackName is `<id>.json`.
-          const sidecarName = `${ackName.slice(0, -'.json'.length)}.meta.json`;
-          const sidecarPath = join(CLAUDE_CODE_PENDING_ACK_DIR, sidecarName);
-          try { if (existsSync(sidecarPath)) unlinkSync(sidecarPath); } catch { /* ignore */ }
+          // Keep the meta sidecar in place: it carries the retry counter
+          // across lease handover and process restart. stagePendingAck()
+          // reads it before overwriting fresh push metadata.
           knownFiles.delete(ackName);
           logWarn(`Replay: re-injected handover-pending file ${ackName} (age=${age}ms)`);
           logEvent({
@@ -1483,8 +1530,12 @@ export async function replayUndeliveredMessages(): Promise<void> {
       logInfo(`Replay: pushing message ${msg.id} from ${msg.from} (ts: ${msg.timestamp})`);
       try {
         await withChannelNotifyTimeout(Promise.resolve(channelCallback(msg)), msg.id);
-        markDelivered(msg.id);
-        archiveDeliveredMessage(fileName, msg.id, 'replayed to channel');
+        const entry = stagePendingAck(fileName, msg.id, 0);
+        if (!entry) {
+          leavePendingAfterStageFailure(fileName, msg.id, 'replay_channel_callback_resolve');
+          continue;
+        }
+        logPendingStaged(entry);
       } catch (err) {
         knownFiles.delete(fileName);
         invalidateCache();
@@ -1492,7 +1543,7 @@ export async function replayUndeliveredMessages(): Promise<void> {
       }
     }
 
-    logInfo(`Replay: completed, ${undelivered.length} message(s) delivered`);
+    logInfo(`Replay: completed, ${undelivered.length} message(s) pushed/staged`);
   } catch (err) {
     logError(`Replay: failed to scan inbox for undelivered messages: ${err}`);
   }

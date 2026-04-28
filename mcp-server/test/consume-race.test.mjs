@@ -334,8 +334,8 @@ test('E. handover replay: files in .pending-ack/ older than 30s are re-injected 
   });
 
   // Simulate handover: write a stale file directly into .pending-ack/ as if
-  // the previous lease holder had staged it. mtime defaults to now, so we
-  // need to backdate it.
+  // the previous lease holder had staged it. Include retries=2 in the sidecar
+  // so replay proves it does not reset the retry cap across lease handover.
   mkdirSync(pendingAckDir, { recursive: true });
   const id = `msg-${randomUUID()}`;
   const msg = inbox.createMessage(
@@ -343,7 +343,15 @@ test('E. handover replay: files in .pending-ack/ older than 30s are re-injected 
   );
   msg.id = id;
   const stalePath = join(pendingAckDir, `${id}.json`);
+  const sidecarPath = join(pendingAckDir, `${id}.meta.json`);
   writeFileSync(stalePath, JSON.stringify(msg, null, 2), { mode: 0o600 });
+  writeFileSync(sidecarPath, JSON.stringify({
+    id,
+    fileName: `${id}.json`,
+    pushedAt: Date.now() - 61_000,
+    retries: 2,
+    target: 'claude-code',
+  }, null, 2), { mode: 0o600 });
   // Backdate mtime to 31s ago via fs.utimesSync.
   const fs = await import('node:fs');
   const past = (Date.now() - 31_000) / 1000;
@@ -361,33 +369,30 @@ test('E. handover replay: files in .pending-ack/ older than 30s are re-injected 
   assert.ok(startedOk, 'watcher should acquire lease for handover replay');
 
   // Hook the replay so we can assert it processed the handover file. After
-  // re-injection the existing replay flow attempts to deliver it through the
-  // channel callback, which in turn re-stages it into .pending-ack/ (3.9.0
-  // hybrid AC). Either of these post-states proves handover replay worked:
-  //   - file is back in inbox/<target>/   (still pre-push)
-  //   - file is in .pending-ack/<target>/ (callback resolved, awaiting ack)
+  // re-injection the replay flow must deliver it through the same pending-ack
+  // state machine as live polling. It must NOT mark delivered/archive
+  // optimistically just because the channel callback resolved.
   await watcher.replayUndeliveredMessages();
 
   const stalePending = listAck();
   const inboxFiles = readdirSync(inboxDir);
   const archivedNow = archiveContains(id);
   const deliveredNow = deliveredLedgerHas(id);
-  const handedOver =
-    inboxFiles.includes(`${id}.json`)
-    || stalePending.includes(`${id}.json`)
-    || archivedNow
-    || deliveredNow;
   assert.ok(
-    handedOver,
-    `expected handover-replay to recover ${id}.json into inbox/ / .pending-ack/ / .archive/ / .delivered; `
+    stalePending.includes(`${id}.json`),
+    `expected handover-replay to re-stage ${id}.json into .pending-ack/; `
     + `inbox=${JSON.stringify(inboxFiles)}, pending-ack=${JSON.stringify(stalePending)}, `
     + `archived=${archivedNow}, delivered=${deliveredNow}`,
   );
+  assert.equal(archivedNow, false, 'handover replay must not archive optimistically');
+  assert.equal(deliveredNow, false, 'handover replay must not mark delivered optimistically');
+  const entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === id);
+  assert.ok(entry, 'replayed handover file should have a pending entry');
+  assert.equal(entry.retries, 2, 'handover replay must preserve sidecar retry count');
 
-  // Original stale path (the one we backdated) MUST be gone — that's the
-  // load-bearing assertion: handover replay actually picked the file up,
-  // not just its timestamp.
-  assert.ok(!existsSync(stalePath), 'original handover file in pending-ack/ should be gone');
+  // The file should be back at the pending-ack path after replay re-injects it
+  // and the callback success re-stages it through the hybrid AC flow.
+  assert.ok(existsSync(stalePath), 'handover file should be re-staged at the pending-ack path');
 
   watcher.stopWatcher();
   for (const f of readdirSync(inboxDir)) try { rmSync(join(inboxDir, f)); } catch {}

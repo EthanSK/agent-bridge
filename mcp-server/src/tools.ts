@@ -584,12 +584,9 @@ export function registerTools(server: McpServer): void {
           setImmediate(() => settle('timeout'));
         } else {
           timer = setTimeout(() => settle('timeout'), timeoutMs);
-          // Don't ref a long-poll timer in tools-only contexts; we need
-          // Node alive while the parent MCP request is in flight, but the
-          // SDK transport already keeps the loop alive for that duration.
-          // Refing here would be redundant; unref keeps test sandboxes
-          // from hanging on stuck timers.
-          if (typeof timer.unref === 'function') timer.unref();
+          // Keep the timer ref'd: the outstanding MCP request is real work,
+          // and the timeout must be able to resolve even in a quiet tools-only
+          // process with no other active handles.
         }
       });
 
