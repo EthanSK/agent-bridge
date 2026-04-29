@@ -333,10 +333,13 @@ function quoteSftpPath(path) {
  * upload to a hidden temporary path, then rename to the final `.json`.
  */
 export function buildSftpBatch(localFile, remoteTmp, remoteFinal) {
-  // [OC-FIX-CODEX-XPLAT 2026-04-29] SFTP protocol ops only: resolve the
-  // connecting user's home via the SFTP server, create each parent directory
-  // one level at a time, put to a temp path, then atomic rename.
-  const lines = ["cd ~"];
+  // [OC-FIX-CODEX-XPLAT 2026-04-29] + [SFTP-CD-TILDE-FIX 2026-04-29] SFTP
+  // protocol ops only. Paths are relative to the connecting user's home
+  // (sftp's CWD on connect) — DO NOT prepend `cd ~` because that is
+  // server-dependent and breaks against some macOS sftp builds. Create each
+  // parent directory one level at a time, put to a temp path, then atomic
+  // rename.
+  const lines = [];
   for (const dir of sftpParentDirs(remoteFinal)) {
     lines.push(`-mkdir ${quoteSftpPath(dir)}`);
   }

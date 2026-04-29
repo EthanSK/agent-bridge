@@ -119,8 +119,8 @@ test("OpenClaw outbound SFTP batch is home-relative and shell-free", () => {
     remoteFinal,
   );
 
+  // [SFTP-CD-TILDE-FIX 2026-04-29] No `cd ~` — server-dependent.
   assert.deepEqual(batch.trim().split("\n"), [
-    "cd ~",
     '-mkdir ".agent-bridge"',
     '-mkdir ".agent-bridge/inbox"',
     '-mkdir ".agent-bridge/inbox/openclaw"',
@@ -129,6 +129,7 @@ test("OpenClaw outbound SFTP batch is home-relative and shell-free", () => {
     'rename ".agent-bridge/inbox/openclaw/default/msg-1.json.tmp.abc" ".agent-bridge/inbox/openclaw/default/msg-1.json"',
     "bye",
   ]);
+  assert.equal(batch.includes("cd ~"), false, "regression guard: no `cd ~`");
 
   for (const banned of ["$HOME", "mkdir -p", "mv -f", "cat <<", "scp "]) {
     assert.equal(batch.includes(banned), false, `unexpected shell construct ${banned}`);

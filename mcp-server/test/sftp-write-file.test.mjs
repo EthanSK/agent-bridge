@@ -82,7 +82,6 @@ test('buildSftpBatch emits -mkdir for each ancestor, put, rename, bye', () => {
   );
   const lines = batch.trim().split('\n');
   assert.deepEqual(lines, [
-    'cd ~',
     '-mkdir ".agent-bridge"',
     '-mkdir ".agent-bridge/inbox"',
     '-mkdir ".agent-bridge/inbox/claude-code"',
@@ -92,11 +91,12 @@ test('buildSftpBatch emits -mkdir for each ancestor, put, rename, bye', () => {
   ]);
 });
 
-test('buildSftpGetBatch and buildSftpListBatch start in the SFTP home directory', () => {
+test('buildSftpGetBatch and buildSftpListBatch use home-relative paths (no cd ~)', () => {
+  // [SFTP-CD-TILDE-FIX 2026-04-29] SFTP starts in user's home; `cd ~` is
+  // server-dependent and breaks against some macOS sftp builds.
   assert.deepEqual(
     ssh.buildSftpGetBatch('~/.agent-bridge/inbox/claude-code/m1.json', '/local/out.json').trim().split('\n'),
     [
-      'cd ~',
       'get ".agent-bridge/inbox/claude-code/m1.json" "/local/out.json"',
       'bye',
     ],
@@ -104,7 +104,6 @@ test('buildSftpGetBatch and buildSftpListBatch start in the SFTP home directory'
   assert.deepEqual(
     ssh.buildSftpListBatch('~/.agent-bridge/inbox/claude-code').trim().split('\n'),
     [
-      'cd ~',
       'ls -1 ".agent-bridge/inbox/claude-code"',
       'bye',
     ],
@@ -119,15 +118,30 @@ test('buildSftpBatch trailing newline so sftp -b - flushes the last command', ()
 test('buildSftpGetBatch downloads via SFTP get without remote shell', () => {
   assert.equal(
     ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', '/tmp/local m1.json'),
-    'cd ~\nget ".agent-bridge/inbox/m1.json" "/tmp/local m1.json"\nbye\n',
+    'get ".agent-bridge/inbox/m1.json" "/tmp/local m1.json"\nbye\n',
   );
 });
 
 test('buildSftpListBatch lists via SFTP ls without remote shell redirection', () => {
   assert.equal(
     ssh.buildSftpListBatch('.agent-bridge/inbox/claude-code'),
-    'cd ~\nls -1 ".agent-bridge/inbox/claude-code"\nbye\n',
+    'ls -1 ".agent-bridge/inbox/claude-code"\nbye\n',
   );
+});
+
+test('SFTP batches do NOT contain `cd ~` (regression: server-dependent tilde-expansion)', () => {
+  // [SFTP-CD-TILDE-FIX 2026-04-29] regression: `cd ~` returned "stat remote:
+  // No such file or directory" on MBP's sftp while succeeding on Mini's.
+  // Drop it everywhere — SFTP CWD = user's home on connect.
+  const batches = [
+    ssh.buildSftpBatch('/l', 'r.tmp', '~/.agent-bridge/inbox/claude-code/m1.json'),
+    ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', '/tmp/local'),
+    ssh.buildSftpListBatch('.agent-bridge/inbox/claude-code'),
+  ];
+  for (const batch of batches) {
+    assert.doesNotMatch(batch, /^cd \~/m, 'batch must not start with `cd ~`');
+    assert.doesNotMatch(batch, /\ncd \~\n/, 'batch must not contain `cd ~` line');
+  }
 });
 
 test('buildSftpBatch produces no shell-mode constructs ($, &&, |, mv, mkdir -p)', () => {
