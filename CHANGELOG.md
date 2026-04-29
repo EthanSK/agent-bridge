@@ -39,6 +39,11 @@ The check is intentionally cheap: just `git fetch` plus a couple of
 remains an explicit decision (run `scripts/update.sh` from the
 harness, or via cron / SessionStart hook).
 
+Verified end-to-end on Windows / Mac mini / MacBook Pro on 2026-04-29:
+local self-drop → channel push round-trips through the existing
+`notifications/claude/channel` path, and the boot-time probe arms
+on `server.connect()` for the channel-owner only.
+
 ## agent-bridge 3.9.4 — 2026-04-29
 
 ### Update helper: quiet auto mode + stale plugin cache archive
