@@ -1370,4 +1370,170 @@ end-to-end `unified plugin` test which now asserts pending-ack staging
 
 ---
 
+## 3.9.1 — Retry-counter persistence across re-inject (2026-04-28)
+
+### The bug
+
+3.9.0 had the retry-cap *intent* right (3 re-injects → `.failed/.exhausted/`)
+but the *bookkeeping* wrong. `reinjectPending` deleted the entry from
+`pendingDeliveries` after moving the file back into `inbox/<target>/` so
+the watcher's next poll would see it as "new" and re-stage. But the
+re-stage path (`emitChannelNotification` → `stagePendingAck(fileName,
+msg.id, retries=0)`) hardcoded `0` for the retries argument. So every
+fresh stage had retries=0, every safety-net tick computed `newRetries =
+0 + 1 = 1`, and the cap of 3 was never reached.
+
+Real-world fingerprint: Mac Mini observed the same channel push 5+
+times. Logs verbatim showed `"retry 1/3"` on every cycle, indefinitely.
+The file ping-ponged forever between `inbox/` and `.pending-ack/`.
+
+### The fix
+
+Introduced `retriesByMsgId: Map<string, number>` in `watcher.ts`. The
+map persists ACROSS the `pendingDeliveries.delete()` →
+`stagePendingAck()` boundary. `stagePendingAck` consults the map first
+and uses the persisted count instead of the param when present.
+`finalizePending` and the `.exhausted/` branch of `reinjectPending`
+GC their entries.
+
+Process restart resets the map, but that's fine — the safety-net replay
+window resets too, and `replayUndeliveredMessages` (handover replay)
+bounds the worst-case duplication via the 30 s `pushedAt` floor.
+
+### Test coverage
+
+`consume-race.test.mjs` — case G: drives `_processPendingDeliveriesForTesting`
+through 4 reinjects and asserts the file lands in `.failed/.exhausted/`
+once retries=3 is exceeded. Pre-fix this test ping-ponged forever; post-fix
+it terminates on attempt 4 as expected.
+
+### Code map
+
+- `mcp-server/src/watcher.ts:200+` — `retriesByMsgId` declaration.
+- `mcp-server/src/watcher.ts` — `stagePendingAck` consults the map first.
+- `mcp-server/src/watcher.ts` — `reinjectPending` writes the new count
+  into the map *before* deleting the in-memory entry.
+- `mcp-server/test/consume-race.test.mjs` — case G regression.
+
+Commit: `ecdf69b`.
+
+---
+
+## 3.9.2 — Lease-binding + `AGENT_BRIDGE_ROLE` env-pin (2026-04-29)
+
+### The bug — env leak from sibling MCP children
+
+Claude Code's plugin host can spawn multiple MCP children for distinct
+plugins under the same parent Claude session, and child processes inherit
+their environment from the spawning context. In an OpenClaw + Claude Code
+shared-machine setup (Mac Mini), the OpenClaw gateway sets
+`AGENT_BRIDGE_ROLE=tools-only` for *its* agent-bridge MCP child (correctly,
+because OpenClaw owns the channel-push lease via `openclaw-channel/`). When
+the *Claude Code* agent-bridge child spawned next, it inherited
+`AGENT_BRIDGE_ROLE=tools-only` from the sibling's environment.
+
+`mcp-server/src/index.ts:711` short-circuits the watcher entirely when role
+is `tools-only`. Result:
+
+- `~/.agent-bridge/locks/claude-code.watcher-lock.json` was never written.
+- Inbound messages staged in `inbox/claude-code/<id>.json` and never
+  channel-pushed into the running Claude session.
+- `bridge_send_message` from Claude *worked* (tools-only sends fine).
+- Inbound `<channel source="agent-bridge" ...>` blocks never appeared.
+
+This is a tools-only-everywhere zombie state — outbound works, inbound dies
+silently. Diagnostic signature: lock file absent, `bridge_inbox_stats` shows
+non-zero pending count, `claude_code_channel_status` reports
+`role: "tools-only"`.
+
+### The fix
+
+`mcp-server/.mcp.json` now explicitly pins
+`"AGENT_BRIDGE_ROLE": "channel-owner"` in the env block. Plugin-loaded
+spawns under Claude Code therefore always start as channel-owner regardless
+of inherited environment. The earlier "auto-demote when not channel-capable"
+fallback (CHANGELOG ref: `1008`) still applies as a safety net for
+non-Claude-Code MCP hosts that happen to spawn this same `.mcp.json`.
+
+For OpenClaw-side MCP children, the `tools-only` role is set explicitly via
+`openclaw mcp set agent-bridge ...` with an `env: { AGENT_BRIDGE_ROLE:
+"tools-only" }` block — i.e. tools-only is opt-in per host configuration,
+not opt-in per environment leak.
+
+Commit: `fdb3125` (`fix(mcp): pin AGENT_BRIDGE_ROLE=channel-owner in
+.mcp.json`).
+
+Diagnostic marker for future grep: `[OC-FIX-CODEX-LEASE 2026-04-29]`.
+
+### Wire-compat
+
+No on-disk schema changes. No tests added (the bug only reproduces under a
+specific Claude+OpenClaw co-tenancy and is mitigated by explicit env in
+config rather than by code logic).
+
+### What this does NOT cover
+
+The pin solves *config-leak* into Claude-Code spawns. It does **not** solve
+the related class of problems where two distinct Claude Code sessions on
+the same machine race to claim the channel-owner lease (sibling-spawn race
+— see "MCP plugin lifecycle failure modes" below). For that, Patch F's
+heartbeat-recency guard (3.5.2/3.7.0) plus 3.7.1's standby-retry remain
+the load-bearing defenses.
+
+---
+
+## 3.9.3 — Deferred: relax alive-heuristic to count cross-channel evidence
+
+### Status: open issue, not yet implemented
+
+The 3.9.0 alive-heuristic in `isHarnessAliveSincePush` returns TRUE on
+three signals:
+
+1. `toolCallsReceivedCount > pending.toolCallsAtPushTime` — MCP tool call
+   landed since push.
+2. `inboxArrivalListenerCount() > 0` — an active long-poll listener.
+3. `savedChannelCallbackRegisteredAt > pushedAt` — plugin reload mid-flight.
+
+All three are *internal to the agent-bridge MCP server*. None of them fire
+when the running Claude harness is alive but is busy doing work that
+doesn't touch agent-bridge tools — e.g. responding to a Telegram message,
+running a build, executing a different MCP plugin's tools.
+
+In that scenario the harness *did* receive the channel push (because
+`notifications/claude/channel` was successfully written to its stdin and
+the harness rendered it into context), but agent-bridge's heuristic has
+no way to tell. The 60 s safety-net then re-injects, the harness sees the
+same `<channel ...>` block twice, and Ethan reads the same answer twice.
+
+### Option (b) — the deferred fix
+
+Treat **subsequent channel-push events for later messages** as alive-
+evidence too. If the watcher successfully push-completed message Y at
+`tY > pendingX.pushedAt`, that is positive proof the JSON-RPC pipe to the
+harness is alive (the harness's stdin is the only consumer of those
+notifications). So: if any newer push has resolved successfully since
+`pendingX.pushedAt`, mark X alive without needing tool-call evidence.
+
+This is option (b) from the original design discussion (the others were
+(a) make the watcher emit a synthetic ping the harness could ack, and (c)
+require explicit ack tools the harness must call back through). Option (b)
+needs no harness cooperation — it's pure server-side bookkeeping.
+
+### Why deferred
+
+3.9.2 stopped the bleeding for the most common case (the env-leak that
+killed channel-owner entirely on Mac Mini). The remaining duplicate-push
+case is a UX papercut, not a correctness failure: messages still get
+delivered, they just get delivered twice. Implementing option (b) needs:
+
+- A `lastSuccessfulPushAt: number | null` field on the watcher.
+- An update path from `emitChannelNotification`'s resolve branch.
+- `isHarnessAliveSincePush` checks `lastSuccessfulPushAt > pending.pushedAt`.
+- Tests that drive two pushes back-to-back and assert the first finalizes
+  on the second's resolve, not on its own 60 s safety-net.
+
+Tracked in the project's TODO. No commits yet.
+
+---
+
 *End of lifecycle history.*
