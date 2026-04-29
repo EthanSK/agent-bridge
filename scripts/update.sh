@@ -18,7 +18,6 @@
 #
 # Usage:
 #   scripts/update.sh [--yes] [--auto] [--skip-openclaw] [--skip-reload]
-#                     [--fan-out] [--dry-run]
 #
 # Options:
 #   -y, --yes         answer yes to interactive prompts
@@ -27,16 +26,6 @@
 #                    needed, and only prints on real changes or errors
 #   --skip-openclaw  skip the OpenClaw gateway restart step
 #   --skip-reload    skip Claude Code /reload-plugins automation
-#   --fan-out        after the local update finishes, propagate to every paired
-#                    peer in ~/.agent-bridge/config (SSH + remote update.sh,
-#                    falling back to a manual rebuild on failure), then drop a
-#                    [MATRIX-UPDATE-DONE] BridgeMessage into each peer's
-#                    inbox/claude-code/ subdir asking it to /reload-plugins.
-#                    Implies --auto. Continues on per-peer failures.
-#   --dry-run        print what would happen without doing it. With --fan-out,
-#                    skips the local update steps AND the per-peer SSH /
-#                    BridgeMessage dispatch — just prints the plan. Useful
-#                    for verifying which peers would be touched.
 #
 # Cache cleanup:
 #   After a successful pull + rebuild, older inactive Claude Code plugin cache
@@ -61,11 +50,9 @@ ASSUME_YES=0
 AUTO=0
 SKIP_OPENCLAW=0
 SKIP_RELOAD=0
-FAN_OUT=0
-DRY_RUN=0
 
 usage() {
-  sed -n '2,46p' "$0"
+  sed -n '2,36p' "$0"
 }
 
 for arg in "$@"; do
@@ -78,24 +65,13 @@ for arg in "$@"; do
       ;;
     --skip-openclaw) SKIP_OPENCLAW=1 ;;
     --skip-reload) SKIP_RELOAD=1 ;;
-    --fan-out)
-      # [MATRIX-FAN-OUT 2026-04-29] Fan-out propagates the update to every
-      # paired peer over SSH and then asks each peer to /reload-plugins via
-      # a BridgeMessage drop into inbox/claude-code/. --fan-out implies
-      # --auto so the local pass stays SessionStart-safe.
-      FAN_OUT=1
-      AUTO=1
-      ASSUME_YES=1
-      SKIP_OPENCLAW=1
-      ;;
-    --dry-run) DRY_RUN=1 ;;
     -h|--help)
       usage
       exit 0
       ;;
     *)
       echo "unknown arg: $arg" >&2
-      echo "usage: $0 [--yes] [--auto] [--skip-openclaw] [--skip-reload] [--fan-out] [--dry-run]" >&2
+      echo "usage: $0 [--yes] [--auto] [--skip-openclaw] [--skip-reload]" >&2
       exit 2
       ;;
   esac
@@ -311,29 +287,6 @@ if (( ! AUTO )); then
   say "==> agent-bridge repo: $REPO_ROOT"
 fi
 
-# [MATRIX-FAN-OUT 2026-04-29] In --dry-run mode the local update is a no-op too
-# — the user is asking "what would this do", not "do most of it". The fan-out
-# planner below still prints its plan after this short-circuit.
-if (( DRY_RUN )); then
-  AUTO_VERBOSE=1
-  say "==> [dry-run] would: git fetch + git pull --ff-only origin main in $REPO_ROOT"
-  say "==> [dry-run] would: rebuild mcp-server (npm install + npm run build) if commits arrived or build/ missing"
-  say "==> [dry-run] would: archive stale Claude plugin caches under $HOME/.claude/plugins/cache/agent-bridge/agent-bridge"
-  say "==> [dry-run] would: sync mcp-server build into each cache version dir"
-  if (( SKIP_OPENCLAW )); then
-    say "==> [dry-run] would: SKIP OpenClaw gateway restart (--skip-openclaw / --auto / --fan-out)"
-  else
-    say "==> [dry-run] would: restart OpenClaw gateway if commits arrived"
-  fi
-  if (( SKIP_RELOAD )); then
-    say "==> [dry-run] would: SKIP /reload-plugins (--skip-reload)"
-  else
-    say "==> [dry-run] would: trigger /reload-plugins via self-reload-plugins skill on macOS"
-  fi
-fi
-
-if (( ! DRY_RUN )); then
-
 # ---------- 1. Git pull -----------------------------------------------------
 
 hr
@@ -539,368 +492,4 @@ if (( NOTHING_CHANGED )); then
   say "    Nothing changed. Repo was already at $(git rev-parse --short HEAD)."
 else
   say "    Now at $(git rev-parse --short HEAD) ($(git log -1 --format=%s))."
-fi
-
-fi  # end: if (( ! DRY_RUN ))
-
-# ---------- 7. Fan-out to paired peers --------------------------------------
-# [MATRIX-FAN-OUT 2026-04-29]
-#
-# When --fan-out is passed, propagate the update to every paired peer:
-#   1. Parse ~/.agent-bridge/config to enumerate top-level [Machine] sections.
-#   2. Skip the local machine and any ".lan" suffixed sub-sections (they're
-#      LAN-fallback duplicates of the same peer).
-#   3. SSH to each peer using its identity_file with IdentitiesOnly=yes (matches
-#      the [OC-FIX-CODEX-XPLAT] pattern in mcp-server/src/ssh.ts) and
-#      Tailscale-first endpoint selection (internet_host if set, else host).
-#   4. Run the remote update.sh --auto under one of the canonical repo paths
-#      (~/Projects/agent-bridge OR ~/.openclaw/workspace/agent-bridge). On
-#      remote update failure, fall back to a manual rebuild against the same
-#      repo path.
-#   5. After the SSH pass, drop a [MATRIX-UPDATE-DONE] BridgeMessage JSON file
-#      into each peer's ~/.agent-bridge/inbox/claude-code/<id>.json via SFTP
-#      so the running Claude Code session sees a request to /reload-plugins.
-#
-# Continues on per-peer failures — one bad peer must not block the others.
-# --dry-run prints the plan and skips all remote work.
-
-if (( FAN_OUT )); then
-  AUTO_VERBOSE=1
-  hr
-  if (( DRY_RUN )); then
-    say "==> Step 7/7: --fan-out (DRY RUN — no remote work)"
-  else
-    say "==> Step 7/7: --fan-out — propagating to paired peers"
-  fi
-
-  CONFIG_FILE_FAN="$HOME/.agent-bridge/config"
-  if [[ ! -f "$CONFIG_FILE_FAN" ]]; then
-    warn "no $CONFIG_FILE_FAN — nothing to fan out to."
-  else
-    # Determine the local machine name so we can skip self.
-    LOCAL_NAME="${AGENT_BRIDGE_MACHINE_NAME:-}"
-    if [[ -z "$LOCAL_NAME" && -f "$HOME/.agent-bridge/machine-name" ]]; then
-      LOCAL_NAME="$(tr -d '[:space:]' <"$HOME/.agent-bridge/machine-name" 2>/dev/null || true)"
-    fi
-    if [[ -z "$LOCAL_NAME" ]]; then
-      LOCAL_NAME="$(hostname 2>/dev/null | sed 's/\.local$//' || printf 'unknown')"
-    fi
-
-    # ---- helpers (scoped to fan-out only) -----------------------------------
-
-    # Read a single key from a [section] in the config file. Echoes value to
-    # stdout, returns 0 on hit, 1 on miss. Same case-sensitivity as cfg_get
-    # in agent-bridge: section match is case-insensitive, key match is exact.
-    _peer_cfg_get() {
-      local section="$1" key="$2" line in_section=0 lower_section
-      lower_section="$(printf '%s' "$section" | tr '[:upper:]' '[:lower:]')"
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%$'\r'}"
-        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
-          local s_lower
-          s_lower="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
-          if [[ "$s_lower" == "$lower_section" ]]; then
-            in_section=1
-          else
-            in_section=0
-          fi
-          continue
-        fi
-        if (( in_section )) && [[ "$line" =~ ^${key}=(.*)$ ]]; then
-          printf '%s' "${BASH_REMATCH[1]}"
-          return 0
-        fi
-      done < "$CONFIG_FILE_FAN"
-      return 1
-    }
-
-    # Enumerate top-level peer section names (skip *.lan duplicates).
-    _peer_list() {
-      local line section
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        line="${line%$'\r'}"
-        if [[ "$line" =~ ^\[(.+)\]$ ]]; then
-          section="${BASH_REMATCH[1]}"
-          # Skip the LAN sub-section flavour (e.g. "MacBookPro.lan") — the
-          # main section already carries the same key/host pair plus an
-          # optional internet_host for Tailscale.
-          [[ "$section" == *.lan ]] && continue
-          printf '%s\n' "$section"
-        fi
-      done < "$CONFIG_FILE_FAN"
-    }
-
-    # Build the SSH arg list for a peer using the same identity/Identity-only
-    # pattern as mcp-server/src/ssh.ts buildSSHArgs().
-    _peer_ssh() {
-      local name="$1"
-      shift
-      local host port user keypath identity_file endpoint
-      host="$(_peer_cfg_get "$name" host || true)"
-      port="$(_peer_cfg_get "$name" port || printf 22)"
-      user="$(_peer_cfg_get "$name" user || true)"
-      identity_file="$(_peer_cfg_get "$name" identity_file || true)"
-      keypath="$(_peer_cfg_get "$name" key || true)"
-      [[ -z "$identity_file" ]] && identity_file="$keypath"
-      # Tailscale-first endpoint selection.
-      endpoint="$(_peer_cfg_get "$name" internet_host || true)"
-      [[ -z "$endpoint" ]] && endpoint="$host"
-
-      if [[ -z "$endpoint" || -z "$user" || -z "$identity_file" ]]; then
-        return 99  # malformed config
-      fi
-      ssh \
-        -i "$identity_file" \
-        -o IdentitiesOnly=yes \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o BatchMode=yes \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        -p "$port" \
-        "${user}@${endpoint}" \
-        "$@"
-    }
-
-    # SFTP a local file into ~/.agent-bridge/inbox/claude-code/<basename> on
-    # the peer using the same Tailscale-first endpoint selection as _peer_ssh.
-    # Mirrors the OC-FIX-CODEX-XPLAT SFTP pattern.
-    _peer_sftp_put_inbox() {
-      local name="$1" local_file="$2" remote_basename="$3"
-      local host port user keypath identity_file endpoint
-      host="$(_peer_cfg_get "$name" host || true)"
-      port="$(_peer_cfg_get "$name" port || printf 22)"
-      user="$(_peer_cfg_get "$name" user || true)"
-      identity_file="$(_peer_cfg_get "$name" identity_file || true)"
-      keypath="$(_peer_cfg_get "$name" key || true)"
-      [[ -z "$identity_file" ]] && identity_file="$keypath"
-      endpoint="$(_peer_cfg_get "$name" internet_host || true)"
-      [[ -z "$endpoint" ]] && endpoint="$host"
-
-      if [[ -z "$endpoint" || -z "$user" || -z "$identity_file" ]]; then
-        return 99
-      fi
-      local remote_tmp="${remote_basename}.tmp.$$"
-      local batch
-      batch=$'-mkdir ".agent-bridge"\n-mkdir ".agent-bridge/inbox"\n-mkdir ".agent-bridge/inbox/claude-code"\n'
-      batch+="put \"$local_file\" \".agent-bridge/inbox/claude-code/${remote_tmp}\""$'\n'
-      batch+="rename \".agent-bridge/inbox/claude-code/${remote_tmp}\" \".agent-bridge/inbox/claude-code/${remote_basename}\""$'\n'
-      batch+="bye"$'\n'
-      printf '%s' "$batch" | sftp \
-        -i "$identity_file" \
-        -o IdentitiesOnly=yes \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o BatchMode=yes \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        -P "$port" \
-        -b - \
-        "${user}@${endpoint}"
-    }
-
-    # Generate a tolerable UUID-ish id without depending on uuidgen.
-    _peer_msg_id() {
-      if command -v uuidgen >/dev/null 2>&1; then
-        printf 'msg-%s' "$(uuidgen | tr '[:upper:]' '[:lower:]')"
-      else
-        printf 'msg-%s-%s-%s' "$(date -u +%s)" "$$" "$RANDOM$RANDOM"
-      fi
-    }
-
-    # ---- main fan-out loop --------------------------------------------------
-
-    # Remote update payload: probe both canonical repo paths, run update.sh
-    # --auto under whichever exists, and on failure fall back to a manual
-    # rebuild + cache-version copy. Source ~/.zshrc and prepend the usual
-    # node locations so non-interactive PATH still finds npm.
-    REMOTE_PAYLOAD='set -u
-# Source common shell init so npm/node/etc are on PATH for non-interactive ssh.
-[ -f "$HOME/.zshrc" ] && . "$HOME/.zshrc" >/dev/null 2>&1 || true
-[ -f "$HOME/.profile" ] && . "$HOME/.profile" >/dev/null 2>&1 || true
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-# Add the latest nvm node bin if nvm is installed but not yet on PATH.
-if [ -d "$HOME/.nvm/versions/node" ]; then
-  latest_node="$(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | sort -V | tail -1 || true)"
-  if [ -n "$latest_node" ]; then
-    export PATH="$HOME/.nvm/versions/node/$latest_node/bin:$PATH"
-  fi
-fi
-candidates="$HOME/Projects/agent-bridge $HOME/.openclaw/workspace/agent-bridge"
-target=""
-for c in $candidates; do
-  if [ -d "$c/.git" ] && [ -f "$c/scripts/update.sh" ]; then
-    target="$c"
-    break
-  fi
-done
-if [ -z "$target" ]; then
-  echo "fan-out: no agent-bridge repo found in $candidates" >&2
-  exit 90
-fi
-cd "$target" || exit 91
-echo "fan-out: target=$target"
-git pull --ff-only origin main || {
-  echo "fan-out: git pull failed at $target — refusing to rebuild" >&2
-  exit 92
-}
-if bash scripts/update.sh --auto; then
-  echo "fan-out: update.sh --auto succeeded at $target"
-  exit 0
-fi
-echo "fan-out: update.sh --auto failed at $target — falling back to manual rebuild" >&2
-cd "$target/mcp-server" || exit 93
-npm install --no-fund --no-audit || exit 94
-npm run build || exit 95
-NEW_VERSION="$(node -e "process.stdout.write(require(\"./package.json\").version)" 2>/dev/null || true)"
-if [ -n "$NEW_VERSION" ]; then
-  CACHE_DIR="$HOME/.claude/plugins/cache/agent-bridge/agent-bridge/$NEW_VERSION"
-  if [ -d "$HOME/.claude/plugins/cache/agent-bridge/agent-bridge" ] && [ ! -d "$CACHE_DIR" ]; then
-    mkdir -p "$CACHE_DIR/build" "$CACHE_DIR/src" "$CACHE_DIR/.claude-plugin" || true
-    cp -R build/. "$CACHE_DIR/build/" 2>/dev/null || true
-    cp -R src/. "$CACHE_DIR/src/" 2>/dev/null || true
-    cp package.json package-lock.json tsconfig.json .mcp.json "$CACHE_DIR/" 2>/dev/null || true
-    [ -f .claude-plugin/plugin.json ] && cp .claude-plugin/plugin.json "$CACHE_DIR/.claude-plugin/plugin.json"
-    echo "fan-out: manual cache primed at $CACHE_DIR"
-  fi
-fi
-echo "fan-out: manual rebuild succeeded at $target"
-exit 0
-'
-
-    # macOS bash 3.2 + `set -u` quirk: expanding "${arr[@]}" on an empty array
-    # raises "unbound variable". Initialize to a safe empty state and gate
-    # iterations on the length, never bare expansion.
-    PEER_RESULTS=()
-    PEER_NAMES=()
-    while IFS= read -r peer; do
-      [[ -z "$peer" ]] && continue
-      # Skip self.
-      if [[ "$(printf '%s' "$peer" | tr '[:upper:]' '[:lower:]')" == \
-            "$(printf '%s' "$LOCAL_NAME" | tr '[:upper:]' '[:lower:]')" ]]; then
-        say "    skipping self ($peer)"
-        continue
-      fi
-      PEER_NAMES+=("$peer")
-
-      if (( DRY_RUN )); then
-        say "    [dry-run] would: ssh to $peer and run remote update payload (probe ~/Projects/agent-bridge then ~/.openclaw/workspace/agent-bridge, run update.sh --auto, fall back to manual rebuild)"
-        PEER_RESULTS+=("$peer:dryrun")
-        continue
-      fi
-
-      say "    ==> $peer: dispatching remote update"
-      set +e
-      _peer_ssh "$peer" bash -lc "$REMOTE_PAYLOAD" 2>&1 | sed "s/^/    [$peer] /"
-      ec=${PIPESTATUS[0]}
-      set -e
-      if (( ec == 0 )); then
-        say "    ==> $peer: remote update OK"
-        PEER_RESULTS+=("$peer:ok")
-      else
-        warn "$peer: remote update failed (ssh exit $ec) — continuing with remaining peers"
-        PEER_RESULTS+=("$peer:fail($ec)")
-      fi
-    done < <(_peer_list)
-
-    # ---- BridgeMessage drop ([MATRIX-UPDATE-DONE]) -------------------------
-
-    if (( ${#PEER_NAMES[@]} == 0 )); then
-      say "==> No remote peers to message."
-    else
-      hr
-      if (( DRY_RUN )); then
-        say "==> [dry-run] would: deliver [MATRIX-UPDATE-DONE] BridgeMessage to each peer's inbox/claude-code/"
-      else
-        say "==> Delivering [MATRIX-UPDATE-DONE] BridgeMessages"
-      fi
-      # bash 3.2 + set -u: only iterate when array is non-empty.
-      if (( ${#PEER_NAMES[@]} )); then
-      for peer in "${PEER_NAMES[@]}"; do
-        # Mark fail-status messages too — let the receiver see the result.
-        peer_status="unknown"
-        if (( ${#PEER_RESULTS[@]} )); then
-          for r in "${PEER_RESULTS[@]}"; do
-            [[ "$r" == "${peer}:"* ]] && peer_status="${r#*:}"
-          done
-        fi
-        msg_id="$(_peer_msg_id)"
-        ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        content="[MATRIX-UPDATE-DONE 2026-04-29] agent-bridge update fan-out from ${LOCAL_NAME} reached this peer (status=${peer_status}). Please run /reload-plugins so the channel plugin reconnects to the new build."
-        # Build BridgeMessage JSON. Use python3 for safe JSON escaping when
-        # available; fall back to a hand-rolled writer (good enough for the
-        # fixed strings we generate here — no user-controlled content).
-        local_msg_file="$(mktemp -t agent-bridge-fanout-msg.XXXXXX)"
-        if command -v python3 >/dev/null 2>&1; then
-          python3 - "$msg_id" "$LOCAL_NAME" "$peer" "$content" "$ts" >"$local_msg_file" <<'PY'
-import json, sys
-mid, sender, to, content, ts = sys.argv[1:6]
-msg = {
-    "id": mid,
-    "from": sender,
-    "to": to,
-    "type": "message",
-    "content": content,
-    "timestamp": ts,
-    "replyTo": None,
-    "ttl": 86400,
-    "target": "claude-code",
-    "fromTarget": "claude-code",
-}
-print(json.dumps(msg))
-PY
-        else
-          # Hand-rolled (only used on systems without python3 — modern macOS
-          # always ships python3; this is a safety net).
-          esc_content="${content//\\/\\\\}"
-          esc_content="${esc_content//\"/\\\"}"
-          {
-            printf '{'
-            printf '"id":"%s",' "$msg_id"
-            printf '"from":"%s",' "$LOCAL_NAME"
-            printf '"to":"%s",' "$peer"
-            printf '"type":"message",'
-            printf '"content":"%s",' "$esc_content"
-            printf '"timestamp":"%s",' "$ts"
-            printf '"replyTo":null,'
-            printf '"ttl":86400,'
-            printf '"target":"claude-code",'
-            printf '"fromTarget":"claude-code"'
-            printf '}'
-          } >"$local_msg_file"
-        fi
-
-        if (( DRY_RUN )); then
-          say "    [dry-run] $peer: would SFTP $local_msg_file -> ~/.agent-bridge/inbox/claude-code/${msg_id}.json"
-          rm -f "$local_msg_file"
-          continue
-        fi
-
-        say "    -> $peer: delivering ${msg_id}.json"
-        set +e
-        _peer_sftp_put_inbox "$peer" "$local_msg_file" "${msg_id}.json" >/dev/null 2>&1
-        sftp_ec=$?
-        set -e
-        rm -f "$local_msg_file"
-        if (( sftp_ec == 0 )); then
-          say "    -> $peer: BridgeMessage delivered"
-        else
-          warn "$peer: BridgeMessage SFTP failed (exit $sftp_ec) — peer will not auto-/reload-plugins"
-        fi
-      done
-      fi  # end: if (( ${#PEER_NAMES[@]} ))
-    fi
-
-    # ---- summary ------------------------------------------------------------
-
-    hr
-    say "==> Fan-out summary:"
-    if (( ${#PEER_RESULTS[@]} == 0 )); then
-      say "    no peers"
-    else
-      for r in "${PEER_RESULTS[@]}"; do
-        say "    - $r"
-      done
-    fi
-  fi
 fi
