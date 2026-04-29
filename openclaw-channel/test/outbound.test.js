@@ -12,6 +12,10 @@ import {
   resolvePairedMachine,
 } from "../src/outbound.js";
 
+function normBatch(s) {
+  return s.replace(/\r\n/g, "\n");
+}
+
 function withTempDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), "agent-bridge-openclaw-channel-"));
   try {
@@ -120,7 +124,7 @@ test("OpenClaw outbound SFTP batch is home-relative and shell-free", () => {
   );
 
   // [SFTP-CD-TILDE-FIX 2026-04-29] No `cd ~` — server-dependent.
-  assert.deepEqual(batch.trim().split("\n"), [
+  assert.deepEqual(normBatch(batch).trim().split("\n"), [
     '-mkdir ".agent-bridge"',
     '-mkdir ".agent-bridge/inbox"',
     '-mkdir ".agent-bridge/inbox/openclaw"',

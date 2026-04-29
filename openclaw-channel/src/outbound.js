@@ -17,8 +17,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, renameSync, rmSync, unlinkSync, existsSync } from "node:fs";
+import { EOL, homedir, hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -275,11 +275,25 @@ export async function deliverReply(opts) {
     host: endpointHost,
     port: endpointPort,
   });
+  let sftpStdin = sftpBatch;
+  let batchFileDir = null;
+
+  // Windows OpenSSH `sftp.exe -b -` can stall under Node's child_process pipe
+  // after an ignorable `-mkdir` failure. Use a temp batch file on Windows,
+  // matching the same commands that succeed via PowerShell/cmd `-b file`.
+  if (process.platform === "win32") {
+    batchFileDir = mkdtempSync(join(tmpdir(), "ab-sftp-batch-"));
+    const batchFile = join(batchFileDir, "batch.txt");
+    writeFileSync(batchFile, sftpBatch);
+    const idx = sftpArgs.indexOf("-b");
+    if (idx >= 0 && idx + 1 < sftpArgs.length) sftpArgs[idx + 1] = batchFile;
+    sftpStdin = null;
+  }
 
   log.debug?.(`sftp -> ${target.user}@${endpointHost}:${remoteInbox}`);
 
   try {
-    await runCommand("sftp", sftpArgs, log, commandTimeoutMs, sftpBatch);
+    await runCommand("sftp", sftpArgs, log, commandTimeoutMs, sftpStdin, { ignoreOutput: process.platform === "win32" });
     log.info?.(
       `agent-bridge reply delivered id=${msg.id} to=${toMachine} target=${targetName}`
       + (msg.replyTo ? ` replyTo=${msg.replyTo}` : ""),
@@ -289,6 +303,9 @@ export async function deliverReply(opts) {
       unlinkSync(tmpPath);
     } catch {
       /* ignore */
+    }
+    if (batchFileDir) {
+      try { rmSync(batchFileDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
   }
 }
@@ -328,6 +345,18 @@ function quoteSftpPath(path) {
   return `"${String(path).replace(/(["\\])/g, "\\$1")}"`;
 }
 
+function normalizeLocalSftpPath(path) {
+  // Windows OpenSSH `sftp.exe` treats backslash as an escape in batch files.
+  // Use forward slashes for local payload paths so Windows-origin replies can
+  // upload to macOS/Linux peers reliably.
+  const value = String(path);
+  return value.includes("\\") ? value.replace(/\\/g, "/") : value;
+}
+
+function quoteSftpLocalPath(path) {
+  return quoteSftpPath(normalizeLocalSftpPath(path));
+}
+
 /**
  * Build an SFTP batch script for atomic delivery: create parent directories,
  * upload to a hidden temporary path, then rename to the final `.json`.
@@ -343,10 +372,11 @@ export function buildSftpBatch(localFile, remoteTmp, remoteFinal) {
   for (const dir of sftpParentDirs(remoteFinal)) {
     lines.push(`-mkdir ${quoteSftpPath(dir)}`);
   }
-  lines.push(`put ${quoteSftpPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
+  lines.push(`put ${quoteSftpLocalPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
   lines.push(`rename ${quoteSftpPath(remoteTmp)} ${quoteSftpPath(remoteFinal)}`);
   lines.push("bye");
-  return lines.join("\n") + "\n";
+  // Windows OpenSSH `sftp.exe -b -` can stall on LF-only stdin batches after an ignorable `-mkdir` failure. Use platform-native line endings for piped batches.
+  return lines.join(EOL) + EOL;
 }
 
 export function buildSftpArgs({ keyPath, user, host, port }) {
@@ -382,9 +412,12 @@ function isValidTarget(target) {
   return target.split("/").every((segment) => segmentPattern.test(segment));
 }
 
-function runCommand(cmd, args, log, timeoutMs, stdin = null) {
+function runCommand(cmd, args, log, timeoutMs, stdin = null, opts = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"] });
+    const ignoreOutput = opts.ignoreOutput === true;
+    const child = spawn(cmd, args, {
+      stdio: [stdin == null ? "ignore" : "pipe", ignoreOutput ? "ignore" : "pipe", ignoreOutput ? "ignore" : "pipe"],
+    });
     let stderr = "";
     let settled = false;
     const timeout = setTimeout(() => {
@@ -412,8 +445,8 @@ function runCommand(cmd, args, log, timeoutMs, stdin = null) {
       clearTimeout(timeout);
       fn(value);
     };
-    child.stdout.on("data", (b) => log.debug?.(String(b).trim()));
-    child.stderr.on("data", (b) => {
+    child.stdout?.on("data", (b) => log.debug?.(String(b).trim()));
+    child.stderr?.on("data", (b) => {
       stderr += String(b);
     });
     child.on("error", (err) => finish(reject, err));

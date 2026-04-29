@@ -12,7 +12,7 @@
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { EOL, tmpdir } from 'os';
 import { join } from 'path';
 import { type MachineConfig } from './config.js';
 import { logDebug, logError, logInfo, logWarn } from './logger.js';
@@ -46,6 +46,25 @@ export interface SSHResult {
  */
 function identityFileFor(machine: MachineConfig): string {
   return machine.identityFile ?? machine.key;
+}
+
+function openSshChildEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+
+  if (process.platform === 'win32') {
+    // Windows OpenSSH reads ProgramData very early while locating global SSH
+    // config/host-key state. Some MCP hosts launch servers with an intentionally
+    // minimal env (for example only AGENT_BRIDGE_ROLE=tools-only); in that shape
+    // ssh.exe/sftp.exe can exit 255 with empty stderr even though the network,
+    // key, and command are fine. Supplying the standard Windows default makes
+    // bridge_status / bridge_run_command / SFTP delivery independent of host env
+    // merging semantics.
+    const programData = env.ProgramData ?? env.PROGRAMDATA ?? 'C:\\ProgramData';
+    env.ProgramData = programData;
+    env.PROGRAMDATA = programData;
+  }
+
+  return env;
 }
 
 export function buildSSHArgs(
@@ -102,6 +121,7 @@ function sshExecSingle(
   return new Promise<SSHResult>((resolve, reject) => {
     const proc = spawn('ssh', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: openSshChildEnv(),
     });
 
     let stdout = '';
@@ -425,7 +445,13 @@ function sftpLines(lines: string[]): string {
   // instead of expanding to $HOME, causing messages to land in ~/~/.agent-bridge/
   // instead of ~/.agent-bridge/. Relative paths from CWD (= home) work
   // consistently across all supported OpenSSH-sftp-server implementations.
-  return [...lines, 'bye'].join('\n') + '\n';
+  //
+  // Windows OpenSSH `sftp.exe -b -` can stall when LF-only batch text is piped
+  // through Node's child_process stdin after an ignorable `-mkdir` failure. Use
+  // the platform-native line ending so Windows receives CRLF while POSIX keeps
+  // LF. Batch files supplied from disk by PowerShell/cmd already have CRLF; this
+  // brings the Node-stdin path in line with that working behavior.
+  return [...lines, 'bye'].join(EOL) + EOL;
 }
 
 /**
@@ -494,21 +520,53 @@ function sftpExecSingle(
   // surfaces any errors. If verbose logging is needed for ad-hoc debugging,
   // add `-v` (universally supported) instead.
   const args = buildSftpArgs(machine, host, port, connectTimeoutS);
+  let batchFileDir: string | null = null;
+  let batchFile: string | null = null;
+  let stdinBatch: string | null = batch;
+
+  // Windows OpenSSH `sftp.exe -b -` can stall under Node's child_process pipe
+  // after an ignorable `-mkdir` failure, even though the same batch works from
+  // a real file. Use a temporary batch file on Windows; keep stdin piping for
+  // POSIX where it is reliable and avoids an extra file.
+  if (process.platform === 'win32') {
+    batchFileDir = mkdtempSync(join(tmpdir(), 'ab-sftp-batch-'));
+    batchFile = join(batchFileDir, 'batch.txt');
+    writeFileSync(batchFile, batch);
+    const idx = args.indexOf('-b');
+    if (idx >= 0 && idx + 1 < args.length) args[idx + 1] = batchFile;
+    stdinBatch = null;
+  }
+
+  const cleanupBatchFile = () => {
+    if (batchFileDir) {
+      try { rmSync(batchFileDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      batchFileDir = null;
+    }
+  };
 
   const startedAt = Date.now();
   return new Promise<SSHResult>((resolve, reject) => {
-    const proc = spawn('sftp', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Windows OpenSSH `sftp.exe` can also hang when stderr/stdout are pipes and
+    // a batch contains ignorable failing `-mkdir` commands. With a temp `-b`
+    // file and ignored output streams it exits normally; keep captured output on
+    // POSIX for diagnostics.
+    const ignoreOutput = process.platform === 'win32';
+    const proc = spawn('sftp', args, {
+      stdio: [stdinBatch == null ? 'ignore' : 'pipe', ignoreOutput ? 'ignore' : 'pipe', ignoreOutput ? 'ignore' : 'pipe'],
+      env: openSshChildEnv(),
+    });
     let stdout = '';
     let stderr = '';
     let settled = false;
 
-    proc.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
-    proc.stderr.on('data', (c: Buffer) => { stderr += c.toString(); });
+    proc.stdout?.on('data', (c: Buffer) => { stdout += c.toString(); });
+    proc.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       proc.kill('SIGKILL');
+      cleanupBatchFile();
       reject(new Error(`SFTP command timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
@@ -516,6 +574,7 @@ function sftpExecSingle(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanupBatchFile();
       resolve({
         exitCode: code ?? 1,
         stdout,
@@ -528,12 +587,16 @@ function sftpExecSingle(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanupBatchFile();
       reject(err);
     });
 
     // Write the batch script to stdin and close it so sftp processes it.
-    proc.stdin.write(batch);
-    proc.stdin.end();
+    // On Windows we pass a temp `-b <file>` instead, so stdin is ignored.
+    if (stdinBatch != null && proc.stdin) {
+      proc.stdin.write(stdinBatch);
+      proc.stdin.end();
+    }
   });
 }
 
@@ -585,6 +648,20 @@ function quoteSftpPath(path: string): string {
   return `"${path.replace(/(["\\])/g, '\\$1')}"`;
 }
 
+function normalizeLocalSftpPath(path: string): string {
+  // Windows OpenSSH `sftp.exe` treats backslash as an escape character inside
+  // batch-file paths. A local payload like `C:\Users\ethan\...` is then parsed
+  // incorrectly and can surface as a misleading remote `stat ... no such file`
+  // failure. Forward-slash drive paths are accepted by Windows' local SFTP
+  // client and are also harmless for POSIX callers, so normalize only local
+  // file operands before quoting them.
+  return path.includes('\\') ? path.replace(/\\/g, '/') : path;
+}
+
+function quoteSftpLocalPath(path: string): string {
+  return quoteSftpPath(normalizeLocalSftpPath(path));
+}
+
 /**
  * Build the SFTP batch script for an atomic file delivery.
  *
@@ -611,14 +688,14 @@ export function buildSftpBatch(
   for (const d of sftpParentDirs(remoteFinal)) {
     lines.push(`-mkdir ${quoteSftpPath(d)}`);
   }
-  lines.push(`put ${quoteSftpPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
+  lines.push(`put ${quoteSftpLocalPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
   lines.push(`rename ${quoteSftpPath(remoteTmp)} ${quoteSftpPath(remoteFinal)}`);
   return sftpLines(lines);
 }
 
 export function buildSftpGetBatch(remotePath: string, localFile: string): string {
   return sftpLines([
-    `get ${quoteSftpPath(normalizeSftpPath(remotePath))} ${quoteSftpPath(localFile)}`,
+    `get ${quoteSftpPath(normalizeSftpPath(remotePath))} ${quoteSftpLocalPath(localFile)}`,
   ]);
 }
 

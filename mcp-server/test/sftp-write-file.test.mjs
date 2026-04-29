@@ -10,8 +10,13 @@
 // Run with `npm test` (after `npm run build`).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 
 const ssh = await import('../build/ssh.js');
+
+function normBatch(s) {
+  return s.replace(/\r\n/g, '\n');
+}
 
 test('normalizeSftpPath strips ~/ prefix (Windows OpenSSH-sftp does not expand ~)', () => {
   assert.equal(
@@ -80,7 +85,7 @@ test('buildSftpBatch emits -mkdir for each ancestor, put, rename, bye', () => {
     '.agent-bridge/inbox/claude-code/m1.json.tmp.abc',
     '.agent-bridge/inbox/claude-code/m1.json',
   );
-  const lines = batch.trim().split('\n');
+  const lines = normBatch(batch).trim().split('\n');
   assert.deepEqual(lines, [
     '-mkdir ".agent-bridge"',
     '-mkdir ".agent-bridge/inbox"',
@@ -95,14 +100,14 @@ test('buildSftpGetBatch and buildSftpListBatch use home-relative paths (no cd ~)
   // [SFTP-CD-TILDE-FIX 2026-04-29] SFTP starts in user's home; `cd ~` is
   // server-dependent and breaks against some macOS sftp builds.
   assert.deepEqual(
-    ssh.buildSftpGetBatch('~/.agent-bridge/inbox/claude-code/m1.json', '/local/out.json').trim().split('\n'),
+    normBatch(ssh.buildSftpGetBatch('~/.agent-bridge/inbox/claude-code/m1.json', '/local/out.json')).trim().split('\n'),
     [
       'get ".agent-bridge/inbox/claude-code/m1.json" "/local/out.json"',
       'bye',
     ],
   );
   assert.deepEqual(
-    ssh.buildSftpListBatch('~/.agent-bridge/inbox/claude-code').trim().split('\n'),
+    normBatch(ssh.buildSftpListBatch('~/.agent-bridge/inbox/claude-code')).trim().split('\n'),
     [
       'ls -1 ".agent-bridge/inbox/claude-code"',
       'bye',
@@ -115,16 +120,36 @@ test('buildSftpBatch trailing newline so sftp -b - flushes the last command', ()
   assert.equal(batch.endsWith('\n'), true);
 });
 
+test('buildSftpBatch normalizes Windows local payload paths for sftp.exe batch mode', () => {
+  const batch = ssh.buildSftpBatch(
+    'C:\\Users\\ethan\\.agent-bridge\\outbound\\payload.json',
+    '.agent-bridge/inbox/openclaw/default/m1.json.tmp',
+    '.agent-bridge/inbox/openclaw/default/m1.json',
+  );
+  assert.match(
+    batch,
+    /put "C:\/Users\/ethan\/\.agent-bridge\/outbound\/payload\.json" "\.agent-bridge\/inbox\/openclaw\/default\/m1\.json\.tmp"/,
+  );
+  assert.doesNotMatch(batch, /C:\\\\Users/);
+});
+
 test('buildSftpGetBatch downloads via SFTP get without remote shell', () => {
   assert.equal(
-    ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', '/tmp/local m1.json'),
+    normBatch(ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', '/tmp/local m1.json')),
     'get ".agent-bridge/inbox/m1.json" "/tmp/local m1.json"\nbye\n',
+  );
+});
+
+test('buildSftpGetBatch normalizes Windows local destination paths for sftp.exe batch mode', () => {
+  assert.equal(
+    normBatch(ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', 'C:\\Users\\ethan\\AppData\\Local\\Temp\\m1.json')),
+    'get ".agent-bridge/inbox/m1.json" "C:/Users/ethan/AppData/Local/Temp/m1.json"\nbye\n',
   );
 });
 
 test('buildSftpListBatch lists via SFTP ls without remote shell redirection', () => {
   assert.equal(
-    ssh.buildSftpListBatch('.agent-bridge/inbox/claude-code'),
+    normBatch(ssh.buildSftpListBatch('.agent-bridge/inbox/claude-code')),
     'ls -1 ".agent-bridge/inbox/claude-code"\nbye\n',
   );
 });
@@ -183,4 +208,14 @@ test('SSH and SFTP args prefer identityFile and force IdentitiesOnly', () => {
   assert.equal(sftpArgs[1], '/bridge/identity');
   assert.ok(sftpArgs.includes('IdentitiesOnly=yes'), sftpArgs.join(' '));
   assert.equal(sftpArgs.includes('-E'), false, 'sftp args must not reintroduce unsupported -E');
+});
+
+test('Windows OpenSSH child env supplies ProgramData fallback for minimal MCP envs', async () => {
+  const buildSource = await readFile(new URL('../build/ssh.js', import.meta.url), 'utf8');
+
+  assert.match(buildSource, /function openSshChildEnv/);
+  assert.match(buildSource, /ProgramData/);
+  assert.match(buildSource, /PROGRAMDATA/);
+  assert.match(buildSource, /spawn\('ssh',[\s\S]*env: openSshChildEnv\(\)/);
+  assert.match(buildSource, /spawn\('sftp',[\s\S]*env: openSshChildEnv\(\)/);
 });
