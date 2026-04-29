@@ -1,5 +1,13 @@
 # Changelog
 
+## agent-bridge 3.9.3 — 2026-04-29
+
+### Fix: recognise current Claude Code channel-capable parents
+
+Claude Code 2.1.x desktop / VS Code hosts advertise `notifications/claude/channel` through the MCP handshake rather than the older `--channels` command-line flags. The 3.9.2 parent-command heuristic therefore demoted legitimate Claude Code plugin starts to `tools-only`, leaving stale `claude-code` watcher leases unreclaimed and pending inbox files unread.
+
+**Fix.** Treat the current Claude Code desktop and VS Code native-binary parent command signatures as channel-capable, while keeping the explicit `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT=1` escape hatch in the plugin MCP env for compatibility.
+
 ## agent-bridge 3.9.1 — 2026-04-28
 
 ### [CONSUME-RACE] Fix — re-inject retry counter never incremented past 1

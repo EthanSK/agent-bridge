@@ -499,13 +499,18 @@ function readParentCommandLine(): string {
 
 function parentLooksChannelCapable(commandLine: string): boolean {
   // Claude channel notifications are only delivered to sessions launched with
-  // the channel plugin flags. Plain MCP/tool sessions (including editor helper
-  // processes) may start this server from the same plugin manifest, but they do
-  // not process notifications/claude/channel. If they win the watcher lease,
-  // messages are marked delivered and then disappear from the intended live
-  // channel. Treat those parents as tools-only by default.
+  // channel-capable Claude Code hosts. Older experimental builds advertised
+  // that via CLI flags; current Claude Code 2.1.x desktop/VS Code builds expose
+  // it through the MCP handshake instead, so their parent command line no longer
+  // contains a `--channels` flag. Plain MCP/tool sessions may still start this
+  // server from the same plugin manifest but cannot process
+  // notifications/claude/channel. If they win the watcher lease, messages are
+  // marked delivered and then disappear from the intended live channel. Treat
+  // only known Claude Code channel host signatures as channel-capable.
   return /--channels(?:\s|=|$)/.test(commandLine)
-    || /--dangerously-load-development-channels(?:\s|=|$)/.test(commandLine);
+    || /--dangerously-load-development-channels(?:\s|=|$)/.test(commandLine)
+    || /\/claude\.app\/Contents\/MacOS\/claude(?:\s|$)/i.test(commandLine)
+    || /\/anthropic\.claude-code-[^\s/]+\/resources\/native-binary\/claude(?:\s|$)/i.test(commandLine);
 }
 
 async function main(): Promise<void> {
