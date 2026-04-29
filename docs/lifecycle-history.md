@@ -1536,4 +1536,205 @@ Tracked in the project's TODO. No commits yet.
 
 ---
 
+## MCP plugin lifecycle failure modes (cross-version)
+
+These are not bugs in any one version but recurring failure-shapes that
+have shown up in 3.5 → 3.9. Document them here so the next "channel is
+dead, why?" investigation doesn't have to rediscover them.
+
+### 1. `/reload-plugins` does NOT always respawn the MCP child
+
+`/reload-plugins` re-reads the marketplace manifest and re-registers the
+plugin's tools, but Claude Code's plugin host sometimes keeps the
+existing MCP child process alive and just rebinds the tool definitions
+to it. The in-memory module state (loaded JS, lock-holder pid, watcher
+intervals, pending-ack map) survives the reload.
+
+Symptom: edited `mcp-server/build/index.js`, ran `/reload-plugins`, and
+the new code is not running. `claude_code_channel_status` still reports
+the old pid + uptime.
+
+When this matters:
+
+- Migrating between version dirs in `~/.claude/plugins/cache/` after a
+  `claude plugin update` (the cache dir name changes but the running
+  child is still loaded from the previous dir).
+- Investigating a wedged channel-owner — `/reload-plugins` cannot
+  exorcise a hung child; only SIGKILL + a full session can.
+
+Recovery (no clean automation; ask Ethan):
+
+1. `claude_code_channel_status` to identify the child pid + version
+   it's running.
+2. SIGKILL the child explicitly (`kill -9 <pid>`).
+3. `/reload-plugins` — now Claude has no MCP child for agent-bridge and
+   must spawn a fresh one from the cache dir's `build/index.js`.
+4. If the watcher-lock points at the killed pid, the new spawn detects
+   ESRCH and reaps it. If something stale is still holding the lock,
+   delete `~/.agent-bridge/locks/claude-code.watcher-lock.json` manually.
+
+### 2. Stale-binding zombie: lock-pid alive, owning session dead
+
+`~/.agent-bridge/locks/claude-code.watcher-lock.json` records the pid
+that owns the channel-owner lease. When the lease-holder is the MCP
+child of a Claude Code session that has since exited (cmd-Q, terminal
+crash, OS reboot interrupted teardown), that pid can sometimes remain
+alive as an orphaned `node`/`bun` process — its parent died without
+sending SIGTERM, and Node's default behavior is to keep running.
+
+The pathology:
+
+- Live Claude session at pid Y has agent-bridge MCP child at pid B.
+- Old (dead) Claude session's MCP child at pid A is still alive,
+  orphaned, and holds the watcher-lock.
+- Pid B starts up, sees pid A is alive (`process.kill(A, 0)` returns 0),
+  treats the lease as held, and falls back to tools-only or standby.
+- Inbound messages stage in `inbox/.pending-ack/claude-code/` forever.
+- Outbound `bridge_send_message` works (pid B handles tools fine).
+
+Diagnostic signature:
+
+```
+ps -p <lock-holder-pid> -o pid,ppid,etime,command
+# A very old etime, ppid=1 (re-parented to launchd/init), command path
+# under ~/.claude/plugins/cache/.../<old-version>/mcp-server/build/index.js
+```
+
+Recovery: SIGKILL the orphan, delete the lock file, `/reload-plugins`
+in the live session.
+
+### 3. Sibling-spawn race (multiple Claude Code instances)
+
+Launching two Claude Code instances on the same machine creates two MCP
+children competing for the same `claude-code.watcher-lock.json`. Patch F
+(3.5.2 / 3.7.0) handles this with the heartbeat-recency guard: a child
+that loses the race exits cleanly with `process.exit(0)` and a
+`patch_f.backoff` log line. 3.7.1's standby-retry adds a re-acquisition
+attempt for cases where the original holder dies shortly after.
+
+The 3.9.2 `AGENT_BRIDGE_ROLE=channel-owner` env-pin reduces but does
+NOT eliminate this. Both children boot as channel-owner; the lock is
+the tiebreaker. The pin solves the *adjacent* problem — sibling
+*plugins* (e.g. OpenClaw + Claude Code) leaking `tools-only` into each
+other's child env.
+
+Multiple-Claude on one machine is a supported configuration (Ethan
+runs Mac Mini with Claude inside the MBP-paired session AND a spawned
+local sub-session), but only ONE can win the channel-owner lease at a
+time. The losers are tools-only and cannot push inbound. This is by
+design.
+
+---
+
+## Auth / pairing failure modes (cross-version)
+
+### 1. macOS sftp does not support `-E logfile`
+
+3.8.1 added the SFTP-only send path with `-E <clientLog>` so client-side
+sftp diagnostics could be captured to a per-call log file. Modern Linux
+and Windows OpenSSH-portable 8.6+ accept `-E` on `sftp(1)`. macOS ships
+an older Apple OpenSSH fork whose `sftp` command does NOT accept `-E`,
+and every Mac→anywhere `bridge_send_message` failed with:
+
+```
+sftp: illegal option -- E
+```
+
+3.8.2 (`b08160c`) dropped `-E` and the paired `-o LogLevel=INFO`. The
+spawn stdout/stderr capture already surfaces sftp errors, so no
+practical diagnostic is lost. Use `-v` for verbose ad-hoc debugging
+(universally supported).
+
+The `ssh` codepath (`sshExec` / `buildSSHArgs`) was untouched — `ssh -E`
+is fine on every platform. Only `sftp -E` is the gotcha.
+
+Lesson: any flag added to platform-specific helpers needs a "does macOS
+ship the same OpenSSH version" check before merge. macOS lags Linux/Win
+by 2–3 OpenSSH minor versions and is the most likely platform-feature
+mismatch.
+
+### 2. SCP file-drops MUST land in `inbox/<target>/`, not the inbox root
+
+When the MCP `bridge_send_message` tool is unavailable (other side's
+plugin not loaded, Claude harness not running, mid-migration), the
+fallback is to SCP a `BridgeMessage` JSON directly to the remote's
+`~/.agent-bridge/inbox/<target>/<id>.json`. **The target subdir is
+mandatory.** Files placed at the inbox root (`~/.agent-bridge/inbox/<id>.json`)
+are auto-routed to `inbox/.failed/_unrouted/<id>.json` on the watcher's
+next startup pass and never delivered.
+
+The watcher's `_unrouted` quarantine was added when targets became
+required (3.4.0). Pre-3.4.0 senders that wrote flat-file messages to
+inbox root would have their messages silently lost — `_unrouted/` is
+both safety net and breadcrumb trail.
+
+For Claude Code targets, the subdir is literally `claude-code/`. For
+OpenClaw, it's `openclaw/<account-name>/`. The local target dir on the
+sender side does not need to exist in advance — the receiver's watcher
+creates it on first use.
+
+Correct file drop:
+
+```
+scp -i ~/.agent-bridge/keys/agent-bridge_<remote> \
+    /tmp/msg.json \
+    user@host:.agent-bridge/inbox/claude-code/<id>.json
+```
+
+Wrong (will be quarantined):
+
+```
+scp ... user@host:.agent-bridge/inbox/<id>.json
+```
+
+This is also documented in `~/.claude/projects/.../memory/feedback_codex_for_agent_bridge.md`
+and `reference_bridge_scp_target_subdir.md`.
+
+### 3. Tailscale auto-mint via OpenClaw default's CDP browser
+
+Tailscale's CLI cannot mint auth keys — that operation lives behind the
+admin API (PAT or OAuth client). For zero-touch provisioning across a
+fleet you need to drive the browser at `login.tailscale.com` once to
+generate a Personal Access Token, then use the API to mint reusable
+auth keys.
+
+Documented here as "this pattern works end-to-end" rather than as a
+required path — agent-bridge does not depend on it. Two mechanisms had
+to be discovered to make the OpenClaw default's CDP browser actually
+work for this flow:
+
+1. **Google account chooser button needs `Input.dispatchMouseEvent`,
+   not `el.click()`.** Google's `data-jsaction` attribute installs a
+   capturing-phase listener on `mousedown` that the synthetic click
+   from `element.click()` does NOT fire. CDP's
+   `Input.dispatchMouseEvent` issues a real OS-level mouse event that
+   propagates through the jsaction handler. This is generic Google-OAuth
+   advice — applies to every "click the right account in this list"
+   moment.
+2. **WS handshake to internal CDP needs `Origin` header suppression.**
+   The default CDP endpoint expects no `Origin` header (or, on some
+   builds, a specific allowlist). Python `websocket-client` defaults to
+   sending the requesting host as `Origin`, which Chromium rejects with
+   a 403. Pass `suppress_origin=True` on the `WebSocketApp` constructor
+   (or the lower-level `create_connection`).
+
+Reference snippet (used in the 2026-04-28 setup):
+
+```python
+import websocket
+ws = websocket.create_connection(cdp_ws_url, suppress_origin=True)
+ws.send(json.dumps({
+    "id": 1, "method": "Input.dispatchMouseEvent",
+    "params": {"type": "mousePressed", "button": "left", "x": 600, "y": 320, "clickCount": 1}
+}))
+```
+
+Provided here as a "this is possible" reference. Future tooling that
+wants programmatic Tailscale provisioning without a human-in-the-loop
+click can lean on this pattern; agent-bridge itself stays human-mediated
+for the cold-bootstrap step (one click) since the alternative requires
+storing a long-lived PAT.
+
+---
+
 *End of lifecycle history.*
