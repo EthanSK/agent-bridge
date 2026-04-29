@@ -1,5 +1,5 @@
 /**
- * Outbound delivery: SCP a BridgeMessage reply to the originating machine.
+ * Outbound delivery: SFTP a BridgeMessage reply to the originating machine.
  *
  * We avoid any npm dependency and reuse the same SSH key layout as the rest
  * of agent-bridge:
@@ -9,7 +9,8 @@
  * To deliver a reply we:
  *   1. Resolve the remote machine by name via the pairing registry.
  *   2. Write the reply JSON to a temp file under ~/.agent-bridge/outbound/.
- *   3. `scp -i <key> <tmp> <user>@<host>:~/.agent-bridge/inbox/<target>/<id>.json`
+ *   3. `sftp -b - <user>@<host>` with an atomic put-to-tmp + rename into
+ *      `~/.agent-bridge/inbox/<target>/<id>.json`.
  *
  * The remote's inbox-watcher (or Claude Code channel plugin) then picks it up
  * and pushes it into the running session.
@@ -189,12 +190,14 @@ export function deliverReplyLocal(opts) {
 }
 
 /**
- * SCP a BridgeMessage to `<remote>:~/.agent-bridge/inbox/<target>/<id>.json`.
+ * SFTP a BridgeMessage to `<remote>:~/.agent-bridge/inbox/<target>/<id>.json`.
  *
  * As of 3.5.1 this also handles the same-machine case: when `toMachine`
  * resolves to the local host (real name or one of `LOCAL_MACHINE_ALIASES`),
  * the call short-circuits to `deliverReplyLocal` — no SSH, no paired-machine
- * lookup. Cross-machine delivery is unchanged.
+ * lookup. Cross-machine delivery uses the SFTP subsystem rather than remote
+ * shell commands so Windows OpenSSH targets work even when the login shell is
+ * cmd.exe.
  *
  * @param {object} opts
  * @param {object} opts.message - BridgeMessage envelope
@@ -258,50 +261,30 @@ export async function deliverReply(opts) {
   const tmpPath = join(outboundDir, `${msg.id}.json`);
   writeFileSync(tmpPath, JSON.stringify(msg, null, 2));
 
-  const remoteDir = `~/.agent-bridge/inbox/${targetName}`;
-  const remoteTmpName = `.${msg.id}.${process.pid}.${Date.now()}.tmp`;
-  const remoteTmp = `${remoteDir}/${remoteTmpName}`;
-  const remoteInbox = `${remoteDir}/${msg.id}.json`;
-  const sshBaseArgs = [
+  const remoteInbox = `~/.agent-bridge/inbox/${targetName}/${msg.id}.json`;
+  const normalizedRemoteInbox = normalizeSftpPath(remoteInbox);
+  const remoteTmp = `${normalizedRemoteInbox}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
+  const sftpBatch = buildSftpBatch(tmpPath, remoteTmp, normalizedRemoteInbox);
+  const sftpArgs = [
     "-i",
     keyPath,
-    "-p",
-    String(endpointPort),
     "-o",
     "StrictHostKeyChecking=accept-new",
     "-o",
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=10",
-    `${target.user}@${endpointHost}`,
-  ];
-  const scpArgs = [
-    "-i",
-    keyPath,
     "-P",
     String(endpointPort),
-    "-o",
-    "StrictHostKeyChecking=accept-new",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=10",
-    tmpPath,
-    `${target.user}@${endpointHost}:${remoteTmp}`,
+    "-b",
+    "-",
+    `${target.user}@${endpointHost}`,
   ];
 
-  log.debug?.(`scp -> ${target.user}@${endpointHost}:${remoteInbox}`);
+  log.debug?.(`sftp -> ${target.user}@${endpointHost}:${remoteInbox}`);
 
   try {
-    await runCommand("ssh", [
-      ...sshBaseArgs,
-      `mkdir -p "$HOME/.agent-bridge/inbox/${targetName}"`,
-    ], log, commandTimeoutMs);
-    await runCommand("scp", scpArgs, log, commandTimeoutMs);
-    await runCommand("ssh", [
-      ...sshBaseArgs,
-      `mv -f "$HOME/.agent-bridge/inbox/${targetName}/${remoteTmpName}" "$HOME/.agent-bridge/inbox/${targetName}/${msg.id}.json"`,
-    ], log, commandTimeoutMs);
+    await runCommand("sftp", sftpArgs, log, commandTimeoutMs, sftpBatch);
     log.info?.(
       `agent-bridge reply delivered id=${msg.id} to=${toMachine} target=${targetName}`
       + (msg.replyTo ? ` replyTo=${msg.replyTo}` : ""),
@@ -315,6 +298,56 @@ export async function deliverReply(opts) {
   }
 }
 
+/**
+ * Normalize a remote path for SFTP delivery.
+ *
+ * Windows OpenSSH's SFTP subsystem does not expand a leading `~/`, while
+ * Unix-like SFTP servers normally start the session in the user's home
+ * directory. Strip the prefix and use a home-relative path that works on
+ * macOS, Linux, and Windows.
+ */
+export function normalizeSftpPath(remotePath) {
+  if (remotePath.startsWith("~/")) return remotePath.slice(2);
+  if (remotePath === "~") return ".";
+  return remotePath;
+}
+
+/**
+ * Return the progressive parent directories for an SFTP destination. SFTP's
+ * `mkdir` is not recursive, so the batch emits `-mkdir` for each ancestor.
+ */
+export function sftpParentDirs(path) {
+  const parts = path.split("/").filter((part) => part.length > 0 && part !== ".");
+  parts.pop();
+  if (parts.length === 0) return [];
+  const acc = [];
+  let prefix = "";
+  for (const part of parts) {
+    prefix = prefix ? `${prefix}/${part}` : (path.startsWith("/") ? `/${part}` : part);
+    acc.push(prefix);
+  }
+  return acc;
+}
+
+function quoteSftpPath(path) {
+  return `"${String(path).replace(/(["\\])/g, "\\$1")}"`;
+}
+
+/**
+ * Build an SFTP batch script for atomic delivery: create parent directories,
+ * upload to a hidden temporary path, then rename to the final `.json`.
+ */
+export function buildSftpBatch(localFile, remoteTmp, remoteFinal) {
+  const lines = [];
+  for (const dir of sftpParentDirs(remoteFinal)) {
+    lines.push(`-mkdir ${quoteSftpPath(dir)}`);
+  }
+  lines.push(`put ${quoteSftpPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
+  lines.push(`rename ${quoteSftpPath(remoteTmp)} ${quoteSftpPath(remoteFinal)}`);
+  lines.push("bye");
+  return lines.join("\n") + "\n";
+}
+
 function isValidTarget(target) {
   // Mirror of mcp-server/src/config.ts :: isValidTarget — Unicode-aware. Keep in sync.
   if (typeof target !== "string" || !target) return false;
@@ -326,9 +359,9 @@ function isValidTarget(target) {
   return target.split("/").every((segment) => segmentPattern.test(segment));
 }
 
-function runCommand(cmd, args, log, timeoutMs) {
+function runCommand(cmd, args, log, timeoutMs, stdin = null) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, args, { stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"] });
     let stderr = "";
     let settled = false;
     const timeout = setTimeout(() => {
@@ -365,6 +398,10 @@ function runCommand(cmd, args, log, timeoutMs) {
       if (code === 0) return finish(resolve);
       finish(reject, new Error(`${cmd} exited ${code}: ${stderr.trim()}`));
     });
+    if (stdin != null) {
+      child.stdin.write(stdin);
+      child.stdin.end();
+    }
   });
 }
 

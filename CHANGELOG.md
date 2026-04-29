@@ -8,6 +8,12 @@ Claude Code 2.1.x desktop / VS Code hosts advertise `notifications/claude/channe
 
 **Fix.** Treat the current Claude Code desktop and VS Code native-binary parent command signatures as channel-capable, while keeping the explicit `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT=1` escape hatch in the plugin MCP env for compatibility.
 
+### Fix: OpenClaw outbound replies use SFTP for Windows targets
+
+The OpenClaw channel adapter still used a POSIX remote-shell sequence for cross-machine replies: `ssh mkdir -p`, `scp` to a temp path, then `ssh mv`. That failed against Windows OpenSSH hosts whose default remote shell is `cmd.exe`; `cmd` treats `-p` as a directory name and does not expand `$HOME`, so OpenClaw-generated Agent Bridge replies could arrive from Windows but fail on the return leg.
+
+**Fix.** `openclaw-channel/src/outbound.js` now mirrors the MCP server send path: build an SFTP batch, create parent directories with `-mkdir`, `put` to a hidden temp file, then `rename` atomically to the final JSON inbox path. `~/` is normalized to a home-relative SFTP path so the same batch works on macOS, Linux, and Windows OpenSSH. Added OpenClaw-channel SFTP path/batch tests.
+
 ## agent-bridge 3.9.1 — 2026-04-28
 
 ### [CONSUME-RACE] Fix — re-inject retry counter never incremented past 1
