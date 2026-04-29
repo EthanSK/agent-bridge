@@ -437,6 +437,41 @@ The installer drops the bash `agent-bridge` script and an `agent-bridge.cmd` shi
 
 > **Important:** the PATH update is written to the **User** environment scope. New shells pick it up automatically; the shell you ran `install.ps1` from will *not* see it until you close and reopen it. If `agent-bridge` is "not found" right after install, this is almost always why.
 
+### `cmd.exe` semantics — what breaks when piping shell commands to a Windows host
+
+Windows OpenSSH-server uses `cmd.exe` as the default login shell. Several things that work transparently on macOS/Linux silently break across the SSH boundary:
+
+- **`;` is not a command separator in cmd.exe.** Shell pipelines like `cd dir; ls` are interpreted as a single token. Use `&&` (success-chained) or `&` (unconditional) instead. agent-bridge avoids this entirely by using the SFTP subsystem for delivery (3.8.1+) — no remote shell evaluates the command.
+- **No POSIX heredocs, no `cat > $dest`, no `mkdir -p`, no `mv -f`, no `$VAR` expansion.** `dest=...` is read as a command name (`'dest' is not recognized...`). The 3.4.x → 3.8.0 send path used a POSIX shell pipeline and was 100% broken against Windows targets — see lifecycle-history `3.8.1` for the migration story.
+- **PowerShell is NOT the SSH default shell** unless you explicitly set the registry `HKLM:\SOFTWARE\OpenSSH\DefaultShell`. If you do, the cmd.exe quirks above go away but you inherit a different set of quoting/escaping issues. agent-bridge does not require either — the SFTP-only delivery path is shell-agnostic.
+
+If you find yourself wanting to `agent-bridge run <windows-machine> "...command..."` for diagnostics, prefer single-token PowerShell calls invoked via `powershell.exe -NoProfile -Command "..."` — that gives you a real shell on the remote side without the cmd.exe gotchas.
+
+### Node `os.homedir()` reads `USERPROFILE` on Windows, not `HOME`
+
+Subtle test-isolation footgun discovered while debugging the 3.9.0 spawn tests on Windows. Node's `os.homedir()`:
+
+| Platform | Reads | Falls back to |
+|----------|-------|---------------|
+| macOS/Linux | `$HOME` | `getpwuid` lookup |
+| Windows | `%USERPROFILE%` | `%HOMEDRIVE%%HOMEPATH%` |
+
+A test that does `process.env.HOME = tempDir; spawn(child)` to sandbox a child's home directory works on macOS but **leaks the real home into the child on Windows** — the child's `os.homedir()` ignores `HOME` and reads the unmodified `USERPROFILE`. agent-bridge writes lock files and inbox dirs under `os.homedir()`, so a leaked-home test pollutes the *real* `~/.agent-bridge/` instead of the sandbox.
+
+The fix in 3.9.0's spawn tests (`e397839`, `9d9e585`): override BOTH `HOME` and `USERPROFILE` when sandboxing:
+
+```js
+spawn(node, [scriptPath], {
+  env: {
+    ...process.env,
+    HOME: tempDir,
+    USERPROFILE: tempDir,   // Windows
+  },
+});
+```
+
+Apply the same pattern to any external test or harness that wraps an agent-bridge process. The same applies to `HOMEDRIVE`/`HOMEPATH` if you really want to be airtight, but `USERPROFILE` is what Node actually reads.
+
 ### Stricter ACL on the admin keys file
 
 The earlier gotcha lists `icacls $path /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"` as the fix. That is the **only** acceptable ACL — sshd silently rejects keys if anything else has rights. To verify a known-good state:
