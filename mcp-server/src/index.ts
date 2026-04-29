@@ -67,8 +67,9 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, MCP_SERVER_VERSION, ensureDirectories, getLocalMachineName } from './config.js';
 import { initInbox, shutdownInbox } from './inbox.js';
@@ -836,6 +837,117 @@ async function main(): Promise<void> {
   // untouched for the real Claude session.
   if (watcherStarted) {
     void replayUndeliveredMessages();
+  }
+
+  // [AUTO-UPDATE-CHECK 2026-04-29] — Fire-and-forget background probe of
+  // origin/main. The script (`scripts/check-update.sh` in the source
+  // checkout) is silent unless origin is strictly ahead of the local
+  // checkout AND the same SHA hasn't already triggered a notification
+  // (sentinel at ~/.agent-bridge/.last-update-notified-head). When it does
+  // notify, it drops a [BRIDGE-UPDATE-AVAILABLE] message into the local
+  // claude-code inbox (and any other harness inbox subdirs), which the
+  // channel watcher above pushes into the running session — exactly the
+  // delivery path Ethan asked for in voice 327.
+  //
+  // ON by default. Disable with AGENT_BRIDGE_AUTO_UPDATE_CHECK=0
+  // (or false / off / no). Only the channel-owner runs the probe so a
+  // single host with multiple bridge MCP children doesn't multi-notify.
+  if (watcherStarted && bridgeRole === 'channel-owner') {
+    const killSwitch = (process.env.AGENT_BRIDGE_AUTO_UPDATE_CHECK ?? '1').trim().toLowerCase();
+    if (!['0', 'false', 'off', 'no', 'disabled'].includes(killSwitch)) {
+      // The MCP child usually runs from the plugin cache (no .git), so the
+      // probe script lives in the source checkout. Caller can pin via
+      // AGENT_BRIDGE_SOURCE_DIR; otherwise probe a small list of common
+      // locations relative to $HOME. If none exist, skip silently.
+      const candidates: string[] = [];
+      if (process.env.AGENT_BRIDGE_SOURCE_DIR) {
+        candidates.push(process.env.AGENT_BRIDGE_SOURCE_DIR);
+      }
+      const home = homedir();
+      candidates.push(
+        join(home, '.openclaw', 'workspace', 'agent-bridge'),
+        join(home, 'Projects', 'agent-bridge'),
+        join(home, 'projects', 'agent-bridge'),
+        join(home, 'agent-bridge'),
+        join(home, 'src', 'agent-bridge'),
+      );
+      let scriptPath: string | null = null;
+      for (const dir of candidates) {
+        const probe = join(dir, 'scripts', 'check-update.sh');
+        if (existsSync(probe) && existsSync(join(dir, '.git'))) {
+          scriptPath = probe;
+          break;
+        }
+      }
+      if (scriptPath) {
+        // Stagger the probe ~30 s after boot so we don't slow startup or
+        // race with `replayUndeliveredMessages`. The unref() lets Node exit
+        // cleanly even if the timer hasn't fired yet (e.g. parent dies in
+        // the first 30 s).
+        const probeTimer = setTimeout(() => {
+          try {
+            const child = spawn('bash', [scriptPath as string], {
+              stdio: 'ignore',
+              detached: false,
+              env: process.env,
+            });
+            child.on('error', (err) => {
+              try {
+                logEvent({
+                  event: 'auto_update_check.spawn_error',
+                  level: 'warn',
+                  msg: 'auto-update-check script spawn failed',
+                  context: { error: String(err), script: scriptPath },
+                });
+              } catch { /* best-effort */ }
+            });
+            child.on('exit', (code) => {
+              try {
+                logEvent({
+                  event: 'auto_update_check.exit',
+                  msg: `auto-update-check exited code=${code}`,
+                  context: { code, script: scriptPath },
+                });
+              } catch { /* best-effort */ }
+            });
+            child.unref();
+          } catch (err) {
+            try {
+              logEvent({
+                event: 'auto_update_check.spawn_threw',
+                level: 'warn',
+                msg: 'auto-update-check spawn threw',
+                context: { error: String(err) },
+              });
+            } catch { /* best-effort */ }
+          }
+        }, 30_000);
+        probeTimer.unref();
+        try {
+          logEvent({
+            event: 'auto_update_check.scheduled',
+            msg: 'auto-update-check scheduled (will run in 30s)',
+            context: { script: scriptPath },
+          });
+        } catch { /* best-effort */ }
+      } else {
+        try {
+          logEvent({
+            event: 'auto_update_check.no_source_dir',
+            msg: 'auto-update-check skipped: no agent-bridge source checkout found (set AGENT_BRIDGE_SOURCE_DIR to override)',
+            context: { candidates_probed: candidates },
+          });
+        } catch { /* best-effort */ }
+      }
+    } else {
+      try {
+        logEvent({
+          event: 'auto_update_check.disabled',
+          msg: 'auto-update-check disabled via AGENT_BRIDGE_AUTO_UPDATE_CHECK env var',
+          context: { value: killSwitch },
+        });
+      } catch { /* best-effort */ }
+    }
   }
 
   // Clean shutdown. Triggered by:

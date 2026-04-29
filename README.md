@@ -305,6 +305,50 @@ To run the updater automatically when Claude Code starts or resumes, paste one h
 
 Claude Code's current hook schema uses an outer matcher group and an inner `hooks` array. `timeout` is in seconds.
 
+### Auto-update notifications (3.10.0+)
+
+agent-bridge can also tell the running harness when its source checkout has fallen behind `origin/main`, so the agent itself sees a `[BRIDGE-UPDATE-AVAILABLE]` channel message instead of silently drifting. The notification is **on by default** — the MCP server fires `scripts/check-update.sh` ~30 seconds after `server.connect()` (channel-owner only). The script runs `git fetch --quiet`, compares `HEAD` to `origin/main`, and — if origin is strictly ahead — drops a `BridgeMessage` JSON file into `~/.agent-bridge/inbox/<target>/`. The existing channel watcher pushes it into the live session via `notifications/claude/channel`, just like a remote message. Idempotent: the last-notified `origin/main` SHA is recorded at `~/.agent-bridge/.last-update-notified-head`, so the same SHA does not re-notify.
+
+```bash
+# Manual probe (safe to run anywhere, anytime):
+./scripts/check-update.sh                   # silent unless update available
+./scripts/check-update.sh --verbose         # always print status to stderr
+./scripts/check-update.sh --force           # ignore the sentinel and re-notify
+./scripts/check-update.sh --dry-run         # show what would be written, don't write
+./scripts/check-update.sh --target=claude-code   # drop only into a specific inbox
+```
+
+By default the script fans out to every leaf inbox subdir under `~/.agent-bridge/inbox/` (e.g. `claude-code`, `openclaw/<account>`), so any harness on this host that watches its own subdir sees the notification. Override via `--target=<name>`.
+
+The MCP server locates the source checkout in this order:
+
+1. `AGENT_BRIDGE_SOURCE_DIR` env var (highest priority — set this to skip the probe)
+2. `~/.openclaw/workspace/agent-bridge`
+3. `~/Projects/agent-bridge`
+4. `~/projects/agent-bridge`
+5. `~/agent-bridge`
+6. `~/src/agent-bridge`
+
+If none exist (e.g. the host installed agent-bridge from the plugin marketplace and never cloned the source), the probe is skipped silently.
+
+To **disable** auto-update notifications, set `AGENT_BRIDGE_AUTO_UPDATE_CHECK=0` (also accepts `false` / `off` / `no` / `disabled`) in the MCP server's environment — for example, via the plugin's `.mcp.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/build/index.js"],
+      "env": {
+        "AGENT_BRIDGE_AUTO_UPDATE_CHECK": "0"
+      }
+    }
+  }
+}
+```
+
+You can also wire `scripts/check-update.sh` to cron / launchd / Task Scheduler / a SessionStart hook for periodic re-checks; the same kill switch applies because the script honours `AGENT_BRIDGE_AUTO_UPDATE_CHECK` directly. Applying the update is still an explicit decision: when the harness sees `[BRIDGE-UPDATE-AVAILABLE]` it can decide whether to run `scripts/update.sh`, ask the operator, or ignore.
+
 ### Manual update path
 
 If you'd rather do it by hand:

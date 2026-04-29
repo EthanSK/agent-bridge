@@ -1,5 +1,44 @@
 # Changelog
 
+## agent-bridge 3.10.0 — 2026-04-29
+
+### Auto-update notifications
+
+[AUTO-UPDATE-CHECK 2026-04-29] — agent-bridge can now notify a running
+harness when its source checkout is behind `origin/main`, so the agent
+sees an explicit `[BRIDGE-UPDATE-AVAILABLE]` channel message instead of
+silently drifting from upstream.
+
+- New script: `scripts/check-update.sh`. Runs `git fetch --quiet`,
+  compares `HEAD` to `origin/main`, and — if origin is strictly
+  ahead — drops a `BridgeMessage` JSON file into the local
+  `~/.agent-bridge/inbox/<target>/` subdir(s). The channel watcher
+  picks it up and pushes it into the live Claude Code (or other
+  harness) session via the existing `notifications/claude/channel`
+  path, so no new transport is introduced.
+- Idempotent. The last notified `origin/main` SHA is recorded at
+  `~/.agent-bridge/.last-update-notified-head`; subsequent runs skip
+  silently until origin advances. Pass `--force` to re-notify.
+- Multi-target fan-out by default: drops one message into every
+  leaf inbox subdir under `~/.agent-bridge/inbox/` (e.g. `claude-code`,
+  `openclaw/<account>`), so any harness on the host that watches its
+  own inbox sees the notification. Override with `--target=<name>`.
+- MCP server runs the probe automatically ~30 s after `server.connect`
+  on the channel-owner only (no multi-notify across sibling MCP
+  children). The probe locates the source checkout via
+  `AGENT_BRIDGE_SOURCE_DIR` env var, falling back to common locations
+  under `$HOME` (`.openclaw/workspace/agent-bridge`,
+  `Projects/agent-bridge`, `agent-bridge`, etc.). If no source
+  checkout is found the probe is skipped silently.
+- Kill switch: set `AGENT_BRIDGE_AUTO_UPDATE_CHECK=0` (or
+  `false` / `off` / `no` / `disabled`) to disable the check entirely.
+  Default is enabled.
+
+The check is intentionally cheap: just `git fetch` plus a couple of
+`rev-parse` calls, no `git pull`, no rebuild. Applying the update
+remains an explicit decision (run `scripts/update.sh` from the
+harness, or via cron / SessionStart hook).
+
 ## agent-bridge 3.9.4 — 2026-04-29
 
 ### Update helper: quiet auto mode + stale plugin cache archive
