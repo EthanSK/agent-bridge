@@ -15,7 +15,7 @@ import { basename, join } from 'path';
  * peer-kill path). Bump this in lockstep with `package.json`,
  * `.claude-plugin/plugin.json`, and the bash CLI's VERSION constant.
  */
-export const MCP_SERVER_VERSION = '3.9.3';
+export const MCP_SERVER_VERSION = '3.9.4';
 
 export const BRIDGE_DIR = join(homedir(), '.agent-bridge');
 export const CONFIG_FILE = join(BRIDGE_DIR, 'config');

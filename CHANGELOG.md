@@ -1,5 +1,16 @@
 # Changelog
 
+## agent-bridge 3.9.4 — 2026-04-29
+
+### Update helper: quiet auto mode + stale plugin cache archive
+
+- Added `scripts/update.sh --auto` for Claude Code `SessionStart` hooks. Auto mode implies `--yes --skip-openclaw`, suppresses prompts, and exits silently when no commits were pulled and no rebuild is needed.
+- Added stale Claude Code plugin cache cleanup after successful pull + rebuild. Older inactive cache version directories under `~/.claude/plugins/cache/agent-bridge/agent-bridge/` are archived to `.archive/<version>-<timestamp>/`; cache versions still used by a running `build/index.js` process are kept.
+- Archive activity is recorded via `skill_log info "agent-bridge.update.archive"` when `~/.claude/scripts/skill-log.sh` is available, with stderr fallback for machines without the Claude skill log helper.
+- Documented the current Claude Code `SessionStart` hook syntax for running `scripts/update.sh --auto` on startup/resume, and updated the stale-plugin-cache docs so the manual `mv` cleanup is now the fallback path.
+
+No protocol, SFTP delivery, or message envelope changes.
+
 ## agent-bridge 3.9.3 — 2026-04-29
 
 ### Fix: recognise current Claude Code channel-capable parents

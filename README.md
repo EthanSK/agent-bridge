@@ -269,15 +269,41 @@ cd ~/Projects/agent-bridge       # or wherever you cloned it
 ./scripts/update.sh              # safe mode — prompts before anything risky
 ./scripts/update.sh --yes        # unattended (still warns, but no prompts)
 ./scripts/update.sh --skip-openclaw   # skip the gateway-restart step
+./scripts/update.sh --auto       # SessionStart-safe: quiet no-op, no prompts, skips OpenClaw restart
 ```
 
 What it does:
 1. `git fetch origin && git pull --ff-only origin main`
 2. `(cd mcp-server && npm install && npm run build)` to rebuild the unified MCP server (tools + channel)
-3. (Optional) Restart the OpenClaw gateway via `openclaw gateway restart` if the `openclaw` CLI is on `$PATH`. Gated behind a Y/n prompt so you can say no during a live session. Skipped entirely with `--skip-openclaw`
-4. On macOS, attempts to trigger `/reload-plugins` in the running Claude Code terminal via the `self-reload-plugins` skill (only if that skill is installed in `~/.claude/skills/self-reload-plugins/`)
+3. Archives older inactive Claude Code plugin cache version directories under `~/.claude/plugins/cache/agent-bridge/agent-bridge/.archive/`
+4. Syncs remaining Claude Code plugin cache copies to the rebuilt MCP server
+5. (Optional) Restart the OpenClaw gateway via `openclaw gateway restart` if the `openclaw` CLI is on `$PATH`. Gated behind a Y/n prompt so you can say no during a live session. Skipped entirely with `--skip-openclaw`
+6. On macOS, attempts to trigger `/reload-plugins` in the running Claude Code terminal via the `self-reload-plugins` skill (only if that skill is installed in `~/.claude/skills/self-reload-plugins/`)
 
-The script is idempotent — if `mcp-server/build/` is already up-to-date the npm build is a fast no-op, and if no new commits were pulled it exits early without touching the gateway.
+The script is idempotent — if `mcp-server/build/` is already up-to-date the npm build is a fast no-op. `--auto` is intended for Claude Code startup hooks: it implies `--yes --skip-openclaw`, suppresses prompts, and exits silently when no commits were pulled and no rebuild is needed.
+
+To run the updater automatically when Claude Code starts or resumes, paste one hook group like this into `~/.claude/settings.json`:
+
+```jsonc
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/Projects/agent-bridge/scripts/update.sh --auto",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code's current hook schema uses an outer matcher group and an inner `hooks` array. `timeout` is in seconds.
 
 ### Manual update path
 
@@ -312,12 +338,14 @@ ls -1 ~/.claude/plugins/cache/agent-bridge/agent-bridge/
 pgrep -fl 'agent-bridge/[0-9].*build/index.js' | grep -v grep
 ```
 
-**Clean up:**
+`scripts/update.sh` now handles the normal cleanup path automatically after a successful pull + rebuild: it archives any older cache version directory that is not being used by a running `build/index.js` process. Active stale cache directories are kept in place and logged so the live process is not disrupted.
+
+**Fallback manual cleanup:**
 ```bash
 # Kill any stale node MCP children (safe — they just respawn from the active plugin path on next tool call):
 pkill -f 'agent-bridge/3\.[0-8]\.'   # adjust the regex to your old versions
 
-# Archive (don't delete; recoverable) old cache dirs:
+# If the updater could not archive a directory automatically, archive (don't delete; recoverable) old cache dirs:
 mkdir -p ~/.claude/plugins/cache/agent-bridge/agent-bridge/.archive
 mv ~/.claude/plugins/cache/agent-bridge/agent-bridge/3.7.1 \
    ~/.claude/plugins/cache/agent-bridge/agent-bridge/.archive/
@@ -327,8 +355,6 @@ mv ~/.claude/plugins/cache/agent-bridge/agent-bridge/3.7.1 \
 ```
 
 **Why does this happen?** Claude Desktop sessions cache the plugin path in their launch args at startup. If your machine fetched the marketplace plugin at version 3.7.1 first, every Desktop session started from that point on uses 3.7.1's path until the marketplace serves a newer version AND the session restarts. `/reload-plugins` reloads the BUILD at that path, but doesn't change which path is loaded. To pick up the latest cache version, quit and reopen Claude Desktop. To pick up the latest **repo** version, keep using the symlinked `~/Projects/agent-bridge/mcp-server/build/` path that `agent-bridge install`/`setup` configures (that's what `~/.claude/.mcp.json` will point at if you used Option B / setup).
-
-A future v3.10 release may add a post-update step to `scripts/update.sh` that auto-archives dormant cache dirs older than the marketplace-current version.
 
 ---
 
