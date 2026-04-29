@@ -903,6 +903,24 @@ v2 adds an MCP server that enables running AI agent sessions to communicate dire
 
 > **Note:** The MCP server does NOT spawn new agent processes. It enables _existing running_ agent sessions to communicate. Machine A's agent sends a message to Machine B's inbox, and Machine B's already-running agent picks it up via Claude Code channel push, the OpenClaw native channel plugin, or a manual `bridge_receive_messages` fallback where that harness has been explicitly wired and tested.
 
+### Subagent usage
+
+All agent-bridge MCP tools (`bridge_send_message`, `bridge_status`, `bridge_run_command`, `bridge_inbox_stats`, `bridge_list_machines`, `claude_code_channel_status`, `bridge_clear_inbox`, `bridge_receive_messages`) ARE accessible to Claude Code subagents and OpenClaw subagents. The earlier-circulating belief "subagents can't access bridge MCP tools" is incorrect.
+
+**For sending:** subagents call `bridge_send_message` directly. Note that subagents in Claude Code load tools as DEFERRED SCHEMAS — they must run `ToolSearch select:mcp__plugin_agent-bridge_agent-bridge__bridge_send_message` (or the broader bridge selection) before invoking, otherwise they'll hit `InputValidationError`. This is just a one-line schema-fetch, not a real limitation.
+
+**For receiving:** the channel-push stream (inbound `<channel source="agent-bridge" ...>` blocks) only lands in the running parent Claude Code session — the watcher pushes via the parent's conversation transport, not the subagent's. Subagents that need to receive a bridge reply call `bridge_receive_messages(wait: true)` to actively poll. This is documented intentional design (see ["Subagent receive pattern"](#subagent-receive-pattern-380) below).
+
+**Workflow that works in subagents:**
+
+```text
+ToolSearch select:mcp__plugin_agent-bridge_agent-bridge__bridge_send_message,...
+bridge_send_message(machine="...", target="...", message="...")
+bridge_receive_messages(wait: true, timeout_ms: 60000)  # for replies
+```
+
+File-drop workarounds (writing JSON directly into peer's `~/.agent-bridge/inbox/<target>/<id>.json` via SCP) are NOT needed and should not be used — they bypass the watcher's validation/lease guarantees.
+
 ### Subagent receive pattern (3.8.0+)
 
 Channel-push notifications (`<channel source="agent-bridge" ...>`) reach the **parent** Claude Code session, not subagents spawned by the Task tool. A subagent that needs to wait for a bridge reply should long-poll `bridge_receive_messages`:
