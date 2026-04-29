@@ -307,7 +307,11 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
 });
 
 // ─── Patch G — SIGTERM ignored when parent alive + watcher healthy ──────────
-test('Patch G: SIGTERM is ignored when parent is alive and channel-owner watcher is healthy', { timeout: 12_000 }, async () => {
+test('Patch G: SIGTERM is ignored when parent is alive and channel-owner watcher is healthy', { timeout: 12_000 }, async (t) => {
+  if (process.platform === 'win32') {
+    t.skip("Windows child.kill('SIGTERM') can terminate without exercising Node's SIGTERM handler");
+    return;
+  }
   // The test runner IS the plugin's parent and is alive while we run, so
   // the Patch G ignore branch should fire. Re-enable Patch G for this test.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-g-'));

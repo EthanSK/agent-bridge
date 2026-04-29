@@ -82,6 +82,7 @@ test('buildSftpBatch emits -mkdir for each ancestor, put, rename, bye', () => {
   );
   const lines = batch.trim().split('\n');
   assert.deepEqual(lines, [
+    'cd ~',
     '-mkdir ".agent-bridge"',
     '-mkdir ".agent-bridge/inbox"',
     '-mkdir ".agent-bridge/inbox/claude-code"',
@@ -89,6 +90,25 @@ test('buildSftpBatch emits -mkdir for each ancestor, put, rename, bye', () => {
     'rename ".agent-bridge/inbox/claude-code/m1.json.tmp.abc" ".agent-bridge/inbox/claude-code/m1.json"',
     'bye',
   ]);
+});
+
+test('buildSftpGetBatch and buildSftpListBatch start in the SFTP home directory', () => {
+  assert.deepEqual(
+    ssh.buildSftpGetBatch('~/.agent-bridge/inbox/claude-code/m1.json', '/local/out.json').trim().split('\n'),
+    [
+      'cd ~',
+      'get ".agent-bridge/inbox/claude-code/m1.json" "/local/out.json"',
+      'bye',
+    ],
+  );
+  assert.deepEqual(
+    ssh.buildSftpListBatch('~/.agent-bridge/inbox/claude-code').trim().split('\n'),
+    [
+      'cd ~',
+      'ls -1 ".agent-bridge/inbox/claude-code"',
+      'bye',
+    ],
+  );
 });
 
 test('buildSftpBatch trailing newline so sftp -b - flushes the last command', () => {
@@ -99,14 +119,14 @@ test('buildSftpBatch trailing newline so sftp -b - flushes the last command', ()
 test('buildSftpGetBatch downloads via SFTP get without remote shell', () => {
   assert.equal(
     ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', '/tmp/local m1.json'),
-    'get ".agent-bridge/inbox/m1.json" "/tmp/local m1.json"\nbye\n',
+    'cd ~\nget ".agent-bridge/inbox/m1.json" "/tmp/local m1.json"\nbye\n',
   );
 });
 
 test('buildSftpListBatch lists via SFTP ls without remote shell redirection', () => {
   assert.equal(
     ssh.buildSftpListBatch('.agent-bridge/inbox/claude-code'),
-    'ls -1 ".agent-bridge/inbox/claude-code"\nbye\n',
+    'cd ~\nls -1 ".agent-bridge/inbox/claude-code"\nbye\n',
   );
 });
 
@@ -126,4 +146,27 @@ test('buildSftpBatch produces no shell-mode constructs ($, &&, |, mv, mkdir -p)'
       `SFTP batch must not contain shell construct ${JSON.stringify(banned)}; got:\n${batch}`,
     );
   }
+});
+
+test('SSH and SFTP args prefer identityFile and force IdentitiesOnly', () => {
+  const machine = {
+    name: 'WinPeer',
+    host: '192.0.2.10',
+    user: 'ethan',
+    port: 22,
+    key: '/legacy/key',
+    identityFile: '/bridge/identity',
+    pairedAt: '2026-04-29T00:00:00Z',
+  };
+
+  const sshArgs = ssh.buildSSHArgs(machine, '192.0.2.10', 2222, 10);
+  assert.equal(sshArgs[0], '-i');
+  assert.equal(sshArgs[1], '/bridge/identity');
+  assert.ok(sshArgs.includes('IdentitiesOnly=yes'), sshArgs.join(' '));
+
+  const sftpArgs = ssh.buildSftpArgs(machine, '192.0.2.10', 2222, 10);
+  assert.equal(sftpArgs[0], '-i');
+  assert.equal(sftpArgs[1], '/bridge/identity');
+  assert.ok(sftpArgs.includes('IdentitiesOnly=yes'), sftpArgs.join(' '));
+  assert.equal(sftpArgs.includes('-E'), false, 'sftp args must not reintroduce unsupported -E');
 });

@@ -132,6 +132,7 @@ ensure_config_dir() {
 #   user=ethansk
 #   port=22
 #   key=~/.agent-bridge/keys/MacBook-Pro
+#   identity_file=~/.agent-bridge/keys/MacBook-Pro
 #   paired_at=2026-04-09T12:00:00
 
 # Get a value for a machine: cfg_get <machine> <key>
@@ -160,6 +161,19 @@ cfg_get() {
     fi
   done < "$CONFIG_FILE"
   return 1
+}
+
+cfg_identity_file() {
+  local machine="$1"
+  local keypath
+  # [OC-FIX-CODEX-XPLAT 2026-04-29] Prefer the explicit identity_file schema
+  # key, while falling back to the historical key= field for existing peers.
+  keypath="$(cfg_get "$machine" identity_file 2>/dev/null || true)"
+  if [ -z "$keypath" ]; then
+    keypath="$(cfg_get "$machine" key 2>/dev/null || true)"
+  fi
+  keypath="${keypath/#\~/$HOME}"
+  printf '%s' "$keypath"
 }
 
 # Check if a machine exists (case-insensitive)
@@ -223,6 +237,7 @@ cfg_save() {
     printf 'user=%s\n' "$user"
     printf 'port=%s\n' "$port"
     printf 'key=%s\n' "$keypath"
+    printf 'identity_file=%s\n' "$keypath"
     printf 'paired_at=%s\n' "$ts"
     printf '\n'
   } >> "$CONFIG_FILE"
@@ -721,8 +736,7 @@ ssh_build_args_for() {
   local machine="$1" host="$2" port="$3" timeout="$4"
   local client_log="${5:-}"
   local keypath
-  keypath="$(cfg_get "$machine" key 2>/dev/null || true)"
-  keypath="${keypath/#\~/$HOME}"
+  keypath="$(cfg_identity_file "$machine")"
 
   local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "ConnectTimeout=${timeout}" "-p" "$port")
   if [ -n "$client_log" ]; then
@@ -731,7 +745,7 @@ ssh_build_args_for() {
     args+=("-o" "LogLevel=ERROR")
   fi
   if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
-    args+=("-i" "$keypath")
+    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
   fi
   args+=("$(cfg_get "$machine" user)@${host}")
 
@@ -877,14 +891,11 @@ ssh_build_args() {
   host="$(cfg_get "$machine" host)" || die "Machine \"$machine\" not found."
   user="$(cfg_get "$machine" user)" || die "No user for \"$machine\"."
   port="$(cfg_get "$machine" port 2>/dev/null || printf '22')"
-  keypath="$(cfg_get "$machine" key 2>/dev/null || true)"
-
-  # Expand ~ in keypath
-  keypath="${keypath/#\~/$HOME}"
+  keypath="$(cfg_identity_file "$machine")"
 
   local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "LogLevel=ERROR" "-p" "$port")
   if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
-    args+=("-i" "$keypath")
+    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
   fi
   args+=("${user}@${host}")
 
@@ -1408,8 +1419,7 @@ cmd_connect() {
   host="$(cfg_get "$machine_name" host)"
   user="$(cfg_get "$machine_name" user)"
   port="$(cfg_get "$machine_name" port 2>/dev/null || printf '22')"
-  keypath="$(cfg_get "$machine_name" key 2>/dev/null || true)"
-  keypath="${keypath/#\~/$HOME}"
+  keypath="$(cfg_identity_file "$machine_name")"
   internet_host="$(cfg_get "$machine_name" internet_host 2>/dev/null || true)"
   internet_port="$(cfg_get "$machine_name" internet_port 2>/dev/null || printf '22')"
 
@@ -1428,7 +1438,7 @@ cmd_connect() {
 
   local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "LogLevel=ERROR" "-o" "ConnectTimeout=10" "-p" "$try_port")
   if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
-    args+=("-i" "$keypath")
+    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
   fi
   args+=("${user}@${try_host}")
 
@@ -1491,8 +1501,7 @@ cmd_run() {
   host="$(cfg_get "$machine_name" host)"
   user="$(cfg_get "$machine_name" user)"
   port="$(cfg_get "$machine_name" port 2>/dev/null || printf '22')"
-  keypath="$(cfg_get "$machine_name" key 2>/dev/null || true)"
-  keypath="${keypath/#\~/$HOME}"
+  keypath="$(cfg_identity_file "$machine_name")"
   internet_host="$(cfg_get "$machine_name" internet_host 2>/dev/null || true)"
   internet_port="$(cfg_get "$machine_name" internet_port 2>/dev/null || printf '22')"
 
@@ -1517,7 +1526,7 @@ cmd_run() {
   # always visible even when stderr would be silent.
   local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "ConnectTimeout=10" "-p" "$try_port" "-E" "$client_log" "-o" "LogLevel=INFO")
   if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
-    args+=("-i" "$keypath")
+    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
   fi
   args+=("${user}@${try_host}" "$command")
 
@@ -1585,7 +1594,8 @@ cmd_list() {
     host="$(cfg_get "$name" host 2>/dev/null || printf 'unknown')"
     user="$(cfg_get "$name" user 2>/dev/null || printf 'unknown')"
     port="$(cfg_get "$name" port 2>/dev/null || printf '22')"
-    keypath="$(cfg_get "$name" key 2>/dev/null || printf '(system default)')"
+    keypath="$(cfg_identity_file "$name")"
+    [ -n "$keypath" ] || keypath="(system default)"
     paired_at="$(cfg_get "$name" paired_at 2>/dev/null || true)"
 
     local ihost iport
@@ -1645,8 +1655,7 @@ cmd_status() {
     host="$(cfg_get "$name" host 2>/dev/null || printf 'unknown')"
     user="$(cfg_get "$name" user 2>/dev/null || printf 'unknown')"
     port="$(cfg_get "$name" port 2>/dev/null || printf '22')"
-    keypath="$(cfg_get "$name" key 2>/dev/null || true)"
-    keypath="${keypath/#\~/$HOME}"
+    keypath="$(cfg_identity_file "$name")"
     internet_host="$(cfg_get "$name" internet_host 2>/dev/null || true)"
     internet_port="$(cfg_get "$name" internet_port 2>/dev/null || printf '22')"
 
@@ -1662,7 +1671,7 @@ cmd_status() {
 
     local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "LogLevel=ERROR" "-o" "ConnectTimeout=10" "-p" "$try_port")
     if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
-      args+=("-i" "$keypath")
+      args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
     fi
     args+=("${user}@${try_host}" "echo ok")
 
@@ -1818,8 +1827,7 @@ cmd_unpair() {
 
   # Try to remove the key file
   local keypath
-  keypath="$(cfg_get "$machine_name" key 2>/dev/null || true)"
-  keypath="${keypath/#\~/$HOME}"
+  keypath="$(cfg_identity_file "$machine_name")"
   if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ] && [ -f "$keypath" ]; then
     rm -f "$keypath" 2>/dev/null && dim "Removed key: $keypath" || warn "Could not remove key at $keypath"
     # Also remove .pub if it exists
@@ -1841,7 +1849,7 @@ cmd_unpair_help() {
 # -- config -------------------------------------------------------------------
 cmd_config() {
   local machine_name=""
-  local internet_host="" internet_port=""
+  local internet_host="" internet_port="" identity_file=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1851,6 +1859,9 @@ cmd_config() {
       --internet-port)
         [ $# -lt 2 ] && die "--internet-port requires a value."
         internet_port="$2"; shift 2 ;;
+      --identity-file)
+        [ $# -lt 2 ] && die "--identity-file requires a value."
+        identity_file="$2"; shift 2 ;;
       --help|-h)        cmd_config_help; exit 0 ;;
       -*)               die "Unknown option: $1. Use --help for usage." ;;
       *)
@@ -1864,26 +1875,30 @@ cmd_config() {
     esac
   done
 
-  [ -z "$machine_name" ] && die "Machine name required. Usage: agent-bridge config <machine> --internet-host <host>"
+  [ -z "$machine_name" ] && die "Machine name required. Usage: agent-bridge config <machine> [OPTIONS]"
 
   if ! cfg_exists "$machine_name"; then
     die "Machine \"$machine_name\" not found. Run 'agent-bridge list' to see paired machines."
   fi
 
-  if [ -z "$internet_host" ] && [ -z "$internet_port" ]; then
+  if [ -z "$internet_host" ] && [ -z "$internet_port" ] && [ -z "$identity_file" ]; then
     # Show current config
-    local host port user ihost iport
+    local host port user ihost iport ident
     host="$(cfg_get "$machine_name" host 2>/dev/null || printf 'unknown')"
     port="$(cfg_get "$machine_name" port 2>/dev/null || printf '22')"
     user="$(cfg_get "$machine_name" user 2>/dev/null || printf 'unknown')"
     ihost="$(cfg_get "$machine_name" internet_host 2>/dev/null || true)"
     iport="$(cfg_get "$machine_name" internet_port 2>/dev/null || true)"
+    ident="$(cfg_identity_file "$machine_name")"
 
     printf '\n'
     printf "${BOLD}  %s${RESET}\n" "$machine_name"
     printf "${DIM}    host=%s${RESET}\n" "$host"
     printf "${DIM}    port=%s${RESET}\n" "$port"
     printf "${DIM}    user=%s${RESET}\n" "$user"
+    if [ -n "$ident" ]; then
+      printf "${DIM}    identity_file=%s${RESET}\n" "$ident"
+    fi
     if [ -n "$ihost" ]; then
       printf "${DIM}    internet_host=%s${RESET}\n" "$ihost"
     fi
@@ -1911,6 +1926,19 @@ cmd_config() {
     cfg_set "$machine_name" "internet_port" "$internet_port"
     ok "Set internet_port=$internet_port for $machine_name"
   fi
+  if [ -n "$identity_file" ]; then
+    identity_file="${identity_file/#\~/$HOME}"
+    if printf '%s' "$identity_file" | grep -qE '[[:space:]\[\]=]|^$' 2>/dev/null; then
+      die "Invalid identity_file: must not contain whitespace, brackets, or '=' characters."
+    fi
+    if [ ! -f "$identity_file" ]; then
+      die "Identity file not found: $identity_file"
+    fi
+    cfg_set "$machine_name" "identity_file" "$identity_file"
+    # Keep the legacy key= field in sync for older installed MCP/plugin builds.
+    cfg_set "$machine_name" "key" "$identity_file"
+    ok "Set identity_file=$identity_file for $machine_name"
+  fi
   printf '\n'
 }
 
@@ -1923,11 +1951,13 @@ cmd_config_help() {
   printf '                           Recommended: a Tailscale 100.x.y.z address.\n'
   printf '                           See README section "Internet connectivity (Tailscale)".\n'
   printf '  --internet-port <port>   Set the internet-reachable SSH port (default: 22)\n'
+  printf '  --identity-file <path>   Set the SSH IdentityFile for this peer (also updates legacy key=)\n'
   printf '  -h, --help               Show this help\n\n'
   printf 'Examples:\n'
   printf '  agent-bridge config MacBook-Pro\n'
   printf '  agent-bridge config MacBook-Pro --internet-host 100.126.23.87\n'
   printf '  agent-bridge config MacBook-Pro --internet-host 100.126.23.87 --internet-port 22\n'
+  printf '  agent-bridge config MacBook-Pro --identity-file ~/.agent-bridge/keys/agent-bridge_Mac-mini\n'
 }
 
 cmd_help() {

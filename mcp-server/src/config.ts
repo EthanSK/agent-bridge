@@ -137,7 +137,10 @@ export interface MachineConfig {
   host: string;
   user: string;
   port: number;
+  /** SSH private key path used for this peer. Kept for backward compatibility with pre-identity_file configs. */
   key: string;
+  /** Explicit OpenSSH IdentityFile path. Preferred over `key` when both are present. */
+  identityFile?: string;
   pairedAt: string;
   /** Optional internet-reachable host (e.g. a Tailscale 100.x.y.z IP or other stable overlay address). */
   internetHost?: string;
@@ -180,8 +183,25 @@ export function loadConfig(): MachineConfig[] {
   }
 
   const content = readFileSync(CONFIG_FILE, 'utf8');
+  return parseConfigContent(content);
+}
+
+/**
+ * Parse the INI-style config content. Exported for tests.
+ */
+export function parseConfigContent(content: string): MachineConfig[] {
   const machines: MachineConfig[] = [];
   let current: Partial<MachineConfig> | null = null;
+
+  const pushCurrent = () => {
+    if (!current?.name) return;
+    // [OC-FIX-CODEX-XPLAT 2026-04-29] Prefer the explicit identity_file
+    // schema field while preserving the historical `key=` name so old configs
+    // and older CLIs continue to interoperate.
+    if (current.identityFile && !current.key) current.key = current.identityFile;
+    if (current.key && !current.identityFile) current.identityFile = current.key;
+    machines.push(current as MachineConfig);
+  };
 
   for (const rawLine of content.split('\n')) {
     const line = rawLine.replace(/\r$/, '').trim();
@@ -189,9 +209,7 @@ export function loadConfig(): MachineConfig[] {
     // Section header: [MachineName]
     const sectionMatch = line.match(/^\[(.+)\]$/);
     if (sectionMatch) {
-      if (current?.name) {
-        machines.push(current as MachineConfig);
-      }
+      pushCurrent();
       current = { name: sectionMatch[1] };
       continue;
     }
@@ -213,6 +231,11 @@ export function loadConfig(): MachineConfig[] {
             break;
           case 'key':
             current.key = value;
+            if (!current.identityFile) current.identityFile = value;
+            break;
+          case 'identity_file':
+            current.identityFile = value;
+            if (!current.key) current.key = value;
             break;
           case 'paired_at':
             current.pairedAt = value;
@@ -229,9 +252,7 @@ export function loadConfig(): MachineConfig[] {
   }
 
   // Push the last machine
-  if (current?.name) {
-    machines.push(current as MachineConfig);
-  }
+  pushCurrent();
 
   // Validate that all required fields are present; skip incomplete entries
   return machines.filter(m => {

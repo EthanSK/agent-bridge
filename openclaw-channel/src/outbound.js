@@ -64,7 +64,7 @@ export function isLocalMachineName(name, opts = {}) {
 
 /**
  * Look up a paired machine in ~/.agent-bridge/config.
- * Returns { user, host, port, key, internetHost?, internetPort? } or null.
+ * Returns { user, host, port, key, identityFile?, internetHost?, internetPort? } or null.
  */
 export function resolvePairedMachine(name, configPath = DEFAULT_CONFIG) {
   if (!existsSync(configPath)) return null;
@@ -83,11 +83,13 @@ export function resolvePairedMachine(name, configPath = DEFAULT_CONFIG) {
   const machines = cfg?.machines ?? {};
   const entry = machines[name];
   if (!entry) return null;
+  const identityFile = entry.identity_file ?? entry.identityFile ?? entry.key ?? null;
   return {
     user: entry.user ?? entry.username ?? "root",
     host: entry.host ?? entry.address ?? null,
     port: entry.port ?? 22,
     key: entry.key ? expandHome(entry.key) : null,
+    identityFile: identityFile ? expandHome(identityFile) : null,
     internetHost: entry.internet_host ?? entry.internetHost ?? null,
     internetPort: entry.internet_port ?? entry.internetPort ?? null,
   };
@@ -110,11 +112,13 @@ function resolvePairedMachineFromIni(name, raw) {
     if (kv) fields[kv[1]] = kv[2];
   }
   if (!fields.host || !fields.user) return null;
+  const identityFile = fields.identity_file || fields.key || null;
   return {
     user: fields.user,
     host: fields.host,
     port: Number.parseInt(fields.port ?? "22", 10) || 22,
     key: fields.key ? expandHome(fields.key) : null,
+    identityFile: identityFile ? expandHome(identityFile) : null,
     internetHost: fields.internet_host || null,
     internetPort: Number.parseInt(fields.internet_port ?? "", 10) || null,
   };
@@ -245,7 +249,7 @@ export async function deliverReply(opts) {
     throw new Error(`paired machine "${toMachine}" not found in ${configPath}`);
   }
 
-  const keyPath = target.key ?? join(keysDir, `agent-bridge_${toMachine}`);
+  const keyPath = target.identityFile ?? target.key ?? join(keysDir, `agent-bridge_${toMachine}`);
   if (!existsSync(keyPath)) {
     throw new Error(`no SSH key for machine "${toMachine}" at ${keyPath}`);
   }
@@ -259,27 +263,18 @@ export async function deliverReply(opts) {
 
   mkdirSync(outboundDir, { recursive: true });
   const tmpPath = join(outboundDir, `${msg.id}.json`);
-  writeFileSync(tmpPath, JSON.stringify(msg, null, 2));
+  writeFileSync(tmpPath, JSON.stringify(msg, null, 2), { mode: 0o600 });
 
   const remoteInbox = `~/.agent-bridge/inbox/${targetName}/${msg.id}.json`;
   const normalizedRemoteInbox = normalizeSftpPath(remoteInbox);
   const remoteTmp = `${normalizedRemoteInbox}.tmp.${process.pid}.${Date.now()}.${randomUUID()}`;
   const sftpBatch = buildSftpBatch(tmpPath, remoteTmp, normalizedRemoteInbox);
-  const sftpArgs = [
-    "-i",
+  const sftpArgs = buildSftpArgs({
     keyPath,
-    "-o",
-    "StrictHostKeyChecking=accept-new",
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=10",
-    "-P",
-    String(endpointPort),
-    "-b",
-    "-",
-    `${target.user}@${endpointHost}`,
-  ];
+    user: target.user,
+    host: endpointHost,
+    port: endpointPort,
+  });
 
   log.debug?.(`sftp -> ${target.user}@${endpointHost}:${remoteInbox}`);
 
@@ -338,7 +333,10 @@ function quoteSftpPath(path) {
  * upload to a hidden temporary path, then rename to the final `.json`.
  */
 export function buildSftpBatch(localFile, remoteTmp, remoteFinal) {
-  const lines = [];
+  // [OC-FIX-CODEX-XPLAT 2026-04-29] SFTP protocol ops only: resolve the
+  // connecting user's home via the SFTP server, create each parent directory
+  // one level at a time, put to a temp path, then atomic rename.
+  const lines = ["cd ~"];
   for (const dir of sftpParentDirs(remoteFinal)) {
     lines.push(`-mkdir ${quoteSftpPath(dir)}`);
   }
@@ -346,6 +344,28 @@ export function buildSftpBatch(localFile, remoteTmp, remoteFinal) {
   lines.push(`rename ${quoteSftpPath(remoteTmp)} ${quoteSftpPath(remoteFinal)}`);
   lines.push("bye");
   return lines.join("\n") + "\n";
+}
+
+export function buildSftpArgs({ keyPath, user, host, port }) {
+  return [
+    // [OC-FIX-CODEX-XPLAT 2026-04-29] Match manual bridge SSH: force the
+    // configured key and prevent ssh-agent/default-key fallback.
+    "-i",
+    keyPath,
+    "-o",
+    "IdentitiesOnly=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-P",
+    String(port),
+    "-b",
+    "-",
+    `${user}@${host}`,
+  ];
 }
 
 function isValidTarget(target) {

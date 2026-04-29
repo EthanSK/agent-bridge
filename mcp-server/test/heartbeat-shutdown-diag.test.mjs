@@ -65,15 +65,20 @@ async function readEvents(home) {
   }
 }
 
-test('server.shutdown_diag dumps active handles and request counts on shutdown', async () => {
+test('server.shutdown_diag dumps active handles and request counts on shutdown', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip("Windows child.kill() signal delivery can bypass Node's shutdown handler");
+    return;
+  }
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-5-5-shutdown-'));
   // 3.5.5: stdin-end no longer fires immediate shutdown — orphan watchdog
-  // confirms across 3 polls. To exercise the shutdown path quickly, send
-  // SIGTERM instead, which goes through handleSignal → shutdown → diag.
+  // confirms across 3 polls. To exercise the shutdown path quickly, send a
+  // handled shutdown signal, which goes through handleSignal → shutdown → diag.
   const server = startServer(home);
   try {
     await sleep(800);
-    server.child.kill('SIGTERM');
+    const shutdownSignal = process.platform === 'win32' ? 'SIGINT' : 'SIGTERM';
+    server.child.kill(shutdownSignal);
     await new Promise((resolve) => server.child.once('exit', resolve));
 
     const events = await readEvents(home);
@@ -149,7 +154,11 @@ test('sibling detection wiring is present in shipped build', async () => {
   );
 });
 
-test('3.6.1: channel-owner survives idle stdin and shuts down cleanly on SIGTERM, releasing lease', { timeout: 30_000 }, async () => {
+test('3.6.1: channel-owner survives idle stdin and shuts down cleanly on SIGTERM, releasing lease', { timeout: 30_000 }, async (t) => {
+  if (process.platform === 'win32') {
+    t.skip("Windows child.kill() signal delivery can bypass Node's shutdown handler");
+    return;
+  }
   // 3.6.1: idle stdin (`readableEnded === true`) is no longer an orphan
   // signal — Claude Code's MCP plugin host writes the JSON-RPC handshake then
   // leaves the pipe idle, which used to trigger false-positive shutdown
@@ -192,8 +201,10 @@ test('3.6.1: channel-owner survives idle stdin and shuts down cleanly on SIGTERM
     ]);
     assert.equal(earlyExit, null, `channel-owner must NOT exit on idle stdin (3.6.1) — got ${JSON.stringify(earlyExit)}`);
 
-    // Now send SIGTERM — should shut down cleanly within a few seconds.
-    server.child.kill('SIGTERM');
+    // Now send a shutdown signal — SIGTERM on Unix, SIGINT on Windows where
+    // child.kill('SIGTERM') can terminate without exercising Node's handler.
+    const shutdownSignal = process.platform === 'win32' ? 'SIGINT' : 'SIGTERM';
+    server.child.kill(shutdownSignal);
     const exited = await Promise.race([
       new Promise((resolve) => server.child.once('exit', () => resolve(true))),
       sleep(7_000).then(() => false),

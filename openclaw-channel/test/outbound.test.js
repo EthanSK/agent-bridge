@@ -4,7 +4,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { localMachineName } from "../src/outbound.js";
+import {
+  buildSftpArgs,
+  buildSftpBatch,
+  localMachineName,
+  normalizeSftpPath,
+  resolvePairedMachine,
+} from "../src/outbound.js";
 
 function withTempDir(fn) {
   const dir = mkdtempSync(join(tmpdir(), "agent-bridge-openclaw-channel-"));
@@ -80,4 +86,65 @@ test("hostname fallback strips .local", () => {
     }),
     "Ethans-MacBook-Pro",
   );
+});
+
+test("resolvePairedMachine parses identity_file and prefers it for explicit identity", () => {
+  withTempDir((dir) => {
+    const configPath = join(dir, "config");
+    writeFileSync(
+      configPath,
+      [
+        "[WinPeer]",
+        "host=192.0.2.10",
+        "user=ethan",
+        "port=2222",
+        "key=/legacy/key",
+        "identity_file=/bridge/identity",
+        "paired_at=2026-04-29T00:00:00Z",
+        "",
+      ].join("\n"),
+    );
+
+    const peer = resolvePairedMachine("WinPeer", configPath);
+    assert.equal(peer.key, "/legacy/key");
+    assert.equal(peer.identityFile, "/bridge/identity");
+  });
+});
+
+test("OpenClaw outbound SFTP batch is home-relative and shell-free", () => {
+  const remoteFinal = normalizeSftpPath("~/.agent-bridge/inbox/openclaw/default/msg-1.json");
+  const batch = buildSftpBatch(
+    "/local/payload.json",
+    `${remoteFinal}.tmp.abc`,
+    remoteFinal,
+  );
+
+  assert.deepEqual(batch.trim().split("\n"), [
+    "cd ~",
+    '-mkdir ".agent-bridge"',
+    '-mkdir ".agent-bridge/inbox"',
+    '-mkdir ".agent-bridge/inbox/openclaw"',
+    '-mkdir ".agent-bridge/inbox/openclaw/default"',
+    'put "/local/payload.json" ".agent-bridge/inbox/openclaw/default/msg-1.json.tmp.abc"',
+    'rename ".agent-bridge/inbox/openclaw/default/msg-1.json.tmp.abc" ".agent-bridge/inbox/openclaw/default/msg-1.json"',
+    "bye",
+  ]);
+
+  for (const banned of ["$HOME", "mkdir -p", "mv -f", "cat <<", "scp "]) {
+    assert.equal(batch.includes(banned), false, `unexpected shell construct ${banned}`);
+  }
+});
+
+test("OpenClaw outbound SFTP args force configured identity only", () => {
+  const args = buildSftpArgs({
+    keyPath: "/bridge/identity",
+    user: "ethan",
+    host: "192.0.2.10",
+    port: 2222,
+  });
+
+  assert.equal(args[0], "-i");
+  assert.equal(args[1], "/bridge/identity");
+  assert.ok(args.includes("IdentitiesOnly=yes"), args.join(" "));
+  assert.equal(args.includes("-E"), false, "sftp args must not include macOS-unsupported -E");
 });

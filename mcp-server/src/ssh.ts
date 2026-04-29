@@ -44,15 +44,24 @@ export interface SSHResult {
  * this, SSH's default `LogLevel=ERROR` path writes some connection failures
  * silently, making exit 255 ambiguous.
  */
-function buildSSHArgs(
+function identityFileFor(machine: MachineConfig): string {
+  return machine.identityFile ?? machine.key;
+}
+
+export function buildSSHArgs(
   machine: MachineConfig,
   host: string,
   port: number,
   connectTimeoutS: number,
   clientLogFile?: string,
 ): string[] {
+  const identityFile = identityFileFor(machine);
   const args = [
-    '-i', machine.key,
+    // [OC-FIX-CODEX-XPLAT 2026-04-29] Always pair the explicit IdentityFile
+    // with IdentitiesOnly so probes do not exhaust/fall through to agent or
+    // default keys before trying the bridge key.
+    '-i', identityFile,
+    '-o', 'IdentitiesOnly=yes',
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'UserKnownHostsFile=/dev/null',
     '-o', 'BatchMode=yes',
@@ -273,8 +282,9 @@ export async function sshExec(
   timeoutMs: number = 30000,
   _opts: SSHExecOptions = {},
 ): Promise<SSHResult> {
-  if (!existsSync(machine.key)) {
-    throw new Error(`SSH key not found: ${machine.key}`);
+  const identityFile = identityFileFor(machine);
+  if (!existsSync(identityFile)) {
+    throw new Error(`SSH key not found: ${identityFile}`);
   }
 
   const kind = preferredEndpointKind(machine);
@@ -408,6 +418,10 @@ export function normalizeSftpPath(remotePath: string): string {
   return remotePath;
 }
 
+function sftpLines(lines: string[]): string {
+  return ['cd ~', ...lines, 'bye'].join('\n') + '\n';
+}
+
 /**
  * Split a normalized SFTP path into its parent directory chain and filename.
  * Returns the list of progressive directory paths (so we can `-mkdir` each
@@ -433,6 +447,29 @@ export function sftpParentDirs(path: string): string[] {
  * Run `sftp` against a specific endpoint with a batch script piped on stdin.
  * Internal helper — does not do endpoint fallback (mirrors sshExecSingle).
  */
+export function buildSftpArgs(
+  machine: MachineConfig,
+  host: string,
+  port: number,
+  connectTimeoutS: number,
+): string[] {
+  const identityFile = identityFileFor(machine);
+  return [
+    // [OC-FIX-CODEX-XPLAT 2026-04-29] Match ssh probes: explicit key plus
+    // IdentitiesOnly. SFTP bypasses the remote login shell entirely.
+    '-i', identityFile,
+    '-o', 'IdentitiesOnly=yes',
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'BatchMode=yes',
+    '-o', `ConnectTimeout=${connectTimeoutS}`,
+    '-o', 'LogLevel=ERROR',
+    '-P', String(port),
+    '-b', '-', // read batch from stdin
+    `${machine.user}@${host}`,
+  ];
+}
+
 function sftpExecSingle(
   machine: MachineConfig,
   host: string,
@@ -450,17 +487,7 @@ function sftpExecSingle(
   // but we don't need it — the spawn stdout/stderr capture below already
   // surfaces any errors. If verbose logging is needed for ad-hoc debugging,
   // add `-v` (universally supported) instead.
-  const args = [
-    '-i', machine.key,
-    '-o', 'StrictHostKeyChecking=no',
-    '-o', 'UserKnownHostsFile=/dev/null',
-    '-o', 'BatchMode=yes',
-    '-o', `ConnectTimeout=${connectTimeoutS}`,
-    '-o', 'LogLevel=ERROR',
-    '-P', String(port),
-    '-b', '-', // read batch from stdin
-    `${machine.user}@${host}`,
-  ];
+  const args = buildSftpArgs(machine, host, port, connectTimeoutS);
 
   const startedAt = Date.now();
   return new Promise<SSHResult>((resolve, reject) => {
@@ -510,8 +537,9 @@ async function sftpExec(
   batch: string,
   timeoutMs: number,
 ): Promise<SSHResult> {
-  if (!existsSync(machine.key)) {
-    throw new Error(`SSH key not found: ${machine.key}`);
+  const identityFile = identityFileFor(machine);
+  if (!existsSync(identityFile)) {
+    throw new Error(`SSH key not found: ${identityFile}`);
   }
 
   const kind = preferredEndpointKind(machine);
@@ -567,30 +595,26 @@ export function buildSftpBatch(
   remoteTmp: string,
   remoteFinal: string,
 ): string {
+  // [OC-FIX-CODEX-XPLAT 2026-04-29] Use SFTP protocol operations only:
+  // resolve the user's home with `cd ~`, create parent dirs one level at a
+  // time, upload to a temp path, then rename atomically.
   const lines: string[] = [];
   for (const d of sftpParentDirs(remoteFinal)) {
     lines.push(`-mkdir ${quoteSftpPath(d)}`);
   }
   lines.push(`put ${quoteSftpPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
   lines.push(`rename ${quoteSftpPath(remoteTmp)} ${quoteSftpPath(remoteFinal)}`);
-  lines.push('bye');
-  return lines.join('\n') + '\n';
+  return sftpLines(lines);
 }
 
-/** Build an SFTP batch that downloads one remote file to a local temp path. */
-export function buildSftpGetBatch(remoteFile: string, localFile: string): string {
-  return [
-    `get ${quoteSftpPath(remoteFile)} ${quoteSftpPath(localFile)}`,
-    'bye',
-  ].join('\n') + '\n';
+export function buildSftpGetBatch(remotePath: string, localFile: string): string {
+  return sftpLines([
+    `get ${quoteSftpPath(normalizeSftpPath(remotePath))} ${quoteSftpPath(localFile)}`,
+  ]);
 }
 
-/** Build an SFTP batch that lists one remote directory, one name per line. */
 export function buildSftpListBatch(remotePath: string): string {
-  return [
-    `ls -1 ${quoteSftpPath(remotePath)}`,
-    'bye',
-  ].join('\n') + '\n';
+  return sftpLines([`ls -1 ${quoteSftpPath(normalizeSftpPath(remotePath))}`]);
 }
 
 /**
@@ -628,8 +652,9 @@ export async function sshWriteFile(
   content: string,
   timeoutMs: number = 15000,
 ): Promise<SSHResult> {
-  if (!existsSync(machine.key)) {
-    throw new Error(`SSH key not found: ${machine.key}`);
+  const identityFile = identityFileFor(machine);
+  if (!existsSync(identityFile)) {
+    throw new Error(`SSH key not found: ${identityFile}`);
   }
   logDebug(`SFTP write file to ${machine.name}: ${remotePath} (${content.length}B)`);
 
@@ -660,15 +685,12 @@ export async function sshReadFile(
   remotePath: string,
   timeoutMs: number = 15000,
 ): Promise<string> {
+  // [OC-FIX-CODEX-XPLAT 2026-04-29] Remote file reads are SFTP-only; `cat`
+  // depends on the target's login shell and fails under Windows cmd.exe.
   const localTmpDir = mkdtempSync(join(tmpdir(), 'ab-sftp-read-'));
-  const localFile = join(localTmpDir, `payload-${randomUUID()}.json`);
+  const localFile = join(localTmpDir, `payload-${randomUUID()}`);
   try {
-    const normalized = normalizeSftpPath(remotePath);
-    const result = await sftpExec(
-      machine,
-      buildSftpGetBatch(normalized, localFile),
-      timeoutMs,
-    );
+    const result = await sftpExec(machine, buildSftpGetBatch(remotePath, localFile), timeoutMs);
     if (result.exitCode !== 0) {
       throw new Error(`Failed to read remote file ${remotePath}: ${result.stderr}`);
     }
@@ -686,8 +708,9 @@ export async function sshListFiles(
   remotePath: string,
   timeoutMs: number = 15000,
 ): Promise<string[]> {
-  const normalized = normalizeSftpPath(remotePath);
-  const result = await sftpExec(machine, buildSftpListBatch(normalized), timeoutMs);
+  // [OC-FIX-CODEX-XPLAT 2026-04-29] Directory listing uses the SFTP protocol,
+  // not `ls`, so Windows targets with cmd.exe shells behave the same as Unix.
+  const result = await sftpExec(machine, buildSftpListBatch(remotePath), timeoutMs);
   if (result.exitCode !== 0) {
     return [];
   }
