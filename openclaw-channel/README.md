@@ -10,7 +10,7 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 ## What's new in v2.3.0
 
 - **`replyVia` per-target routing.** Inbound bridge messages can now route their reply either back through the Telegram chat (default — visible on Ethan's phone) or back over agent-bridge as a BridgeMessage to the sender machine (silent peer-to-peer back-channel). Set it plugin-level (`channels["agent-bridge"].config.replyVia`), per-target (`targets.<name>.replyVia`), or per-message (add `replyVia` to the BridgeMessage JSON). Valid modes: `"telegram"` | `"agent-bridge"`. Unknown values fall back to `"telegram"` with a warn log.
-  - When `replyVia: "agent-bridge"`, peer identity switches from `<telegram-peer-id>` to an encoded bridge peer id containing both `<sender-machine-name>` and `<sender-fromTarget>`. The session key becomes `agent:main:agent-bridge:<account>:direct:<encoded-peer>`, so multiple Telegram accounts or return targets on the same machine cannot collapse onto one shared back-channel session. Replies come back via the native `agent-bridge` channel's outbound SCP adapter (channel-plugin.js :: sendText) instead of the Telegram outbound. No Telegram traffic is generated.
+  - When `replyVia: "agent-bridge"`, peer identity switches from `<telegram-peer-id>` to an encoded bridge peer id containing both `<sender-machine-name>` and `<sender-fromTarget>`. The session key becomes `agent:main:agent-bridge:<account>:direct:<encoded-peer>`, so multiple Telegram accounts or return targets on the same machine cannot collapse onto one shared back-channel session. Replies come back via the native `agent-bridge` channel's outbound SFTP adapter (channel-plugin.js :: sendText) instead of the Telegram outbound. No Telegram traffic is generated.
   - Use-case: a Claude Code or OpenClaw session asking another bridge-aware session for context without Ethan's phone pinging.
 
 ## What's new in v2.2.0
@@ -24,7 +24,7 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 - **Per-target inbox subdirs.** Watches `~/.agent-bridge/inbox/openclaw/<target>/*.json` instead of the single flat `inbox/`. Each subdir name maps to one configured target in `openclaw.json`.
 - **Auto-discovery of targets from `channels.telegram.accounts`.** In the common case you don't have to write a `targets` block at all — the plugin inspects the OpenClaw global config's `channels.telegram.accounts` map and creates one bridge target per account, routing to `telegram:<account>`. An explicit `targets` block is still accepted as an advanced override. Peer-id resolution walks `targets.<name>.peer_id` → `config.peer_id` → `meta.user_id` → first numeric `chat_id` in `channels.telegram.accounts[<name>].allowFrom`.
 - **Round-trip bridge replies (`fromTarget`).** Inbound BridgeMessages carry an optional `fromTarget` telling the receiver where to put replies. When the agent answers back over the bridge (cross-harness flows), the OpenClaw session peer id encodes both the sender machine and `fromTarget`, and `buildReply(...)` populates the outgoing `target` from that value. That keeps `MacBookPro/claude-code` separate from `MacBookPro/openclaw/default`; there is no implicit fallback to `claude-code` or any other shared back-channel target.
-- **Outbound reply delivery honors `internet_host`.** The native OpenClaw channel's outbound SCP adapter now mirrors the CLI / MCP transport rule: if a paired machine has `internet_host` configured, replies go there instead of getting stuck on a stale LAN `host`.
+- **Outbound reply delivery honors `internet_host`.** The native OpenClaw channel's outbound SFTP adapter now mirrors the CLI / MCP transport rule: if a paired machine has `internet_host` configured, replies go there instead of getting stuck on a stale LAN `host`.
 
 ## How it works
 
@@ -34,7 +34,7 @@ v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 | Inbound dispatch | `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` (same primitive used by native IRC / Nextcloud Talk channels) |
 | Session key | Resolved via `runtime.channel.routing.resolveAgentRoute({cfg, channel: "telegram", accountId, peer: {kind: "direct", id: peer_id}})` — respects `cfg.session.dmScope` |
 | Routing | Per-target subdir `~/.agent-bridge/inbox/openclaw/<target>/` — each target maps to one Telegram bot / account session |
-| Reply path | `replyVia="telegram"` keeps `OriginatingChannel="telegram"` + `OriginatingTo="telegram:<peerId>"`; `replyVia="agent-bridge"` injects on the native `agent-bridge` channel with an encoded bridge peer id, so in-turn replies SCP back over agent-bridge instead of Telegram |
+| Reply path | `replyVia="telegram"` keeps `OriginatingChannel="telegram"` + `OriginatingTo="telegram:<peerId>"`; `replyVia="agent-bridge"` injects on the native `agent-bridge` channel with an encoded bridge peer id, so in-turn replies SFTP back over agent-bridge instead of Telegram |
 | Cross-harness reply | Outbound `ChannelOutboundAdapter.sendText` on the native `agent-bridge` channel is still available for the rare case where the peer is an agent-bridge-aware harness |
 
 ## Install
@@ -107,12 +107,12 @@ Senders on the other machine address a specific target with the new `target` fie
   3. Resolve the canonical session route via `runtime.channel.routing.resolveAgentRoute(...)`.
   4. Build a synthetic inbound `ctxPayload` via `runtime.channel.reply.finalizeInboundContext({...})`, pinned either to Telegram (`Provider/OriginatingChannel/OriginatingTo = telegram`) or to the native `agent-bridge` channel with an encoded bridge peer id, depending on `replyVia`.
   5. `await dispatchInboundReplyWithBase({cfg, channel, accountId, route, storePath, ctxPayload, core: runtime, deliver, onRecordError, onDispatchError})`. This runs a synchronous agent turn in the target session.
-  6. The `deliver` callback forwards each reply payload through the matching outbound adapter, so Telegram-bound targets land in the chat and `replyVia="agent-bridge"` targets SCP back to the sender machine.
+  6. The `deliver` callback forwards each reply payload through the matching outbound adapter, so Telegram-bound targets land in the chat and `replyVia="agent-bridge"` targets SFTP back to the sender machine.
 - After successful dispatch, the consumed inbox file is moved to `~/.agent-bridge/archive/openclaw/<target>/`. Seeing a message there means it was delivered to OpenClaw; pending messages remain in `~/.agent-bridge/inbox/openclaw/<target>/`.
 - Legacy messages at `~/.agent-bridge/inbox/*.json` (no subdir, no `target` field) are quarantined to `~/.agent-bridge/inbox/.failed/_unrouted/` with a deprecation log line.
-- The outbound `ChannelOutboundAdapter.sendText` adapter is preserved for cross-harness bridge replies — if the paired peer is another agent-bridge-aware agent (not a Telegram session), the reply can still SCP back via the bridge instead of landing in Telegram.
+- The outbound `ChannelOutboundAdapter.sendText` adapter is preserved for cross-harness bridge replies — if the paired peer is another agent-bridge-aware agent (not a Telegram session), the reply can still SFTP back via the bridge instead of landing in Telegram.
 
 ## No dependencies
 
 Node builtins only (`fs`, `path`, `os`, `child_process`, `crypto`). Uses the
-host's bundled SSH and SCP for outbound delivery.
+host's bundled SSH and SFTP for outbound delivery.

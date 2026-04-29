@@ -518,8 +518,8 @@
             <p>Each machine generates its own key under <code>~/.agent-bridge/keys/</code> during <code>agent-bridge setup</code>. Authorized keys are installed only on paired peers. No passwords, no shared secrets.</p>
           </li>
           <li>
-            <h3>Base64 transport over SSH</h3>
-            <p>Message content is base64-encoded before SSH delivery to sidestep shell-quoting hazards. The remote-side path is tilde-expanded to <code>$HOME</code> so files land in the real inbox, not a literal <code>~</code> directory.</p>
+            <h3>SFTP delivery over SSH</h3>
+            <p>Message JSON is delivered with the SSH SFTP subsystem: create parent inbox directories, upload to a temporary file, then atomically rename into place. No remote login shell, no <code>$HOME</code> expansion, no <code>mkdir -p</code>, and no <code>mv</code> are required, so Windows OpenSSH targets work cleanly.</p>
           </li>
           <li>
             <h3>TTL-bounded delivery</h3>
@@ -570,7 +570,7 @@
           <li class="cl-item">
             <div class="cl-version">2.3.2</div>
             <div class="cl-body">
-              <strong>Tilde expansion fix.</strong> Messages were landing in a literal <code>~/.agent-bridge/inbox</code> shadow directory on the remote machine instead of the real <code>$HOME/.agent-bridge/inbox</code>. Fixed in <code>sshWriteFile</code> by substituting leading <code>~/</code> with <code>$HOME/</code> before quoting.
+              <strong>Tilde expansion fix.</strong> Older versions could land messages in a literal <code>~/.agent-bridge/inbox</code> shadow directory. Modern Agent Bridge avoids that whole class by normalizing home-relative SFTP paths before delivery.
             </div>
           </li>
           <li class="cl-item">

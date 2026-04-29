@@ -27,7 +27,7 @@
  *     `<senderMachine>` and the sender's `<fromTarget>`
  *     with Provider/OriginatingChannel=agent-bridge, so the agent's reply
  *     flows back through the NATIVE agent-bridge channel (channel-plugin.js
- *     :: sendText), which SCPs a BridgeMessage to the sender machine. No
+ *     :: sendText), which SFTP-delivers a BridgeMessage to the sender machine. No
  *     Telegram traffic is generated. Use for agent-to-agent conversations
  *     that should be invisible to Ethan's phone.
  *
@@ -129,7 +129,7 @@ export default {
     const processState = getProcessState();
 
     // Map of session-key-ish hint -> { fromMachine } so the outbound adapter
-    // knows which machine to SCP a reply to when the agent replies in-turn
+    // knows which machine to SFTP-deliver a reply to when the agent replies in-turn
     // via our NATIVE agent-bridge channel (cross-harness flows). This is
     // irrelevant for the Telegram-injection path — replies there travel
     // back through telegram automatically via OriginatingChannel routing.
@@ -375,7 +375,7 @@ export default {
             //    in case the agent replies via our channel tool by hand.
             //  - In agent-bridge mode, our channel-plugin.js :: sendText
             //    consults this map (via ctx.threadId/accountId/to hints) to
-            //    resolve `fromMachine` for the SCP destination. The key
+            //    resolve `fromMachine` for the SFTP destination. The key
             //    MUST include the sessionKey AND the sender machine, which
             //    registerReplyTarget already does.
             registerReplyTarget(replyTargets, {
@@ -408,7 +408,7 @@ export default {
                   // telegram outbound registered on the host. For
                   // targetChannel="agent-bridge" we delegate to our own
                   // registered channel's sendText (channel-plugin.js), which
-                  // SCPs a BridgeMessage back to the sender machine. Either
+                  // SFTP-delivers a BridgeMessage back to the sender machine. Either
                   // way it goes through runtime.channel.outbound.loadAdapter.
                   const deliverFn = resolveProviderDeliver({
                     runtime,
@@ -567,7 +567,7 @@ function startOrReuseWatcher({
 }
 
 /**
- * Register reply-target hints for the outbound SCP path. Keyed by a few
+ * Register reply-target hints for the outbound SFTP path. Keyed by a few
  * plausible lookup shapes so the outbound adapter can find the origin
  * machine regardless of which ctx field the host passes through.
  */

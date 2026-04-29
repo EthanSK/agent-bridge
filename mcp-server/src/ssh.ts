@@ -504,6 +504,53 @@ function sftpExecSingle(
   });
 }
 
+/** Run an SFTP batch against the preferred endpoint with transient retries. */
+async function sftpExec(
+  machine: MachineConfig,
+  batch: string,
+  timeoutMs: number,
+): Promise<SSHResult> {
+  if (!existsSync(machine.key)) {
+    throw new Error(`SSH key not found: ${machine.key}`);
+  }
+
+  const kind = preferredEndpointKind(machine);
+  const ep = endpointFor(machine, kind);
+
+  let result: SSHResult | undefined;
+  for (let attempt = 0; attempt < RETRY_BACKOFFS_MS.length; attempt++) {
+    const backoff = RETRY_BACKOFFS_MS[attempt];
+    if (backoff > 0) {
+      logDebug(
+        `SFTP to ${machine.name} via ${ep.label}: transient failure, ` +
+        `backing off ${backoff}ms before retry ${attempt}/${RETRY_BACKOFFS_MS.length - 1}`,
+      );
+      await sleep(backoff);
+    }
+    result = await sftpExecSingle(
+      machine, ep.host, ep.port, ep.timeoutS, batch, timeoutMs,
+    );
+    if (
+      result.exitCode !== 0 &&
+      isConnectionFailure(result.stderr) &&
+      isTransientClientFailure(result.stderr) &&
+      attempt < RETRY_BACKOFFS_MS.length - 1
+    ) {
+      logWarn(
+        `SFTP to ${machine.name} via ${ep.label} hit transient client ` +
+        `failure (${result.stderr.trim().split('\n').pop()}), retrying`,
+      );
+      continue;
+    }
+    break;
+  }
+  return result!;
+}
+
+function quoteSftpPath(path: string): string {
+  return `"${path.replace(/(["\\])/g, '\\$1')}"`;
+}
+
 /**
  * Build the SFTP batch script for an atomic file delivery.
  *
@@ -522,12 +569,28 @@ export function buildSftpBatch(
 ): string {
   const lines: string[] = [];
   for (const d of sftpParentDirs(remoteFinal)) {
-    lines.push(`-mkdir "${d}"`);
+    lines.push(`-mkdir ${quoteSftpPath(d)}`);
   }
-  lines.push(`put "${localFile}" "${remoteTmp}"`);
-  lines.push(`rename "${remoteTmp}" "${remoteFinal}"`);
+  lines.push(`put ${quoteSftpPath(localFile)} ${quoteSftpPath(remoteTmp)}`);
+  lines.push(`rename ${quoteSftpPath(remoteTmp)} ${quoteSftpPath(remoteFinal)}`);
   lines.push('bye');
   return lines.join('\n') + '\n';
+}
+
+/** Build an SFTP batch that downloads one remote file to a local temp path. */
+export function buildSftpGetBatch(remoteFile: string, localFile: string): string {
+  return [
+    `get ${quoteSftpPath(remoteFile)} ${quoteSftpPath(localFile)}`,
+    'bye',
+  ].join('\n') + '\n';
+}
+
+/** Build an SFTP batch that lists one remote directory, one name per line. */
+export function buildSftpListBatch(remotePath: string): string {
+  return [
+    `ls -1 ${quoteSftpPath(remotePath)}`,
+    'bye',
+  ].join('\n') + '\n';
 }
 
 /**
@@ -581,71 +644,50 @@ export async function sshWriteFile(
     const remoteTmp = `${normalized}.tmp.${randomUUID()}`;
     const batch = buildSftpBatch(localFile, remoteTmp, normalized);
 
-    // 2. Pick the same endpoint sshExec would (Tailscale-first, no fallback).
-    const kind = preferredEndpointKind(machine);
-    const ep = endpointFor(machine, kind);
-
-    let result: SSHResult | undefined;
-    for (let attempt = 0; attempt < RETRY_BACKOFFS_MS.length; attempt++) {
-      const backoff = RETRY_BACKOFFS_MS[attempt];
-      if (backoff > 0) {
-        logDebug(
-          `SFTP to ${machine.name} via ${ep.label}: transient failure, ` +
-          `backing off ${backoff}ms before retry ${attempt}/${RETRY_BACKOFFS_MS.length - 1}`,
-        );
-        await sleep(backoff);
-      }
-      result = await sftpExecSingle(
-        machine, ep.host, ep.port, ep.timeoutS, batch, timeoutMs,
-      );
-      if (
-        result.exitCode !== 0 &&
-        isConnectionFailure(result.stderr) &&
-        isTransientClientFailure(result.stderr) &&
-        attempt < RETRY_BACKOFFS_MS.length - 1
-      ) {
-        logWarn(
-          `SFTP to ${machine.name} via ${ep.label} hit transient client ` +
-          `failure (${result.stderr.trim().split('\n').pop()}), retrying`,
-        );
-        continue;
-      }
-      break;
-    }
-    return result!;
+    // 2. Pick the same endpoint sshExec would (Tailscale-first, no fallback)
+    //    but use SFTP so no remote login shell is involved.
+    return await sftpExec(machine, batch, timeoutMs);
   } finally {
     try { rmSync(localTmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 }
 
 /**
- * Read a file from a remote machine via SSH.
+ * Read a file from a remote machine via SFTP.
  */
 export async function sshReadFile(
   machine: MachineConfig,
   remotePath: string,
   timeoutMs: number = 15000,
 ): Promise<string> {
-  const result = await sshExec(machine, `cat '${remotePath}'`, timeoutMs);
-  if (result.exitCode !== 0) {
-    throw new Error(`Failed to read remote file ${remotePath}: ${result.stderr}`);
+  const localTmpDir = mkdtempSync(join(tmpdir(), 'ab-sftp-read-'));
+  const localFile = join(localTmpDir, `payload-${randomUUID()}.json`);
+  try {
+    const normalized = normalizeSftpPath(remotePath);
+    const result = await sftpExec(
+      machine,
+      buildSftpGetBatch(normalized, localFile),
+      timeoutMs,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(`Failed to read remote file ${remotePath}: ${result.stderr}`);
+    }
+    return readFileSync(localFile, 'utf8');
+  } finally {
+    try { rmSync(localTmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
-  return result.stdout;
 }
 
 /**
- * List files in a directory on a remote machine via SSH.
+ * List files in a directory on a remote machine via SFTP.
  */
 export async function sshListFiles(
   machine: MachineConfig,
   remotePath: string,
   timeoutMs: number = 15000,
 ): Promise<string[]> {
-  const result = await sshExec(
-    machine,
-    `ls -1 '${remotePath}' 2>/dev/null || true`,
-    timeoutMs,
-  );
+  const normalized = normalizeSftpPath(remotePath);
+  const result = await sftpExec(machine, buildSftpListBatch(normalized), timeoutMs);
   if (result.exitCode !== 0) {
     return [];
   }

@@ -21,7 +21,7 @@
       },
       "keysDir": {
         "type": "string",
-        "description": "Directory holding SSH keys for SCP outbound replies. Defaults to ~/.agent-bridge/keys."
+        "description": "Directory holding SSH keys for SFTP outbound replies. Defaults to ~/.agent-bridge/keys."
       },
       "pollIntervalMs": {
         "type": "integer",
@@ -43,7 +43,7 @@
       "replyVia": {
         "type": "string",
         "enum": ["telegram", "agent-bridge"],
-        "description": "Plugin-level default reply routing for inbound bridge messages. 'telegram' routes the agent's reply back through the same Telegram chat that injected the session (visible to Ethan's phone). 'agent-bridge' routes the reply back to the SENDER machine via agent-bridge SCP (invisible to Telegram). If unset, routing mirrors the sender: messages with fromTarget reply over agent-bridge; messages without it reply through Telegram. Per-target overrides win over this default."
+        "description": "Plugin-level default reply routing for inbound bridge messages. 'telegram' routes the agent's reply back through the same Telegram chat that injected the session (visible to Ethan's phone). 'agent-bridge' routes the reply back to the SENDER machine via agent-bridge SFTP delivery (invisible to Telegram). If unset, routing mirrors the sender: messages with fromTarget reply over agent-bridge; messages without it reply through Telegram. Per-target overrides win over this default."
       },
       "targets": {
         "type": "object",
@@ -73,7 +73,7 @@
             "replyVia": {
               "type": "string",
               "enum": ["telegram", "agent-bridge"],
-              "description": "Override plugin-level `replyVia` for this target. 'telegram' = reply goes out through Telegram (Ethan's phone pings). 'agent-bridge' = reply is SCP'd back to the sender machine as a BridgeMessage (no Telegram traffic). Default: inherits plugin-level, then mirrors the sender (agent-bridge when fromTarget is present, otherwise telegram)."
+              "description": "Override plugin-level `replyVia` for this target. 'telegram' = reply goes out through Telegram (Ethan's phone pings). 'agent-bridge' = reply is SFTP-delivered back to the sender machine as a BridgeMessage (no Telegram traffic). Default: inherits plugin-level, then mirrors the sender (agent-bridge when fromTarget is present, otherwise telegram)."
             }
           },
           "required": ["account"]

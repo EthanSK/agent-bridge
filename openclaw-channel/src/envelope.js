@@ -31,7 +31,7 @@
  * replyVia mode on a single incoming message — handy for quick back-channel
  * probes without reconfiguring the receiver's target. Valid values are
  * "telegram" (reply goes back through the Telegram chat — Ethan's phone
- * pings) and "agent-bridge" (reply is SCP'd back as a BridgeMessage, no
+ * pings) and "agent-bridge" (reply is SFTP-delivered back as a BridgeMessage, no
  * Telegram traffic). Unrecognised values fall back to the target's configured
  * default.
  */

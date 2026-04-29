@@ -283,7 +283,7 @@ export function registerTools(server: McpServer): void {
       }
 
       // Validate target up-front so we return a helpful error rather than
-      // letting sendMessage throw deep in the SCP path.
+      // letting sendMessage throw deep in the SFTP delivery path.
       if (!target || !isValidTarget(target)) {
         return {
           content: [

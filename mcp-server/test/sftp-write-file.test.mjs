@@ -96,6 +96,20 @@ test('buildSftpBatch trailing newline so sftp -b - flushes the last command', ()
   assert.equal(batch.endsWith('\n'), true);
 });
 
+test('buildSftpGetBatch downloads via SFTP get without remote shell', () => {
+  assert.equal(
+    ssh.buildSftpGetBatch('.agent-bridge/inbox/m1.json', '/tmp/local m1.json'),
+    'get ".agent-bridge/inbox/m1.json" "/tmp/local m1.json"\nbye\n',
+  );
+});
+
+test('buildSftpListBatch lists via SFTP ls without remote shell redirection', () => {
+  assert.equal(
+    ssh.buildSftpListBatch('.agent-bridge/inbox/claude-code'),
+    'ls -1 ".agent-bridge/inbox/claude-code"\nbye\n',
+  );
+});
+
 test('buildSftpBatch produces no shell-mode constructs ($, &&, |, mv, mkdir -p)', () => {
   const batch = ssh.buildSftpBatch(
     '/local/payload.json',

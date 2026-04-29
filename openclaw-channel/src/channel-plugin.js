@@ -6,7 +6,7 @@
  *
  * The goal is to register as a native channel with enough surface that the
  * host's channel registry accepts us, while keeping the real behaviour in
- * our own inbox-watcher + outbound SCP pipeline.
+ * our own inbox-watcher + outbound SFTP pipeline.
  *
  * Key pieces of the ChannelPlugin contract we satisfy:
  *   - id, meta          : identity + docs metadata
@@ -19,7 +19,7 @@
  *   - gateway/status    : keep a passive runtime alive so OpenClaw marks the
  *                         account as running instead of repeatedly restarting
  *                         it as "stopped"
- *   - outbound          : direct-delivery sendText that SCPs a BridgeMessage
+ *   - outbound          : direct-delivery sendText that SFTP-delivers a BridgeMessage
  *                         back to the sender machine
  */
 
@@ -57,7 +57,7 @@ function waitUntilAbort(signal) {
  * @param {object} opts
  * @param {object} opts.logger
  * @param {() => Map<string, {fromMachine: string}>} opts.getReplyTargets
- *   Lookup for which machine to SCP a reply to, keyed by sessionKey.
+ *   Lookup for which machine to SFTP-deliver a reply to, keyed by sessionKey.
  *   Populated by index.js when an inbound message is injected.
  * @param {() => object} [opts.getPluginConfig]
  */

@@ -14,6 +14,10 @@ The OpenClaw channel adapter still used a POSIX remote-shell sequence for cross-
 
 **Fix.** `openclaw-channel/src/outbound.js` now mirrors the MCP server send path: build an SFTP batch, create parent directories with `-mkdir`, `put` to a hidden temp file, then `rename` atomically to the final JSON inbox path. `~/` is normalized to a home-relative SFTP path so the same batch works on macOS, Linux, and Windows OpenSSH. Added OpenClaw-channel SFTP path/batch tests.
 
+### Follow-up: remove remaining remote-shell file helpers/docs drift
+
+A full scan found the runtime delivery paths were SFTP, but two exported MCP helper functions still used POSIX remote-shell commands (`cat` / `ls`) even though they are not used by the current send/receive path. They now use SFTP `get` / `ls -1` batches through the same preferred endpoint and retry wrapper as `sshWriteFile`, so future file-read/list call sites cannot accidentally reintroduce Windows `cmd.exe` shell assumptions. Current README/site/OpenClaw-channel wording now says SFTP, not SCP, for Agent Bridge message delivery.
+
 ## agent-bridge 3.9.1 — 2026-04-28
 
 ### [CONSUME-RACE] Fix — re-inject retry counter never incremented past 1

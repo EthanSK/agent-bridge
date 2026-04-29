@@ -35,7 +35,7 @@ around 25 optional adapter surfaces. The minimum viable shape we implement:
   lives in `~/.agent-bridge/config`, not `openclaw.json`.
 - `setup.applyAccountConfig` — required by the SDK. Implemented as a no-op
   since the CLI command `agent-bridge pair` owns the real config state.
-- `outbound.sendText` — SCPs a `BridgeMessage` reply to the remote machine.
+- `outbound.sendText` — SFTP-delivers a `BridgeMessage` reply to the remote machine.
 - `reload.configPrefixes` — lets the gateway hot-reload when our config block
   changes instead of requiring a full restart.
 
@@ -186,8 +186,7 @@ When the agent replies in-turn, OpenClaw's reply pipeline calls our
 2. Build a `BridgeMessage` envelope with `type: "reply"` and the correct
    `replyTo` id.
 3. Stage it temporarily at `~/.agent-bridge/outbound/<id>.json`.
-4. `scp -i ~/.agent-bridge/keys/agent-bridge_<remote> <tmp>
-   <user>@<host>:~/.agent-bridge/inbox/<target>/<id>.json`.
+4. SFTP batch delivery creates parent inbox dirs, `put`s a temp file, then `rename`s it atomically to `<user>@<host>:.agent-bridge/inbox/<target>/<id>.json`.
 5. Remove the local staging file after success or failure. On the receiver,
    the target watcher moves successfully consumed inbox files to its archive
    directory; archive is a processed-message trace, not the live queue.
@@ -217,7 +216,7 @@ openclaw-channel/
     ├── index.js            # plugin entry: registerChannel + start watcher
     ├── channel-plugin.js   # the ChannelPlugin object (meta, config, outbound)
     ├── inbox-watcher.js    # poll ~/.agent-bridge/inbox/*.json
-    ├── outbound.js         # SCP reply BridgeMessages back to sender
+    ├── outbound.js         # SFTP reply BridgeMessages back to sender
     ├── envelope.js         # BridgeMessage parse/build helpers
     └── log.js              # thin logger wrapper over api.logger
 ```

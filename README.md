@@ -293,7 +293,7 @@ openclaw gateway restart
 # /reload-plugins
 ```
 
-Do this on **both** paired machines so they stay in sync — the SCP envelope format occasionally changes between minor versions.
+Do this on **both** paired machines so they stay in sync — the SFTP-delivered BridgeMessage envelope format occasionally changes between minor versions.
 
 ---
 
@@ -980,15 +980,15 @@ Install the native OpenClaw channel plugin (`openclaw-channel/`):
   }
 }
 ```
-Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegram) via `api.registerChannel()`. Inbound messages dispatch through `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` — the same dispatch primitive used by the native IRC / Nextcloud Talk channels — so a bridge message arriving for a Telegram-bound target runs a real agent turn and the reply lands in the Telegram chat. No CLI shell-out, no scanner bypass. Cross-harness outbound replies SCP a `BridgeMessage` back to the sender. Keep the MCP server in `tools-only` mode on OpenClaw, so only the real Claude Code plugin owns `inbox/claude-code/` delivery. See [`openclaw-channel/README.md`](openclaw-channel/README.md) and [`openclaw-channel/ARCHITECTURE.md`](openclaw-channel/ARCHITECTURE.md).
+Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegram) via `api.registerChannel()`. Inbound messages dispatch through `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` — the same dispatch primitive used by the native IRC / Nextcloud Talk channels — so a bridge message arriving for a Telegram-bound target runs a real agent turn and the reply lands in the Telegram chat. No CLI shell-out, no scanner bypass. Cross-harness outbound replies SFTP-deliver a `BridgeMessage` back to the sender. Keep the MCP server in `tools-only` mode on OpenClaw, so only the real Claude Code plugin owns `inbox/claude-code/` delivery. See [`openclaw-channel/README.md`](openclaw-channel/README.md) and [`openclaw-channel/ARCHITECTURE.md`](openclaw-channel/ARCHITECTURE.md).
 
 > **Migrating from v1.3.0 (`openclaw-plugin/`)?** That extension plugin has been removed as of v2.0.0. Delete any `plugins.entries["agent-bridge"]` block from your config and point `plugins.load.paths` at the new `openclaw-channel/` directory. The gateway hot-reloads on config change.
 
 **How OpenClaw push delivery works:**
-1. Peer's `bridge_send_message` writes a JSON file to `~/.agent-bridge/inbox/openclaw/<target>/` via SSH
+1. Peer's `bridge_send_message` writes a JSON file to `~/.agent-bridge/inbox/openclaw/<target>/` via SFTP over SSH
 2. The channel plugin's file watcher sees the new file
 3. The plugin resolves the canonical session route via `runtime.channel.routing.resolveAgentRoute(...)`, builds a synthetic inbound ctxPayload with `Provider: "telegram"` + `OriginatingChannel: "telegram"` + `OriginatingTo: "telegram:<peerId>"`, and calls `dispatchInboundReplyWithBase` — a synchronous agent turn runs in the target session and the agent's reply is sent out through `runtime.channel.telegram.sendMessageTelegram(...)`, landing in the matching Telegram chat
-4. For cross-harness replies (peer is ALSO agent-bridge-aware), the plugin SCPs a reply `BridgeMessage` back to the sender's inbox via the native `agent-bridge` channel's outbound adapter
+4. For cross-harness replies (peer is ALSO agent-bridge-aware), the plugin SFTP-delivers a reply `BridgeMessage` back to the sender's inbox via the native `agent-bridge` channel's outbound adapter
 
 ### Codex (OpenAI) (MCP server -- tools-only / manual fallback)
 
