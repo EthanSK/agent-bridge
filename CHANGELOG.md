@@ -1,5 +1,18 @@
 # Changelog
 
+## agent-bridge 3.12.0 — 2026-04-30
+
+### [AUTO-UPDATE-COORD-LOCK 2026-04-30] Same-host receiver coordination lock
+
+3.12.0 formalizes the auto-update receiver coordination contract so multi-target notification fan-out no longer causes same-host Claude Code/OpenClaw receivers to race each other on the shared checkout, npm install, or plugin-cache writes.
+
+- **New `scripts/auto-update-coord.sh` helper.** Provides `run`, `acquire`, `release`, and `status` commands. The preferred receiver path is `./scripts/auto-update-coord.sh run --source-dir "$PWD" --cycle <origin-sha> -- ./scripts/update.sh --auto`, which holds the host-local checkout lock while the updater pulls, builds, syncs plugin cache, and triggers reload.
+- **Checkout-scoped lock + state files.** Coordination lives under `~/.agent-bridge/locks/auto-update.<sha256(realpath(source-dir))>.lock` with a sibling `.state` file, so different clones coordinate independently and symlinked paths collapse to the same real checkout.
+- **Stale-lock and retry gates.** Locks older than 1800 seconds (override: `AGENT_BRIDGE_AUTO_UPDATE_STALE_AFTER_SEC`) may be reclaimed. Repeated attempts for the same origin SHA are gated for 300 seconds (override: `AGENT_BRIDGE_AUTO_UPDATE_MIN_INTERVAL_SEC`) so receivers do not spin if a lock is released/reclaimed quickly. Skip exit codes are deterministic: `73` = another receiver holds the lock, `75` = minimum interval active.
+- **Notification + README contract updates.** `scripts/check-update.sh` now includes the coordinated receiver command and current coord lock/state summary in `[BRIDGE-UPDATE-AVAILABLE]` messages. README documents same-host-only semantics, lock paths, exit codes, and the new receiver step 1.5 for both Claude Code and OpenClaw receivers.
+
+Files touched: `scripts/auto-update-coord.sh`, `scripts/check-update.sh`, `README.md`, `CHANGELOG.md`, version bumps in `agent-bridge`, `mcp-server/package.json`, `mcp-server/package-lock.json`, `mcp-server/src/config.ts`, `mcp-server/.claude-plugin/plugin.json`, and version-expectation tests.
+
 ## agent-bridge 3.11.1 — 2026-04-30
 
 ### [AUTO-UPDATE-TEST-MODE 2026-04-30] Configurable interval env var + live-test recipe

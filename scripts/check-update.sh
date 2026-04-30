@@ -3,6 +3,7 @@
 # agent-bridge/scripts/check-update.sh
 # ------------------------------------
 # [AUTO-UPDATE-CHECK 2026-04-29]
+# [AUTO-UPDATE-COORD-LOCK 2026-04-30]
 #
 # Cheap "is there an update available" probe. Runs `git fetch` against the
 # agent-bridge source checkout, compares HEAD to origin/main, and — if origin
@@ -24,7 +25,9 @@
 #   - Multi-target: by default drops one message into every inbox subdir
 #     under ~/.agent-bridge/inbox/* that already exists (claude-code,
 #     openclaw/*, etc.) so any harness on this host that polls its own
-#     subdir will see it.
+#     subdir will see it. Receivers coordinate with
+#     scripts/auto-update-coord.sh before running pull/build/reload so this
+#     fan-out does not create same-host git/npm/plugin-cache races.
 #   - Kill switch: AGENT_BRIDGE_AUTO_UPDATE_CHECK=0 (or false/off/no) makes
 #     this script exit 0 silently without doing anything. Default = on.
 #
@@ -82,6 +85,12 @@ done
 
 say() { (( VERBOSE )) && echo "$@" >&2 || true; }
 warn() { echo "WARN: $*" >&2; }
+
+shell_quote() {
+  # Single-quote a string for display in a copy/pasteable shell command.
+  # This is intentionally tiny/portable (macOS bash 3.2 compatible).
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
 
 # ---------- Locate repo root -------------------------------------------------
 
@@ -158,8 +167,28 @@ ID="msg-update-$(date -u +%Y%m%dT%H%M%SZ)-${ORIGIN_HEAD:0:8}"
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 SUBJECTS="$(git log --format='  %h %s' "$LOCAL_HEAD..$ORIGIN_HEAD" 2>/dev/null | head -10)"
 
+# ---------- Coordination helper details --------------------------------------
+
+COORD_HELPER="$SCRIPT_DIR/auto-update-coord.sh"
+COORD_COMMAND=""
+COORD_STATUS=""
+COORD_LOCK_PATH=""
+if [[ -x "$COORD_HELPER" ]]; then
+  quoted_repo="$(shell_quote "$REPO_ROOT")"
+  quoted_cycle="$(shell_quote "$ORIGIN_HEAD")"
+  COORD_COMMAND="cd $quoted_repo && ./scripts/auto-update-coord.sh run --source-dir $quoted_repo --cycle $quoted_cycle -- ./scripts/update.sh --auto"
+  COORD_STATUS="$("$COORD_HELPER" status --source-dir "$REPO_ROOT" --cycle "$ORIGIN_HEAD" --plain 2>/dev/null || true)"
+  COORD_LOCK_PATH="$(printf '%s\n' "$COORD_STATUS" | sed -n 's/^lock_path=//p' | head -1)"
+else
+  COORD_COMMAND="cd $(shell_quote "$REPO_ROOT") && ./scripts/update.sh --auto"
+fi
+
 CONTENT_HEADER="[BRIDGE-UPDATE-AVAILABLE] agent-bridge has $BEHIND new commit(s) on origin/main since ${LOCAL_HEAD:0:7} (now ${ORIGIN_HEAD:0:7})."
-CONTENT_BODY="Run scripts/update.sh from the agent-bridge checkout (${REPO_ROOT}) to fetch + rebuild + sync the Claude plugin cache. The check is idempotent — the same origin SHA will not re-notify until a newer one lands. Disable entirely with AGENT_BRIDGE_AUTO_UPDATE_CHECK=0."
+CONTENT_BODY="Receiver subagents MUST coordinate before applying this update so same-host Claude Code/OpenClaw listeners do not race on git, npm, or plugin-cache writes. Preferred command:
+
+${COORD_COMMAND}
+
+Only the receiver that acquires the local coord lock should pull/build/reload. Exit 73 means another local receiver is already handling this checkout; exit 75 means the minimum retry interval has not elapsed for this same origin SHA. The check is idempotent — the same origin SHA will not re-notify until a newer one lands. Disable entirely with AGENT_BRIDGE_AUTO_UPDATE_CHECK=0."
 
 # Use node to assemble the JSON payload — agent-bridge already requires node,
 # and node handles all the escaping (multiline content, quotes, etc.) safely.
@@ -175,9 +204,24 @@ JSON_PAYLOAD="$(
   AB_HEADER="$CONTENT_HEADER" \
   AB_BODY="$CONTENT_BODY" \
   AB_SUBJECTS="$SUBJECTS" \
+  AB_COORD_STATUS="$COORD_STATUS" \
+  AB_COORD_LOCK_PATH="$COORD_LOCK_PATH" \
   AB_TIMESTAMP="$TIMESTAMP" \
   "$NODE_BIN" -e '
     const subjects = process.env.AB_SUBJECTS || "";
+    const coordStatus = process.env.AB_COORD_STATUS || "";
+    const coordLockPath = process.env.AB_COORD_LOCK_PATH || "";
+    const coordLines = [];
+    if (coordLockPath) {
+      coordLines.push(`Coord lock: ${coordLockPath}`);
+    }
+    if (coordStatus) {
+      const state = Object.fromEntries(coordStatus.split(/\n/).filter(Boolean).map((line) => {
+        const idx = line.indexOf("=");
+        return idx === -1 ? [line, ""] : [line.slice(0, idx), line.slice(idx + 1)];
+      }));
+      coordLines.push(`Coord state: ${state.lock_state || "unknown"}` + (state.last_attempt_iso ? `; last attempt ${state.last_attempt_iso}` : ""));
+    }
     const content = [
       process.env.AB_HEADER,
       "",
@@ -185,6 +229,7 @@ JSON_PAYLOAD="$(
       subjects,
       "",
       process.env.AB_BODY,
+      ...(coordLines.length ? ["", ...coordLines] : []),
     ].join("\n");
     const payload = {
       id: process.env.AB_ID,

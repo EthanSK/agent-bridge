@@ -305,7 +305,7 @@ To run the updater automatically when Claude Code starts or resumes, paste one h
 
 Claude Code's current hook schema uses an outer matcher group and an inner `hooks` array. `timeout` is in seconds.
 
-### Auto-update notifications (3.10.0+, periodic re-probe in 3.11.0+)
+### Auto-update notifications (3.10.0+, periodic re-probe in 3.11.0+, receiver coord in 3.12.0+)
 
 agent-bridge can also tell the running harness when its source checkout has fallen behind `origin/main`, so the agent itself sees a `[BRIDGE-UPDATE-AVAILABLE]` channel message instead of silently drifting. The notification is **on by default** — the MCP server fires `scripts/check-update.sh` ~30 seconds after `server.connect()` (channel-owner only) **and then re-probes every 3 hours** (3.11.0+, addresses the bug where long-lived channel-owner children booted before an upstream push never noticed the new commit). The script runs `git fetch --quiet`, compares `HEAD` to `origin/main`, and — if origin is strictly ahead — drops a `BridgeMessage` JSON file into `~/.agent-bridge/inbox/<target>/`. The existing channel watcher pushes it into the live session via `notifications/claude/channel`, just like a remote message. Idempotent: the last-notified `origin/main` SHA is recorded at `~/.agent-bridge/.last-update-notified-head`, so the same SHA does not re-notify.
 
@@ -359,26 +359,52 @@ When a `[BRIDGE-UPDATE-AVAILABLE]` channel message lands in a Claude Code or Ope
 - Forces conflict resolution to happen inside whatever the agent was doing (mid-Telegram-thread, mid-debug, etc.) instead of in an isolated context.
 - Loses the natural "report back commit hash and any conflicts" handoff a subagent provides.
 
-The recommended pattern is **dispatch a subagent to do the upgrade**, then surface its result back to the user:
+The recommended pattern is **dispatch a subagent to do the upgrade**, then surface its result back to the user. As of **3.12.0** ([AUTO-UPDATE-COORD-LOCK 2026-04-30]), every receiver subagent must pass through the shared coordination helper before it touches git/npm/plugin-cache state:
 
 1. Receiver sees the `[BRIDGE-UPDATE-AVAILABLE]` channel block.
 2. Receiver dispatches a subagent (see harness-specific guidance below) with instructions to:
    - `cd <agent-bridge source checkout>`
-   - `git fetch origin main`
-   - `git pull --ff-only origin main` (fall back to `git pull --rebase origin main` if FF fails — the script's behavior is non-FF on developer state, treat that as the manual escape hatch and surface to the user)
-   - `cd mcp-server && npm install && npm run build`
-   - Trigger the harness's plugin reload — for Claude Code this is `/reload-plugins` (the `self-reload-plugins` skill); for OpenClaw it's the equivalent gateway-restart path (see harness docs).
-   - Report back: final commit hash, list of incoming subjects, and any conflicts / non-FF / build errors.
-3. Main agent surfaces the subagent's report to the user. **The receiver agent MUST notify the user when the auto-update completes** — for this rig, that means a Telegram message containing the new commit hash, a one-line summary of what changed (subjects of incoming commits), and any conflicts / non-FF / build errors. Notification at start ("dispatching subagent to apply X→Y agent-bridge update") and at end ("update complete, now at \<hash\>") is the right cadence. If the subagent reports a non-FF condition, the main agent asks the user what to do rather than auto-rebasing through unknown developer state.
+   - **Step 1.5: acquire the same-host coordination gate** and run the updater through it:
 
-**Claude Code specifics.** Use the built-in subagent dispatch (the `Agent` tool with `subagent_type: "general-purpose"`). `run_in_background: true` is appropriate here so the user's session remains responsive during the npm install/build; the subagent posts back asynchronously. The receiver agent should announce "dispatching a subagent to apply the agent-bridge update" so the user knows what's happening, and then send a follow-up Telegram (or whichever channel) message when the subagent finishes. The `self-reload-plugins` skill is the right post-build trigger.
+     ```bash
+     ./scripts/auto-update-coord.sh run \
+       --source-dir "$PWD" \
+       --cycle <origin-main-sha-from-the-notification> \
+       -- ./scripts/update.sh --auto
+     ```
 
-**OpenClaw specifics.** OpenClaw's subagent-dispatch convention is harness-version-specific and currently **TBD** — at the time of this writing, no documented `subagent_type` analogue is exposed by OpenClaw's tooling. Until that is resolved, OpenClaw receivers should:
+     `run` acquires the lock, records the attempt timestamp, executes the command, and releases the lock via `trap` when the command exits. Harnesses that cannot wrap the whole command may use `acquire` + `release` manually, but they must keep the token and release only their own lock:
 
-- Print the `[BRIDGE-UPDATE-AVAILABLE]` notice to the operator and stop.
-- Let the operator manually run `scripts/update.sh` (or the recommended commands above) and `openclaw gateway restart`.
+     ```bash
+     eval "$(./scripts/auto-update-coord.sh acquire --source-dir "$PWD" --cycle <origin-sha>)"
+     trap './scripts/auto-update-coord.sh release --source-dir "$PWD" --cycle <origin-sha> --token "$AGENT_BRIDGE_AUTO_UPDATE_TOKEN" --exit-code "$?"' EXIT
+     ./scripts/update.sh --auto
+     ```
 
-A research item is pinned to discover OpenClaw's analogue (likely a `claw spawn` or workspace-skill pattern under `~/.openclaw/workspace/skills/`); when that lands, this section will document the equivalent receiver behavior. Cross-machine update-propagation is unaffected: the bridge_send_message machinery already lets a Claude Code peer instruct an OpenClaw peer to perform a manual update step.
+   - If the helper exits `73`, another local receiver already owns the update for this checkout. Do **not** pull/build; observe/report that the host-level update is already in progress.
+   - If the helper exits `75`, the same origin SHA is inside the minimum retry interval. Do **not** retry immediately; report that the retry gate is active.
+   - If the helper exits `0` from `run`, the update command succeeded. Report the final commit hash, incoming subjects, and reload result.
+   - If the wrapped updater exits non-zero, surface the git/build/reload error to the user rather than retrying in a loop.
+3. Main agent surfaces the subagent's report to the user. **The receiver agent MUST notify the user when the auto-update completes or is skipped by coordination** — for this rig, that means a Telegram message containing the new commit hash or the coordination skip reason, a one-line summary of what changed (subjects of incoming commits), and any conflicts / non-FF / build errors. Notification at start ("dispatching subagent to apply X→Y agent-bridge update") and at end ("update complete, now at <hash>" or "another local receiver is handling it") is the right cadence. If the subagent reports a non-FF condition, the main agent asks the user what to do rather than auto-rebasing through unknown developer state.
+
+**Coordination contract.** The helper is intentionally **same-host only**. Different hosts have different source checkouts, npm installs, plugin caches, and reload lifecycles, so one host's update does not protect or complete another host's update. The lock path is derived from the canonical source checkout path:
+
+```text
+~/.agent-bridge/locks/auto-update.<sha256(realpath(source-dir))>.lock
+~/.agent-bridge/locks/auto-update.<sha256(realpath(source-dir))>.state
+```
+
+That means `~/Projects/agent-bridge` and `~/.openclaw/workspace/agent-bridge` coordinate separately unless they resolve to the same real path/symlink target. Any number of Claude Code sessions and OpenClaw personas on the same machine can call the helper concurrently; exactly one holder proceeds for a given checkout, and the rest receive a deterministic skip code.
+
+Defaults are deliberately conservative:
+
+- Stale lock: **1800 seconds / 30 minutes** (`AGENT_BRIDGE_AUTO_UPDATE_STALE_AFTER_SEC`). If a lock is older than this, the next receiver may reclaim it because the holder likely died.
+- Minimum retry interval: **300 seconds / 5 minutes** for the same `--cycle` (`AGENT_BRIDGE_AUTO_UPDATE_MIN_INTERVAL_SEC`). This prevents tight receiver loops if a lock is released quickly or repeatedly reclaimed. A newer origin SHA is a new cycle and may proceed immediately.
+- Lock dir: `~/.agent-bridge/locks` (`AGENT_BRIDGE_LOCK_DIR`).
+
+**Claude Code specifics.** Use the built-in subagent dispatch (the `Agent` tool with `subagent_type: "general-purpose"`). `run_in_background: true` is appropriate here so the user's session remains responsive during the npm install/build; the subagent posts back asynchronously. The receiver agent should announce "dispatching a subagent to apply the agent-bridge update" so the user knows what's happening, and then send a follow-up Telegram (or whichever channel) message when the subagent finishes. The `self-reload-plugins` skill is the right post-build trigger; `scripts/update.sh --auto` already invokes it when available.
+
+**OpenClaw specifics.** OpenClaw receivers should use the same helper and lock directory. If the running OpenClaw version exposes background subagents/sessions, dispatch one and wrap `./scripts/update.sh --auto` with `auto-update-coord.sh run` exactly as above. If no safe background-dispatch primitive is available in that harness version, print the notification and the coordination command to the operator instead of running pull/build/reload in the foreground. Cross-machine update propagation is unaffected: bridge delivery can notify every host, but coordination remains local to each host's checkout.
 
 #### Live-test recipe
 
@@ -415,7 +441,7 @@ The override accepts an integer millisecond value, bounded **30000 (30 s)** ≤ 
 
 4. Within roughly **30 s + 60 s** (initial-delay window + first periodic interval), the test peer's MCP probe should fire and `scripts/check-update.sh` should drop a `[BRIDGE-UPDATE-AVAILABLE]` BridgeMessage into `~/.agent-bridge/inbox/<target>/`. The channel watcher then pushes it into the running session, exactly as it would with a remote-originated message.
 
-5. The receiver subagent flow documented above (Claude Code: `Agent` tool with `subagent_type: "general-purpose"`, `run_in_background: true`; OpenClaw: TBD) should kick in: dispatch a subagent to `git pull --ff-only && cd mcp-server && npm install && npm run build`, then `/reload-plugins`, then surface the new commit hash and a one-line summary back via the harness's normal channel (Telegram, console, etc.). This is the part you're actually validating.
+5. The receiver subagent flow documented above (Claude Code: `Agent` tool with `subagent_type: "general-purpose"`, `run_in_background: true`; OpenClaw: use its background session/subagent primitive when available) should kick in: dispatch a subagent to run `./scripts/auto-update-coord.sh run --source-dir "$PWD" --cycle <origin-sha> -- ./scripts/update.sh --auto`, then surface the new commit hash or coordination skip reason and a one-line summary back via the harness's normal channel (Telegram, console, etc.). This is the part you're actually validating.
 
 6. **After validating, unset the env var and reload** to return to the production 3 h cadence:
 
