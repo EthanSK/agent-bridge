@@ -10,8 +10,9 @@
 #   3. archive stale Claude Code plugin cache copies when safe
 #   4. sync any installed Claude Code plugin cache copies
 #   5. (optional) restart the OpenClaw gateway
-#   6. (macOS only) trigger /reload-plugins in the running Claude Code terminal
-#      if ~/.claude/skills/self-reload-plugins is present
+#   6. (macOS / Linux / Windows-via-Git-Bash) trigger /reload-plugins in the
+#      running Claude Code terminal if ~/.claude/skills/self-reload-plugins is
+#      present
 #
 # 3.7.0+: the dedicated claude-code-channel package was deleted and merged
 # back into mcp-server/. There's nothing else to build for Claude Code.
@@ -470,10 +471,16 @@ fi
 hr
 say "==> Step 6/6: Claude Code /reload-plugins"
 
+case "$(uname -s)" in
+  Darwin|Linux|MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    say "unsupported platform $(uname -s) — skipping /reload-plugins automation."
+    SKIP_RELOAD=1
+    ;;
+esac
+
 if (( SKIP_RELOAD )); then
   say "--skip-reload — skipping."
-elif [[ "$(uname -s)" != "Darwin" ]]; then
-  say "not macOS — skipping /reload-plugins automation."
 elif [[ ! -x "$HOME/.claude/skills/self-reload-plugins/scripts/reload.sh" ]]; then
   say "self-reload-plugins skill not installed (missing ~/.claude/skills/self-reload-plugins/scripts/reload.sh) — skipping."
   say "    If you're in an active Claude Code session, run /reload-plugins yourself so MCP tools reconnect to the new build."
