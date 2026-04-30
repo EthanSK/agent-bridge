@@ -564,6 +564,18 @@ agent-bridge status MacBook-Pro
 agent-bridge run MacBook-Pro "uname -a"
 ```
 
+### Document the staleness rules in your harness CLAUDE.md / AGENTS.md
+
+After install, copy the following two debug-first rules into your `~/.claude/CLAUDE.md` (or your harness's equivalent global agent instructions file — `AGENTS.md` for Codex, `USER.md` for some OpenClaw setups). These rules surface the most common silent failure modes for agent-bridge specifically and channel-plugin MCPs in general. Without them, future debugging sessions waste hours chasing "why isn't the new version loading" instead of checking the loading path first.
+
+**Rule 1: Stale / out-of-date plugin install — check first**
+> When an MCP plugin / agent-bridge / channel plugin "isn't picking up changes" or "is missing features it should have", verify the actually-loaded plugin version BEFORE assuming a code bug. Run `ps -axww -o pid,command | grep -E "<plugin-name>.*build/index"` (or `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "<plugin>.*build" }` on Windows) to see the path the running MCP child was spawned from. Plugins can be loaded from a **dev clone** path (where `git pull` + `npm run build` updates the file on disk) or a **frozen plugin-cache install** path under `~/.claude/plugins/cache/<name>/<name>/<version>/build/index.js` (which doesn't auto-refresh for directory-source marketplaces). If installed_plugins.json's installPath references a missing or archived dir, the plugin will silently fail to spawn — a `[ -e "$installPath/build/index.js" ]` (bash) or `Test-Path "$installPath/build/index.js"` (PS) preflight check catches this. Fix by editing `~/.claude/plugins/installed_plugins.json` to point installPath at the dev clone's plugin-root subdir (the dir containing `.mcp.json` + `package.json`, e.g. `~/Projects/agent-bridge/mcp-server`), then full Claude Code restart.
+
+**Rule 2: `/reload-plugins` is NOT a hot-reload for MCP child processes**
+> `/reload-plugins` re-reads plugin descriptors / skills / hooks but does NOT reliably kill and respawn long-running MCP child processes. Patch F's lease coordination keeps healthy channel-owners alive and demotes /reload-plugins-spawned children to standby. Result: the running plugin keeps its OLD code regardless of how many times you fire /reload-plugins. **Full Claude Code session restart is the only deterministic way to load new MCP code.** The `self-reload-plugins` skill triggers /reload-plugins but does NOT do what its name implies for MCP-child code refreshes — useful for descriptor refreshes only.
+
+These rules are mirrored in [EthanSK/dot-claude](https://github.com/EthanSK/dot-claude)'s `CLAUDE.md` (commits `aefd7bb` and `2017f8f`) and [EthanSK/dot-claude-dell](https://github.com/EthanSK/dot-claude-dell) (`92d1ae6`). Established 2026-04-30 after a multi-hour debug where an MBP agent-bridge MCP child silently died for 2-3 days because its cache install dir was archived; the runtime had no `node ...build/index.js` process at all and 6 bridge messages stacked in the inbox queue waiting forever.
+
 ---
 
 ## Windows setup
