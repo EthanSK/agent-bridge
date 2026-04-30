@@ -865,7 +865,40 @@ async function main(): Promise<void> {
   // probe so a single host with multiple bridge MCP children doesn't
   // multi-notify.
   const AUTO_UPDATE_PROBE_INITIAL_DELAY_MS = 30_000;
-  const AUTO_UPDATE_PROBE_INTERVAL_MS = 3 * 60 * 60 * 1000; // 3 hours
+  const AUTO_UPDATE_PROBE_INTERVAL_DEFAULT_MS = 3 * 60 * 60 * 1000; // 3 hours
+  // 3.11.1 [AUTO-UPDATE-TEST-MODE 2026-04-30] — operator can override the
+  // periodic interval via env for live regression tests of the auto-update
+  // flow without waiting 3h. Bounds: 30 s ≤ override ≤ 24 h. Out-of-range
+  // or unparseable values fall back to the 3 h default with a warn log.
+  // Kill switch (AGENT_BRIDGE_AUTO_UPDATE_CHECK) wins over this — if the
+  // probe is disabled outright, the override is irrelevant. The initial
+  // 30 s delayed first probe is unaffected; only the interval is configurable.
+  const AUTO_UPDATE_INTERVAL_MIN_MS = 30_000;
+  const AUTO_UPDATE_INTERVAL_MAX_MS = 24 * 60 * 60 * 1000;
+  const resolveAutoUpdateIntervalMs = (): { intervalMs: number; source: 'env' | 'default'; rawValue?: string; reason?: string } => {
+    const raw = process.env.AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS;
+    if (raw === undefined || raw.trim() === '') {
+      return { intervalMs: AUTO_UPDATE_PROBE_INTERVAL_DEFAULT_MS, source: 'default' };
+    }
+    const parsed = Number(raw.trim());
+    if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+      return {
+        intervalMs: AUTO_UPDATE_PROBE_INTERVAL_DEFAULT_MS,
+        source: 'default',
+        rawValue: raw,
+        reason: 'unparseable_or_non_positive_integer',
+      };
+    }
+    if (parsed < AUTO_UPDATE_INTERVAL_MIN_MS || parsed > AUTO_UPDATE_INTERVAL_MAX_MS) {
+      return {
+        intervalMs: AUTO_UPDATE_PROBE_INTERVAL_DEFAULT_MS,
+        source: 'default',
+        rawValue: raw,
+        reason: 'out_of_bounds',
+      };
+    }
+    return { intervalMs: parsed, source: 'env', rawValue: raw };
+  };
 
   let autoUpdateInitialTimer: NodeJS.Timeout | null = null;
   let autoUpdateIntervalTimer: NodeJS.Timeout | null = null;
@@ -974,6 +1007,25 @@ async function main(): Promise<void> {
       return;
     }
     autoUpdateProbeArmed = true;
+    const intervalDecision = resolveAutoUpdateIntervalMs();
+    if (intervalDecision.source === 'default' && intervalDecision.reason) {
+      try {
+        logEvent({
+          event: 'auto_update_check.interval_override_rejected',
+          level: 'warn',
+          msg: `AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS rejected (${intervalDecision.reason}); falling back to default ${AUTO_UPDATE_PROBE_INTERVAL_DEFAULT_MS}ms`,
+          context: {
+            raw_value: intervalDecision.rawValue,
+            reason: intervalDecision.reason,
+            min_ms: AUTO_UPDATE_INTERVAL_MIN_MS,
+            max_ms: AUTO_UPDATE_INTERVAL_MAX_MS,
+            default_ms: AUTO_UPDATE_PROBE_INTERVAL_DEFAULT_MS,
+            trigger,
+          },
+        });
+      } catch { /* best-effort */ }
+    }
+    const intervalMs = intervalDecision.intervalMs;
     // Stagger the first probe ~30 s after boot/promotion so we don't slow
     // startup or race with `replayUndeliveredMessages`. unref() lets Node
     // exit cleanly even if the timer hasn't fired yet.
@@ -982,20 +1034,36 @@ async function main(): Promise<void> {
       runAutoUpdateProbe(scriptPath, `${trigger}_initial`);
     }, AUTO_UPDATE_PROBE_INITIAL_DELAY_MS);
     autoUpdateInitialTimer.unref?.();
-    // Then re-probe every 3 h so a long-lived channel-owner that never
-    // gets a /reload-plugins between upstream pushes still notices.
+    // Then re-probe every `intervalMs` (default 3 h, overridable via
+    // AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS for live tests) so a long-lived
+    // channel-owner that never gets a /reload-plugins between upstream
+    // pushes still notices.
     autoUpdateIntervalTimer = setInterval(() => {
       runAutoUpdateProbe(scriptPath, `${trigger}_interval`);
-    }, AUTO_UPDATE_PROBE_INTERVAL_MS);
+    }, intervalMs);
     autoUpdateIntervalTimer.unref?.();
     try {
       logEvent({
+        event: 'auto_update_check.armed',
+        msg: `auto-update-check armed (initial in ${AUTO_UPDATE_PROBE_INITIAL_DELAY_MS / 1000}s, then every ${intervalMs}ms; source=${intervalDecision.source})`,
+        context: {
+          intervalMs,
+          source: intervalDecision.source,
+          script: scriptPath,
+          initial_delay_ms: AUTO_UPDATE_PROBE_INITIAL_DELAY_MS,
+          trigger,
+        },
+      });
+      // Keep the legacy `scheduled` event too for backwards compat with any
+      // log greps / dashboards built against 3.10/3.11.0.
+      logEvent({
         event: 'auto_update_check.scheduled',
-        msg: `auto-update-check scheduled (initial in 30s, then every ${AUTO_UPDATE_PROBE_INTERVAL_MS / 3_600_000}h)`,
+        msg: `auto-update-check scheduled (initial in 30s, then every ${(intervalMs / 3_600_000).toFixed(3)}h)`,
         context: {
           script: scriptPath,
           initial_delay_ms: AUTO_UPDATE_PROBE_INITIAL_DELAY_MS,
-          interval_ms: AUTO_UPDATE_PROBE_INTERVAL_MS,
+          interval_ms: intervalMs,
+          interval_source: intervalDecision.source,
           trigger,
         },
       });

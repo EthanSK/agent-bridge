@@ -380,6 +380,59 @@ The recommended pattern is **dispatch a subagent to do the upgrade**, then surfa
 
 A research item is pinned to discover OpenClaw's analogue (likely a `claw spawn` or workspace-skill pattern under `~/.openclaw/workspace/skills/`); when that lands, this section will document the equivalent receiver behavior. Cross-machine update-propagation is unaffected: the bridge_send_message machinery already lets a Claude Code peer instruct an OpenClaw peer to perform a manual update step.
 
+#### Live-test recipe
+
+The default 3-hour cadence is intentional for production but useless when you're trying to validate a code change to the auto-update flow itself. As of **3.11.1** ([AUTO-UPDATE-TEST-MODE 2026-04-30]) the periodic interval is configurable via `AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS`, so you can drive the full receiver path end-to-end in roughly a minute and a half instead of waiting 3 hours.
+
+The override accepts an integer millisecond value, bounded **30000 (30 s)** ≤ value ≤ **86400000 (24 h)**. Out-of-range or unparseable values fall back to the 3 h default with a `auto_update_check.interval_override_rejected` warn-level log. The `AGENT_BRIDGE_AUTO_UPDATE_CHECK` kill switch still wins — if the probe is disabled outright, the override is irrelevant. The initial 30 s delayed first probe is unaffected; only the periodic interval is configurable. At arm time the chosen interval is logged as a `auto_update_check.armed` event with `{intervalMs, source: "env" | "default"}` so you can verify which one is active.
+
+**Steps:**
+
+1. **On the test peer**, set the override in the harness's MCP environment so the new MCP child boots with the short interval. For Claude Code that's the `env` block under the agent-bridge plugin entry in `~/.claude/settings.json`:
+
+   ```jsonc
+   {
+     "plugins": {
+       "agent-bridge": {
+         "env": {
+           "AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS": "60000"
+         }
+       }
+     }
+   }
+   ```
+
+   Alternatively, wrap the plugin spawn in a small shell shim that exports the env var before launching `node build/index.js`. (For OpenClaw, set the env var in the gateway's launchd plist or however you launch the workspace.)
+
+2. **Reload plugins** so the new MCP child picks up the env. In Claude Code: `/reload-plugins` (or invoke the `self-reload-plugins` skill). Confirm the override took effect by checking the unified log for an `auto_update_check.armed` event with `source: "env"` and `intervalMs: 60000`:
+
+   ```bash
+   grep '"event":"auto_update_check.armed"' ~/.agent-bridge/logs/skills.log* 2>/dev/null \
+     | tail -3 | jq '.context'
+   ```
+
+3. **From any other peer**, push a small benign commit to `EthanSK/agent-bridge` `main` — a CHANGELOG nudge, a docs typo fix, anything that bumps `origin/main` past the test peer's `HEAD`. Note the new SHA.
+
+4. Within roughly **30 s + 60 s** (initial-delay window + first periodic interval), the test peer's MCP probe should fire and `scripts/check-update.sh` should drop a `[BRIDGE-UPDATE-AVAILABLE]` BridgeMessage into `~/.agent-bridge/inbox/<target>/`. The channel watcher then pushes it into the running session, exactly as it would with a remote-originated message.
+
+5. The receiver subagent flow documented above (Claude Code: `Agent` tool with `subagent_type: "general-purpose"`, `run_in_background: true`; OpenClaw: TBD) should kick in: dispatch a subagent to `git pull --ff-only && cd mcp-server && npm install && npm run build`, then `/reload-plugins`, then surface the new commit hash and a one-line summary back via the harness's normal channel (Telegram, console, etc.). This is the part you're actually validating.
+
+6. **After validating, unset the env var and reload** to return to the production 3 h cadence:
+
+   ```jsonc
+   // remove the AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS line from settings.json
+   ```
+
+   Then `/reload-plugins` again. The next `auto_update_check.armed` event should report `source: "default"` and `intervalMs: 10800000`.
+
+**Synchronous immediate-trigger.** If you don't want to wait at all — useful when iterating on the receiver dispatch path itself — run the probe script synchronously:
+
+```bash
+bash scripts/check-update.sh --force
+```
+
+The `--force` flag bypasses the last-notified-SHA sentinel so the same `origin/main` SHA re-notifies, which is exactly what you want when you're triggering the receiver flow repeatedly without pushing fresh upstream commits each time. This is the same script the periodic timer fires; only the cadence differs.
+
 ### Manual update path
 
 If you'd rather do it by hand:

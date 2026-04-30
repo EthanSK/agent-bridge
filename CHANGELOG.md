@@ -1,5 +1,17 @@
 # Changelog
 
+## agent-bridge 3.11.1 — 2026-04-30
+
+### [AUTO-UPDATE-TEST-MODE 2026-04-30] Configurable interval env var + live-test recipe
+
+3.11.0 wired the periodic re-probe but left the cadence hard-coded at 3 hours, which made live-testing the auto-update flow practically impossible — you had to either wait the full window or hand-craft a fake `[BRIDGE-UPDATE-AVAILABLE]` BridgeMessage to exercise the receiver path. 3.11.1 adds a small env-var override so the same flow can be validated end-to-end in ~90 seconds, and saves the procedure as a reusable regression-check recipe.
+
+- **`AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS` env var.** Override the default 3 h `setInterval` cadence in `armAutoUpdateProbe()`. Bounds: min `30000` (30 s — guards against runaway probes) ≤ value ≤ max `86400000` (24 h). Unparseable / non-positive-integer / out-of-range values fall back to the 3 h default with a `auto_update_check.interval_override_rejected` warn-level log carrying the rejected raw value and the rejection reason. The kill switch (`AGENT_BRIDGE_AUTO_UPDATE_CHECK`) wins over this — if the probe is disabled outright, the override is irrelevant. The initial 30 s delayed first probe is **unaffected**; only the periodic interval is configurable.
+- **`auto_update_check.armed` log event.** New unified-log event emitted at arm time with `{intervalMs, source: "env" | "default", script, initial_delay_ms, trigger}` so future debugs can read which interval was actually active without inferring it from elapsed time. The legacy `auto_update_check.scheduled` event is preserved for backwards compat with any log greps / dashboards built against 3.10/3.11.0.
+- **README live-test recipe.** New "Live-test recipe" subsection inside "Auto-update receiver behavior" walks through the full validation: set the override in the test peer's MCP env, reload plugins, push a benign commit from another peer, watch the receiver subagent flow kick in, then unset the env to return to the 3 h cadence. Also documents `bash scripts/check-update.sh --force` as the synchronous immediate-trigger when you want to iterate on the receiver path itself without waiting at all.
+
+Files touched: `mcp-server/src/index.ts`, `mcp-server/src/config.ts`, `mcp-server/package.json`, `mcp-server/package-lock.json`, `mcp-server/.claude-plugin/plugin.json`, `agent-bridge` (bash CLI VERSION), `mcp-server/test/heartbeat-shutdown-diag.test.mjs`, `mcp-server/test/unified-channel.test.mjs`, `README.md`, `CHANGELOG.md`.
+
 ## agent-bridge 3.11.0 — 2026-04-30
 
 ### [AUTO-UPDATE-RE-PROBE 2026-04-30] Periodic re-probe + standby-promotion probe
