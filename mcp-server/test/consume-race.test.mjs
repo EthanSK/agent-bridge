@@ -9,12 +9,15 @@
  *   1. push    — file moves to `.pending-ack/<target>/` + sidecar meta
  *   2. tick    — every 2 s (in-process: every poll cycle)
  *      - early-defer (5 s + alive-evidence + still own lease) → finalize
- *      - safety-net (60 s + no alive-evidence) → re-inject for retry
- *      - retry cap (3) → move to `.failed/.exhausted/`
+ *      - safety-net (180 s + no alive-evidence) → re-inject for retry
+ *      - retry cap (1) → move to `.failed/.exhausted/`
  *   3. handover — files older than 30 s in `.pending-ack/` are recovered by
  *                 the new lease holder's `replayUndeliveredMessages`
  *   4. escape  — 5+ pushes within 30 s with no alive evidence flips
  *                channelMarkedDead; future pushes skip the callback
+ *
+ * 3.12.1 [DEDUP-RECEIVE-INJECT 2026-04-30] — safety-net 60s→180s, cap 3→1
+ * to halve max-duplicate-channel-pushes for slow-thinking receivers.
  *
  * These tests drive the watcher in-process (no MCP transport) so we can
  * assert state transitions deterministically without depending on poll
@@ -129,7 +132,7 @@ function configureCallback({ resolve = true, error = null } = {}) {
 }
 
 // ── Case A: notification "fails silently" (resolves but harness drops) ──────
-test('A. notification resolves but harness silently drops; file re-injected after 60s safety net', { timeout: 80_000 }, async () => {
+test('A. notification resolves but harness silently drops; file re-injected after 180s safety net', { timeout: 80_000 }, async () => {
   watcher._resetPendingDeliveriesForTesting();
   // Clean inbox and pending-ack so prior tests don't leak in.
   for (const f of readdirSync(inboxDir)) try { rmSync(join(inboxDir, f)); } catch {}
@@ -161,14 +164,14 @@ test('A. notification resolves but harness silently drops; file re-injected afte
   }
   assert.ok(staged, 'expected file to be staged into pending-ack/');
 
-  // Doctor the pushedAt to be 61s in the past so the safety-net branch
-  // fires on the next tick.
+  // 3.12.1 [DEDUP-RECEIVE-INJECT] — Doctor pushedAt to 181s in the past so
+  // the safety-net branch fires on the next tick (window bumped 60s→180s).
   const pending = watcher._getPendingDeliveriesForTesting();
   const entry = pending.find((p) => p.id === msg.id);
   assert.ok(entry, 'pending entry should exist for the staged file');
-  entry.pushedAt = Date.now() - 61_000;
+  entry.pushedAt = Date.now() - 181_000;
 
-  // Drive a tick. With no alive evidence + age >= 60s, the entry must be
+  // Drive a tick. With no alive evidence + age >= 180s, the entry must be
   // re-injected back into inbox/<target>/.
   watcher._processPendingDeliveriesForTesting();
 
@@ -235,8 +238,9 @@ test('B. early-defer finalize: alive-evidence within 5s archives + marks deliver
   watcher.stopWatcher();
 });
 
-// ── Case C: notification succeeds + no activity for 60s → re-injected ───────
-test('C. safety-net reinject: no alive evidence after 60s → file goes back to inbox', { timeout: 30_000 }, async () => {
+// ── Case C: notification succeeds + no activity for 180s → re-injected ──────
+// 3.12.1 [DEDUP-RECEIVE-INJECT] — safety-net window bumped 60s → 180s.
+test('C. safety-net reinject: no alive evidence after 180s → file goes back to inbox', { timeout: 30_000 }, async () => {
   watcher._resetPendingDeliveriesForTesting();
   for (const f of readdirSync(inboxDir)) try { rmSync(join(inboxDir, f)); } catch {}
   if (existsSync(pendingAckDir)) for (const f of readdirSync(pendingAckDir)) try { rmSync(join(pendingAckDir, f)); } catch {}
@@ -261,10 +265,10 @@ test('C. safety-net reinject: no alive evidence after 60s → file goes back to 
   }
   assert.ok(staged);
 
-  // Doctor pushedAt to 61s ago.
+  // Doctor pushedAt to 181s ago — past the 180s safety-net window.
   const entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === msg.id);
   assert.ok(entry);
-  entry.pushedAt = Date.now() - 61_000;
+  entry.pushedAt = Date.now() - 181_000;
 
   watcher._processPendingDeliveriesForTesting();
 
@@ -277,8 +281,9 @@ test('C. safety-net reinject: no alive evidence after 60s → file goes back to 
   for (const f of readdirSync(inboxDir)) try { rmSync(join(inboxDir, f)); } catch {}
 });
 
-// ── Case D: re-injection cap at 3 → moves to .failed/.exhausted/ ────────────
-test('D. retry cap exhaustion: 4th reinject attempt moves file to .failed/.exhausted/', { timeout: 20_000 }, async () => {
+// ── Case D: re-injection cap at 1 → moves to .failed/.exhausted/ ────────────
+// 3.12.1 [DEDUP-RECEIVE-INJECT] — retry cap lowered 3 → 1.
+test('D. retry cap exhaustion: 2nd reinject attempt moves file to .failed/.exhausted/', { timeout: 20_000 }, async () => {
   watcher._resetPendingDeliveriesForTesting();
   for (const f of readdirSync(inboxDir)) try { rmSync(join(inboxDir, f)); } catch {}
   if (existsSync(pendingAckDir)) for (const f of readdirSync(pendingAckDir)) try { rmSync(join(pendingAckDir, f)); } catch {}
@@ -305,12 +310,13 @@ test('D. retry cap exhaustion: 4th reinject attempt moves file to .failed/.exhau
   }
   assert.ok(staged);
 
-  // Set the entry's retries to 3 (the cap) and pushedAt to 61s ago. The
-  // next safety-net trigger should bump retries to 4 → exceed cap → exhaust.
+  // 3.12.1 [DEDUP-RECEIVE-INJECT] — Set the entry's retries to 1 (the new
+  // cap) and pushedAt to 181s ago. The next safety-net trigger should bump
+  // retries to 2 → exceed cap → exhaust.
   const entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === msg.id);
   assert.ok(entry);
-  entry.retries = 3;
-  entry.pushedAt = Date.now() - 61_000;
+  entry.retries = 1;
+  entry.pushedAt = Date.now() - 181_000;
 
   watcher._processPendingDeliveriesForTesting();
 
@@ -457,13 +463,16 @@ test('F. escape-hatch: 5 pushes in 30s without alive evidence flips channel dead
 });
 
 // ── Case G: 3.9.1 retry-persistence — reinject loop terminates at cap ───────
-test('G. retry-persistence: re-inject → re-stage 4 times lands the file in .failed/.exhausted/', { timeout: 40_000 }, async () => {
+// 3.12.1 [DEDUP-RECEIVE-INJECT] — cap dropped 3 → 1, so the loop now
+// exhausts in two cycles instead of four.
+test('G. retry-persistence: re-inject → re-stage twice lands the file in .failed/.exhausted/', { timeout: 40_000 }, async () => {
   watcher._resetPendingDeliveriesForTesting();
   for (const f of readdirSync(inboxDir)) try { rmSync(join(inboxDir, f)); } catch {}
   if (existsSync(pendingAckDir)) for (const f of readdirSync(pendingAckDir)) try { rmSync(join(pendingAckDir, f)); } catch {}
   if (existsSync(exhaustedDir)) for (const f of readdirSync(exhaustedDir)) try { rmSync(join(exhaustedDir, f)); } catch {}
 
-  // Frozen alive signals — the 60s safety-net path will fire.
+  // Frozen alive signals — the 180s safety-net path will fire (we doctor
+  // pushedAt to skip waiting).
   watcher.registerAliveSignals({
     getToolCallsReceivedCount: () => 0,
     getChannelCallbackRegisteredAt: () => 0,
@@ -487,10 +496,12 @@ test('G. retry-persistence: re-inject → re-stage 4 times lands the file in .fa
   }
 
   // Helper: doctor pushedAt to fire the safety-net path on the next tick.
+  // 3.12.1 [DEDUP-RECEIVE-INJECT] — must subtract more than PENDING_REINJECT_MS
+  // (now 180s) to trigger the safety-net branch.
   function expirePushedAt(id) {
     const e = watcher._getPendingDeliveriesForTesting().find((p) => p.id === id);
     assert.ok(e, `expected pending entry for ${id}`);
-    e.pushedAt = Date.now() - 61_000;
+    e.pushedAt = Date.now() - 181_000;
     return e;
   }
 
@@ -503,33 +514,17 @@ test('G. retry-persistence: re-inject → re-stage 4 times lands the file in .fa
   assert.ok(readdirSync(inboxDir).includes(`${msg.id}.json`), 'cycle 1: should be re-injected to inbox/');
 
   // Cycle 2: watcher polls inbox → re-stages with retries restored to 1 → fires
-  // safety-net → retries 1 → 2 (re-injected again). The bug pre-3.9.1 was that
-  // the retry count reset to 0 on every restage, never reaching the cap.
+  // safety-net → retries 1 → 2 → exceeds cap (1) → exhausted. The bug pre-3.9.1
+  // was that the retry count reset to 0 on every restage, never reaching the cap.
   assert.ok(await waitForStage(msg.id), 'cycle 2: file should be re-staged from inbox');
-  let entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === msg.id);
+  const entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === msg.id);
   assert.equal(entry.retries, 1, 'cycle 2: retries must be restored to 1, not reset to 0');
-  expirePushedAt(msg.id);
-  watcher._processPendingDeliveriesForTesting();
-  assert.ok(readdirSync(inboxDir).includes(`${msg.id}.json`), 'cycle 2: should be re-injected');
-
-  // Cycle 3: retries 2 → 3 (re-injected).
-  assert.ok(await waitForStage(msg.id), 'cycle 3: file should be re-staged');
-  entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === msg.id);
-  assert.equal(entry.retries, 2, 'cycle 3: retries should now be 2');
-  expirePushedAt(msg.id);
-  watcher._processPendingDeliveriesForTesting();
-  assert.ok(readdirSync(inboxDir).includes(`${msg.id}.json`), 'cycle 3: should be re-injected');
-
-  // Cycle 4: retries 3 → 4 → exceeds cap → exhausted.
-  assert.ok(await waitForStage(msg.id), 'cycle 4: file should be re-staged');
-  entry = watcher._getPendingDeliveriesForTesting().find((p) => p.id === msg.id);
-  assert.equal(entry.retries, 3, 'cycle 4: retries should now be 3 (the cap)');
   expirePushedAt(msg.id);
   watcher._processPendingDeliveriesForTesting();
 
   assert.ok(
     exhaustedContains(msg.id),
-    `cycle 4: expected file in .failed/.exhausted/, got: ${JSON.stringify(listExhausted())}`,
+    `cycle 2: expected file in .failed/.exhausted/, got: ${JSON.stringify(listExhausted())}`,
   );
   assert.ok(!listAck().includes(`${msg.id}.json`), '.pending-ack/ should be empty after exhaust');
   assert.ok(!readdirSync(inboxDir).includes(`${msg.id}.json`), 'inbox/ should be empty after exhaust');

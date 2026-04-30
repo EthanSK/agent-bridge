@@ -1,5 +1,24 @@
 # Changelog
 
+## agent-bridge 3.12.1 — 2026-04-30
+
+### [DEDUP-RECEIVE-INJECT 2026-04-30] Halve duplicate channel pushes for slow-thinking receivers
+
+The hybrid AC delivery flow (3.9.0) re-injects a pending message back into `inbox/` whenever 60s pass with no positive alive-evidence (new tool calls, long-poll listeners, channel-callback re-registration, or later successful channel push). Each re-inject also re-emits the channel notification — meaning the same `<channel source="agent-bridge" ...>` block can be pushed up to 4 times (initial + 3 reinjects) for a single message over ~4 minutes.
+
+In practice this fired whenever the receiver was in a long-thinking state. **Mini agent-bridge.log evidence (2026-04-30 12:26–12:29 UTC):** `msg-0196018e-5fe9-4b80-a5fa-016f8edeebaa` was channel-pushed 4 times with `tool_calls_at_push` stuck at 11 across all pushes — the harness was alive but reasoning, not invoking tools, so the heuristic's tool-call gate stayed false. Ethan reported visible duplicate `<channel>` blocks on the Dell side; same root cause, just amplified by Windows-side workloads with longer pre-tool-call think times.
+
+3.12.1 reduces the maximum duplicate count from **4 to 2** by tuning the two windows in `mcp-server/src/watcher.ts`:
+
+- **`PENDING_REINJECT_MS`: 60_000 → 180_000.** Wait three minutes before assuming the harness silently dropped the push. Reasoning-heavy tasks routinely take 60–120 s before producing a tool call.
+- **`PENDING_REINJECT_MAX_RETRIES`: 3 → 1.** A single retry is enough for the legitimate dead-channel scenarios; the dead-channel escape-hatch (5+ pushes in 30 s with no alive-evidence) and handover-on-restart paths still recover any genuinely-lost messages.
+
+Trade-off: a truly-dead receiver wastes 3 minutes before the single reinject (vs 1 minute previously). That is the right tradeoff against the dominant pattern (slow-thinking but alive receiver getting visibly duplicated messages). The escape-hatch + handover-replay paths cover the catastrophic-loss case without requiring multiple reinjects per message.
+
+Test updates: `mcp-server/test/consume-race.test.mjs` cases A, C, D, G updated for the new windows. Case D now exhausts on the 2nd reinject attempt, case G drops from 4 cycles to 2, all 8 tests pass under the new tuning.
+
+Files touched: `mcp-server/src/watcher.ts`, `mcp-server/src/config.ts`, `mcp-server/package.json`, `mcp-server/.claude-plugin/plugin.json`, `mcp-server/test/consume-race.test.mjs`, `agent-bridge` (bash CLI VERSION), `CHANGELOG.md`.
+
 ## agent-bridge 3.12.0 — 2026-04-30
 
 ### [AUTO-UPDATE-COORD-LOCK 2026-04-30] Same-host receiver coordination lock

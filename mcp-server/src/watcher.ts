@@ -328,10 +328,31 @@ const retriesByMsgId = new Map<string, number>();
  */
 let successfulChannelPushCount = 0;
 
-/** 3.9.0 [CONSUME-RACE] — windows for the hybrid AC tick. */
+/** 3.9.0 [CONSUME-RACE] — windows for the hybrid AC tick.
+ *
+ * 3.12.1 [DEDUP-RECEIVE-INJECT 2026-04-30] — bumped the safety-net window
+ * 60 s → 180 s and lowered the retry cap 3 → 1.
+ *
+ * Why: the receiver-side code re-emits a `<channel>` notification on every
+ * reinject. With 60 s + 3 retries the same message could be pushed up to
+ * 4 times to the running Claude session over 4 minutes. In practice this
+ * fired whenever the receiver was in a long-thinking state and made no
+ * tool calls within 60 s — a normal pattern for reasoning-heavy tasks.
+ *
+ * Evidence (Mini agent-bridge.log 2026-04-30 12:26–12:29 UTC):
+ *   msg-0196018e was channel-pushed 4 times (initial + 3 reinjects),
+ *   tool_calls_at_push stayed at 11 across ALL pushes — the harness was
+ *   alive but not invoking tools, so the alive-heuristic returned false.
+ *   That's the duplicate Ethan sees in the running session.
+ *
+ * Trade-off: a genuinely-dead receiver now wastes 3 minutes before the
+ * single reinject fires (vs 60 s). That's acceptable — the dead-channel
+ * escape-hatch + handover-on-restart paths still recover lost messages.
+ * What we trade off is one duplicate worst-case (vs three) for slow-
+ * thinking receivers, which is the dominant pattern. */
 const PENDING_EARLY_DEFER_MS = 5_000;
-const PENDING_REINJECT_MS = 60_000;
-const PENDING_REINJECT_MAX_RETRIES = 3;
+const PENDING_REINJECT_MS = 180_000;
+const PENDING_REINJECT_MAX_RETRIES = 1;
 const PENDING_HANDOVER_REINJECT_MS = 30_000;
 
 /**
