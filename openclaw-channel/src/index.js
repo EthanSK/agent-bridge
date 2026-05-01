@@ -79,6 +79,7 @@ import {
 } from "./channel-plugin.js";
 import { localMachineName } from "./outbound.js";
 import { encodeBridgePeerId } from "./bridge-peer.js";
+import { emitLifecycleEvent, ensureService as ensureChimeService } from "../../chime/emitter.mjs";
 
 const PLUGIN_ID = "agent-bridge";
 const PLUGIN_NAME = "Agent Bridge (Channel v2)";
@@ -187,6 +188,36 @@ export default {
         + "Refusing to start the watcher.",
       );
       return;
+    }
+
+    try {
+      ensureChimeService();
+    } catch (err) {
+      log.warn(`failed to ensure chime service: ${err?.message ?? err}`);
+    }
+
+    try {
+      api.on("subagent_spawning", async (event) => {
+        emitLifecycleEvent({
+          kind: "agent.start",
+          sourceId: "openclaw-subagents",
+          harness: "openclaw",
+          agentId: event.childSessionKey,
+          label: event.label ?? null,
+        });
+      });
+      api.on("subagent_ended", async (event) => {
+        if (!event?.targetSessionKey) return;
+        emitLifecycleEvent({
+          kind: "agent.end",
+          sourceId: "openclaw-subagents",
+          harness: "openclaw",
+          agentId: event.targetSessionKey,
+          label: null,
+        });
+      });
+    } catch (err) {
+      log.warn(`failed to register chime subagent hooks: ${err?.message ?? err}`);
     }
 
     // Resolve targets. Precedence:

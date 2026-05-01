@@ -42,6 +42,64 @@ agent-bridge lets running Claude Code and OpenClaw sessions on different machine
 - **Small transport surface** -- just bash/ssh for pairing and delivery, plus Node for the MCP/channel plugins; no Docker, no central service
 - **MCP tools + harness-specific receivers** -- `bridge_*` tools are shared, but Claude Code's `claude/channel` stdio lifecycle and OpenClaw's `registerChannel()` gateway lifecycle are deliberately different
 
+## Fleet Chime
+
+Agent Bridge now includes an internal fleet-aware completion chime module.
+
+- **Per-agent sound**: plays when a local agent finishes or its local active lock expires.
+- **All-complete sound**: plays when the fleet-wide active set transitions from non-zero to zero.
+- **Active locks**: local active agents are mirrored as JSON files under `~/.agent-bridge/chime/active/` with a configurable expiry (`activeLockTtlSeconds`, default 1800 / 30 minutes), so a crashed harness cannot keep the fleet stuck forever.
+- **Transport**: lifecycle snapshots ride over the same Agent Bridge SSH/Tailscale file transport using the dedicated target `agent-bridge/chime`.
+- **OpenClaw hook point**: the bundled OpenClaw channel plugin uses the documented `subagent_spawning` and `subagent_ended` plugin hooks.
+- **Claude Code hook point**: use the bridge CLI hook helpers because Claude's lifecycle events are external to the bridge plugin.
+
+Config lives at `~/.agent-bridge/chime/config.json`. Status and manual control:
+
+```bash
+agent-bridge chime status
+agent-bridge chime test per-agent
+agent-bridge chime test all-complete
+agent-bridge chime config set perAgentSound Glass
+agent-bridge chime config set allCompleteSound Hero
+agent-bridge chime config set activeLockTtlSeconds 1800
+agent-bridge chime reset
+```
+
+Suggested Claude Code hook commands:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "agent-bridge chime start --from-claude-userprompt" }]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "agent-bridge chime end --from-claude-stop" }]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "agent-bridge chime start --from-claude-subagent-start" }]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "agent-bridge chime end --from-claude-subagent" }]
+      }
+    ]
+  }
+}
+```
+
+Design notes and architecture tradeoffs are captured in [docs/agent-bridge-chime-design.md](docs/agent-bridge-chime-design.md).
+
 ---
 
 ## Architecture overview

@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="3.12.2"
+VERSION="3.13.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -1960,6 +1960,21 @@ cmd_config_help() {
   printf '  agent-bridge config MacBook-Pro --identity-file ~/.agent-bridge/keys/agent-bridge_Mac-mini\n'
 }
 
+cmd_chime() {
+  local resolved script_dir repo_root chime_cli
+  resolved="$0"
+  while [ -h "$resolved" ]; do
+    script_dir="$(cd -P "$(dirname "$resolved")" && pwd)"
+    resolved="$(readlink "$resolved")"
+    [[ "$resolved" != /* ]] && resolved="$script_dir/$resolved"
+  done
+  repo_root="$(cd -P "$(dirname "$resolved")" && pwd)"
+  chime_cli="$repo_root/chime/cli.mjs"
+  [ -f "$chime_cli" ] || die "Chime CLI not found at $chime_cli"
+  command -v node >/dev/null 2>&1 || die "node is required for 'agent-bridge chime'"
+  node "$chime_cli" "$@"
+}
+
 cmd_help() {
   printf '\n'
   printf "${BOLD}agent-bridge${RESET} v%s\n" "$VERSION"
@@ -1973,6 +1988,7 @@ cmd_help() {
   printf '  setup              Enable SSH, generate keys, show pairing screen\n'
   printf '  pair               Pair with another machine (interactive or flags)\n'
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
+  printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
   printf '  connect <machine>  Open an interactive SSH session\n'
   printf '  run <machine> "cmd"  Run a plain shell command on a paired machine (diagnostics only)\n'
   printf '  list               List all paired machines\n'
@@ -2019,6 +2035,7 @@ main() {
     setup)    cmd_setup "$@" ;;
     pair)     cmd_pair "$@" ;;
     config)   cmd_config "$@" ;;
+    chime)    cmd_chime "$@" ;;
     connect)  cmd_connect "$@" ;;
     run)      cmd_run "$@" ;;
     list)     cmd_list "$@" ;;

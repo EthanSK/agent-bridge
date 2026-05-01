@@ -1,5 +1,23 @@
 # Changelog
 
+## agent-bridge 3.13.0 — 2026-05-01
+
+### [FLEET-CHIME 2026-05-01] Fleet-aware completion chimes inside Agent Bridge
+
+The old standalone `agent-completion-chime` proof of concept established the sound set, the local active-run state machine, and the OpenClaw `runs.json` fallback watcher, but it was the wrong home for the real feature. Ethan's voice 5990 direction was explicit: the all-complete chime only makes sense with a fleet-wide view across Claude Code and OpenClaw on every paired machine, so the feature now lives inside Agent Bridge itself.
+
+3.13.0 adds a bridge-native chime module under `chime/`:
+
+- **Dedicated Agent Bridge target:** chime traffic uses `target="agent-bridge/chime"` over the existing SSH/Tailscale file transport. No separate network path, daemon repo, or external broker.
+- **Per-source distributed state, not one fragile counter:** each machine-local lifecycle emitter owns a `machine + sourceId` snapshot. OpenClaw subagents publish through the documented plugin hooks `subagent_spawning` and `subagent_ended`; Claude Code remains hook-driven via the new `agent-bridge chime ...` CLI helpers.
+- **Leased single-owner local service:** one process per machine owns playback + reconciliation using `~/.agent-bridge/locks/agent-bridge-chime.lock.json`, so machines with both Claude Code and OpenClaw active do not double-play sounds or race state updates.
+- **Zero-transition Hero logic:** the fleet sound fires only on a strict transition from non-zero to zero, subject to cooldown. Re-observing zero does not replay it.
+- **Stale-peer safety:** remote sources that go stale while still advertising active agents stay blocking briefly, then expire after the configurable active-lock TTL (default 30 minutes) so a crashed harness cannot suppress all-complete forever. Stale zero-count peers are ignored.
+- **Config + operator surface:** `agent-bridge chime status`, `test`, `config get|set`, and `reset`; config lives in `~/.agent-bridge/chime/config.json` because the existing `~/.agent-bridge/config` file is still an INI-style pairing registry, not a general nested config store.
+- **Docs/design note:** README now documents the feature plus suggested Claude Code hook commands, and `docs/agent-bridge-chime-design.md` records the architecture answers and preserves Ethan's verbatim source transcript.
+
+Files touched: `chime/`, `openclaw-channel/src/index.js`, `mcp-server/src/index.ts`, `README.md`, `docs/agent-bridge-chime-design.md`, version bumps in `agent-bridge`, `mcp-server/package.json`, `mcp-server/package-lock.json`, `mcp-server/src/config.ts`, `openclaw-channel/package.json`, `CHANGELOG.md`.
+
 ## agent-bridge 3.12.1 — 2026-04-30
 
 ### [DEDUP-RECEIVE-INJECT 2026-04-30] Halve duplicate channel pushes for slow-thinking receivers

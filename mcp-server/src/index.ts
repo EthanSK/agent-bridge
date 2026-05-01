@@ -843,6 +843,62 @@ async function main(): Promise<void> {
     context: { machineName: localName },
   });
 
+  const resolveChimeServiceScript = (): string | null => {
+    const candidates: string[] = [];
+    if (process.env.AGENT_BRIDGE_SOURCE_DIR) {
+      candidates.push(process.env.AGENT_BRIDGE_SOURCE_DIR);
+    }
+    const home = homedir();
+    candidates.push(
+      join(home, '.openclaw', 'workspace', 'agent-bridge'),
+      join(home, 'Projects', 'agent-bridge'),
+      join(home, 'projects', 'agent-bridge'),
+      join(home, 'agent-bridge'),
+      join(home, 'src', 'agent-bridge'),
+    );
+    for (const dir of candidates) {
+      const probe = join(dir, 'chime', 'service.mjs');
+      if (existsSync(probe) && existsSync(join(dir, '.git'))) {
+        return probe;
+      }
+    }
+    return null;
+  };
+
+  if (!watcherDisabled) {
+    const chimeServiceScript = resolveChimeServiceScript();
+    if (chimeServiceScript) {
+      try {
+        const child = spawn(process.execPath, [chimeServiceScript, '--ensure'], {
+          stdio: 'ignore',
+          detached: false,
+          env: process.env,
+        });
+        child.on('error', (err) => {
+          logEvent({
+            event: 'chime.ensure_failed',
+            level: 'warn',
+            msg: 'Failed to ensure Agent Bridge chime service',
+            context: { error: String(err), script: chimeServiceScript },
+          });
+        });
+      } catch (err) {
+        logEvent({
+          event: 'chime.ensure_failed',
+          level: 'warn',
+          msg: 'Failed to spawn Agent Bridge chime service',
+          context: { error: String(err), script: chimeServiceScript },
+        });
+      }
+    } else {
+      logEvent({
+        event: 'chime.ensure_skipped',
+        msg: 'Skipped chime service ensure: no source checkout found',
+        context: {},
+      });
+    }
+  }
+
   // Replay any messages that arrived while Claude was offline.
   // This must happen AFTER server.connect() so channel notifications
   // can actually be delivered to the client. Only the active watcher owner
