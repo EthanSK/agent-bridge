@@ -37,6 +37,7 @@ test("local active agents are mirrored as metadata lock files and removed on end
     assert.equal(lock.harness, "openclaw");
     assert.equal(lock.agentId, "subagent-1");
     assert.equal(lock.label, "test subagent");
+    assert.equal(lock.playbackHost, "Mini");
     assert.equal(lock.expiresAt, 1_000 + 1_800_000);
 
     const end = core.applyControlEvent({

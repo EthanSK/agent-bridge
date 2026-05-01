@@ -211,7 +211,7 @@ function activeLockTtlMs(config) {
   return Math.max(60, Number(config.activeLockTtlSeconds ?? DEFAULT_CONFIG.activeLockTtlSeconds)) * 1000;
 }
 
-export function writeActiveAgentLock({ machine, sourceId, harness, agentId, label = null, startedAt, updatedAt = Date.now(), config = DEFAULT_CONFIG }) {
+export function writeActiveAgentLock({ machine, sourceId, harness, agentId, label = null, playbackHost = machine, startedAt, updatedAt = Date.now(), config = DEFAULT_CONFIG }) {
   ensureChimeDirs();
   const now = Number(updatedAt || Date.now());
   const payload = {
@@ -220,6 +220,7 @@ export function writeActiveAgentLock({ machine, sourceId, harness, agentId, labe
     harness,
     agentId,
     label,
+    playbackHost,
     startedAt: Number(startedAt || now),
     updatedAt: now,
     expiresAt: now + activeLockTtlMs(config),
@@ -235,11 +236,16 @@ function sourceMapKey(machine, sourceId) {
   return `${machine}::${sourceId}`;
 }
 
+function sourcePlaybackHost(source) {
+  return source.playbackHost || source.machine;
+}
+
 function sourceSummary(source) {
   return {
     machine: source.machine,
     sourceId: source.sourceId,
     harness: source.harness,
+    playbackHost: sourcePlaybackHost(source),
     activeCount: Object.keys(source.activeAgents ?? {}).length,
     seq: source.seq ?? 0,
     updatedAt: source.updatedAt ?? 0,
@@ -252,6 +258,7 @@ export function buildSnapshotPayload(source, now = Date.now()) {
     machine: source.machine,
     sourceId: source.sourceId,
     harness: source.harness,
+    playbackHost: sourcePlaybackHost(source),
     seq: source.seq ?? 0,
     updatedAt: now,
     activeAgents: Object.values(source.activeAgents ?? {}),
@@ -269,6 +276,7 @@ export function applyControlEvent({ state, config, payload, now = Date.now() }) 
   }
 
   const machine = payload.machine || localMachineName();
+  const playbackHost = String(payload.playbackHost || machine);
   const sourceId = String(payload.sourceId || payload.harness || "unknown");
   const key = sourceMapKey(machine, sourceId);
   const current = state.sources[key] ?? {
@@ -282,6 +290,7 @@ export function applyControlEvent({ state, config, payload, now = Date.now() }) 
   current.machine = machine;
   current.sourceId = sourceId;
   current.harness = payload.harness || current.harness;
+  current.playbackHost = playbackHost;
   current.updatedAt = now;
   current.seq = (current.seq ?? 0) + 1;
   current.activeAgents = current.activeAgents ?? {};
@@ -295,6 +304,7 @@ export function applyControlEvent({ state, config, payload, now = Date.now() }) 
         agentId: agentKey,
         harness: payload.harness || current.harness,
         label: payload.label || null,
+        playbackHost,
         startedAt: now,
       };
       if (config.activeLockFiles !== false && machine === localMachineName()) {
@@ -304,6 +314,7 @@ export function applyControlEvent({ state, config, payload, now = Date.now() }) 
           harness: payload.harness || current.harness,
           agentId: agentKey,
           label: payload.label || null,
+          playbackHost,
           startedAt: now,
           updatedAt: now,
           config,
@@ -332,6 +343,7 @@ export function applyControlEvent({ state, config, payload, now = Date.now() }) 
       agentId: agentKey,
       harness: payload.harness || current.harness,
       label: payload.label || null,
+      playbackHost,
     }, config.historyLimit);
   }
   return {
@@ -368,6 +380,7 @@ export function applySnapshotEvent({ state, config, payload, now = Date.now(), l
       agentId: agentKey,
       harness: agent.harness || payload.harness || payload.sourceId,
       label: agent.label || null,
+      playbackHost: agent.playbackHost || payload.playbackHost || payload.machine,
       startedAt: Number(agent.startedAt ?? now),
     };
   }
@@ -375,6 +388,7 @@ export function applySnapshotEvent({ state, config, payload, now = Date.now(), l
     machine: payload.machine,
     sourceId: payload.sourceId,
     harness: payload.harness || payload.sourceId,
+    playbackHost: payload.playbackHost || payload.machine,
     seq,
     updatedAt: incomingUpdatedAt,
     receivedAt: now,
@@ -387,6 +401,7 @@ export function applySnapshotEvent({ state, config, payload, now = Date.now(), l
     sourceId: payload.sourceId,
     activeCount: Object.keys(activeAgents).length,
     harness: payload.harness || payload.sourceId,
+    playbackHost: payload.playbackHost || payload.machine,
   }, config.historyLimit);
   return { changed: true, summary: sourceSummary(state.sources[key]) };
 }
@@ -421,6 +436,7 @@ export function expireChimeState({ state, config, now = Date.now(), localMachine
         agentId: agentKey,
         harness: agent.harness || source.harness,
         label: agent.label || null,
+        playbackHost: agent.playbackHost || sourcePlaybackHost(source),
       }, config.historyLimit);
     }
 
@@ -443,6 +459,7 @@ export function expireChimeState({ state, config, now = Date.now(), localMachine
         sourceId: source.sourceId,
         activeCount,
         harness: source.harness,
+        playbackHost: sourcePlaybackHost(source),
       }, config.historyLimit);
     }
 
@@ -477,10 +494,13 @@ export function evaluateFleetState({ state, config, now = Date.now(), localMachi
   let fleetActiveCount = 0;
   const staleBlocking = [];
   const expiredSources = [];
+  const playbackHosts = new Set();
   const sourceViews = [];
 
   for (const source of Object.values(state.sources)) {
     const activeCount = Object.keys(source.activeAgents ?? {}).length;
+    const playbackHost = sourcePlaybackHost(source);
+    playbackHosts.add(playbackHost);
     const updatedAt = Number(source.updatedAt ?? source.receivedAt ?? 0);
     const isLocal = source.machine === localMachine;
     const ageMs = updatedAt > 0 ? now - updatedAt : 0;
@@ -491,6 +511,7 @@ export function evaluateFleetState({ state, config, now = Date.now(), localMachi
       machine: source.machine,
       sourceId: source.sourceId,
       harness: source.harness,
+      playbackHost,
       activeCount,
       updatedAt,
       isLocal,
@@ -532,12 +553,15 @@ export function evaluateFleetState({ state, config, now = Date.now(), localMachi
 
   state.lastFleetActiveCount = fleetActiveCount;
   if (allCompleteTransition) state.lastAllCompleteTs = now;
+  const sortedPlaybackHosts = [...playbackHosts].sort();
 
   return {
     fleetActiveCount,
     staleBlocking,
     expiredSources,
+    playbackHosts: sortedPlaybackHosts,
     allCompleteTransition,
+    allCompletePlayback: allCompleteTransition && sortedPlaybackHosts.includes(localMachine),
     sources: sourceViews.sort((a, b) => `${a.machine}/${a.sourceId}`.localeCompare(`${b.machine}/${b.sourceId}`)),
   };
 }
@@ -551,6 +575,7 @@ export function statusSnapshot({ state = loadChimeState(), config = loadChimeCon
     fleetActiveCount: fleet.fleetActiveCount,
     staleBlocking: fleet.staleBlocking,
     expiredSources: fleet.expiredSources,
+    playbackHosts: fleet.playbackHosts,
     lastAllCompleteTs: state.lastAllCompleteTs ?? 0,
     lastFleetActiveCount: state.lastFleetActiveCount ?? 0,
     sources: fleet.sources,

@@ -57,6 +57,7 @@ test("local control events create snapshots and trigger a zero transition once",
   const done = evaluateFleetState({ state, config, now: now + 2_001, localMachine: "Mini" });
   assert.equal(done.fleetActiveCount, 0);
   assert.equal(done.allCompleteTransition, true);
+  assert.equal(done.allCompletePlayback, true);
 
   const repeat = evaluateFleetState({ state, config, now: now + 2_100, localMachine: "Mini" });
   assert.equal(repeat.allCompleteTransition, false);
@@ -133,6 +134,53 @@ test("remote stale active peers block all-complete until refreshed", () => {
   const refreshed = evaluateFleetState({ state, config, now: base + 32_001, localMachine: "Mini" });
   assert.equal(refreshed.fleetActiveCount, 0);
   assert.equal(refreshed.allCompleteTransition, true);
+});
+
+test("destination peers suppress all-complete playback for another host", () => {
+  const state = freshState();
+  const config = { ...DEFAULT_CONFIG, allCompleteCooldownSeconds: 1 };
+  const base = 50_000;
+
+  applySnapshotEvent({
+    state,
+    config,
+    now: base,
+    localMachine: "Dell",
+    payload: {
+      kind: "agent.snapshot",
+      machine: "Mini",
+      sourceId: "audible-e2e-local",
+      harness: "openclaw",
+      playbackHost: "Mini",
+      seq: 1,
+      updatedAt: base,
+      activeAgents: [{ agentId: "local-1", harness: "openclaw", playbackHost: "Mini", startedAt: base }],
+    },
+  });
+  const active = evaluateFleetState({ state, config, now: base + 1, localMachine: "Dell" });
+  assert.equal(active.fleetActiveCount, 1);
+
+  applySnapshotEvent({
+    state,
+    config,
+    now: base + 2_000,
+    localMachine: "Dell",
+    payload: {
+      kind: "agent.snapshot",
+      machine: "Mini",
+      sourceId: "audible-e2e-local",
+      harness: "openclaw",
+      playbackHost: "Mini",
+      seq: 2,
+      updatedAt: base + 2_000,
+      activeAgents: [],
+    },
+  });
+  const done = evaluateFleetState({ state, config, now: base + 2_001, localMachine: "Dell" });
+  assert.equal(done.fleetActiveCount, 0);
+  assert.equal(done.allCompleteTransition, true);
+  assert.equal(done.playbackHosts.includes("Mini"), true);
+  assert.equal(done.allCompletePlayback, false);
 });
 
 test("active locks expire after ttl so stale agents cannot block forever", () => {

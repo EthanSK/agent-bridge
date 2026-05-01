@@ -247,7 +247,7 @@ async function processInboxOnce() {
   if (config.enabled !== false && localPerAgent > 0 && config.playback !== "off") {
     playSound(config.perAgentSound, config.volume);
   }
-  if (config.enabled !== false && fleet.allCompleteTransition && config.playback !== "off") {
+  if (config.enabled !== false && fleet.allCompletePlayback && config.playback !== "off") {
     setTimeout(() => {
       playSound(config.allCompleteSound, config.volume);
     }, 350);
@@ -260,6 +260,8 @@ async function processInboxOnce() {
     fleetActiveCount: fleet.fleetActiveCount,
     staleBlocking: fleet.staleBlocking,
     expiredSources: fleet.expiredSources,
+    playbackHosts: fleet.playbackHosts,
+    allCompletePlayback: fleet.allCompletePlayback,
     localSnapshots: localSnapshotToBroadcast.map((snapshot) => ({
       sourceId: snapshot.sourceId,
       seq: snapshot.seq,

@@ -37,7 +37,7 @@ Verbatim voice transcript from Ethan, preserved exactly:
 
 - Fleet state tracks both.
 - `sourceId` is the durable authority key for a local emitter, while each active agent also keeps `harness`, `agentId`, and optional `label` for diagnostics.
-- Local active agents are mirrored as JSON lock files in `~/.agent-bridge/chime/active/`; each lock contains machine/source/harness/agent metadata plus `startedAt`, `updatedAt`, and `expiresAt`.
+- Local active agents are mirrored as JSON lock files in `~/.agent-bridge/chime/active/`; each lock contains machine/source/harness/agent metadata plus `playbackHost`, `startedAt`, `updatedAt`, and `expiresAt`.
 
 4. OpenClaw lifecycle hook point
 
@@ -54,8 +54,9 @@ Verbatim voice transcript from Ethan, preserved exactly:
 
 6. Sound playback locality
 
-- Playback is local.
-- Every machine computes the same fleet transition from replicated state and may play its own sound locally.
+- Playback is host-owned, not destination-owned.
+- Snapshots include `playbackHost`; destination peers still merge state for fleet accounting, but they suppress all-complete playback unless their local machine name matches the snapshot/source playback host.
+- This prevents an Agent Bridge destination machine from chiming just because another host broadcast a lifecycle snapshot to it.
 - We do not fan out explicit "play now" commands.
 
 ## Config
@@ -92,4 +93,6 @@ Current keys:
 - Active local agent lock files live under `~/.agent-bridge/chime/active/`.
 - Archived chime control messages land under `~/.agent-bridge/archive/agent-bridge/chime/`.
 - Durable state lives in `~/.agent-bridge/chime/state.json`.
+- Chime service transition logs append to `~/.agent-bridge/chime/chime.log`.
+- Audible demo logs append to `~/.agent-bridge/chime/e2e-audible-demo.log`.
 - Manual recovery is `agent-bridge chime reset`.

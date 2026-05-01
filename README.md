@@ -49,6 +49,7 @@ Agent Bridge now includes an internal fleet-aware completion chime module.
 - **Per-agent sound**: plays when a local agent finishes or its local active lock expires.
 - **All-complete sound**: plays when the fleet-wide active set transitions from non-zero to zero.
 - **Active locks**: local active agents are mirrored as JSON files under `~/.agent-bridge/chime/active/` with a configurable expiry (`activeLockTtlSeconds`, default 1800 / 30 minutes), so a crashed harness cannot keep the fleet stuck forever.
+- **Playback locality**: sounds are host-owned, not destination-owned; peers merge snapshots for fleet state but suppress playback unless they are the source `playbackHost`.
 - **Transport**: lifecycle snapshots ride over the same Agent Bridge SSH/Tailscale file transport using the dedicated target `agent-bridge/chime`.
 - **OpenClaw hook point**: the bundled OpenClaw channel plugin uses the documented `subagent_spawning` and `subagent_ended` plugin hooks.
 - **Claude Code hook point**: use the bridge CLI hook helpers because Claude's lifecycle events are external to the bridge plugin.
@@ -65,7 +66,7 @@ agent-bridge chime config set activeLockTtlSeconds 1800
 agent-bridge chime reset
 ```
 
-Audible end-to-end demo (uses the real local Agent Bridge chime inbox/service, speaks each simulated event with `say`, and plays the configured chimes):
+Audible end-to-end demo (uses the real local Agent Bridge chime inbox/service, speaks each simulated event with `say`, writes post-mortem logs to `~/.agent-bridge/chime/e2e-audible-demo.log`, and plays the configured chimes):
 
 ```bash
 node chime/e2e/audible-demo.mjs
