@@ -65,6 +65,12 @@ agent-bridge chime config set activeLockTtlSeconds 1800
 agent-bridge chime reset
 ```
 
+Audible end-to-end demo (uses the real local Agent Bridge chime inbox/service, speaks each simulated event with `say`, and plays the configured chimes):
+
+```bash
+node chime/e2e/audible-demo.mjs
+```
+
 Suggested Claude Code hook commands:
 
 ```json
