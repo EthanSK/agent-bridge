@@ -81,10 +81,13 @@ import {
   appendFileSync,
   statSync,
   renameSync,
+  unlinkSync,
+  realpathSync,
 } from 'node:fs';
 import { join, dirname, resolve, sep } from 'node:path';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { randomBytes } from 'node:crypto';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = dirname(SCRIPT_PATH);
@@ -166,11 +169,92 @@ function log(level, event, context) {
 
 // ---------- JSON file helpers (atomic + backup + rollback) ------------------
 
+// Strip line + block comments and trailing commas so we tolerate JSONC variants
+// of ~/.claude/settings.json and ~/.openclaw/openclaw.json. Strings are
+// preserved verbatim — // and /* */ inside string literals must NOT be
+// stripped, and trailing-comma stripping must skip over string contents.
+//
+// Codex-review fix (v3.14.1): strict JSON.parse() previously made the entire
+// phase silently skip when settings.json had a stray comment or trailing
+// comma. We now best-effort-tolerate it; if the JSONC stripping produces
+// invalid JSON we still throw, so genuinely-broken files are still flagged.
+function stripJsonc(raw) {
+  let out = '';
+  let i = 0;
+  const n = raw.length;
+  let inString = false;
+  let stringQuote = '';
+  let escape = false;
+
+  while (i < n) {
+    const ch = raw[i];
+
+    if (inString) {
+      out += ch;
+      if (escape) {
+        escape = false;
+      } else if (ch === '\\') {
+        escape = true;
+      } else if (ch === stringQuote) {
+        inString = false;
+      }
+      i++;
+      continue;
+    }
+
+    // Block comment.
+    if (ch === '/' && raw[i + 1] === '*') {
+      const end = raw.indexOf('*/', i + 2);
+      if (end === -1) { i = n; break; }
+      i = end + 2;
+      continue;
+    }
+    // Line comment.
+    if (ch === '/' && raw[i + 1] === '/') {
+      const nl = raw.indexOf('\n', i + 2);
+      if (nl === -1) { i = n; break; }
+      i = nl; // keep the newline so line numbers stay correct
+      continue;
+    }
+    // Enter string.
+    if (ch === '"' || ch === '\'') {
+      inString = true;
+      stringQuote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+
+  // Trailing-comma strip — `,` followed by optional whitespace then `]` or `}`.
+  // The earlier pass has already removed comments + preserved strings, so this
+  // regex is safe against false positives within strings.
+  out = out.replace(/,(\s*[\]}])/g, '$1');
+  return out;
+}
+
+function parseJsonTolerant(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch (firstErr) {
+    // Fall back to JSONC tolerance.
+    try {
+      return JSON.parse(stripJsonc(raw));
+    } catch {
+      // Throw the original error so the message matches the file's actual
+      // syntax issue rather than the post-strip artifact.
+      throw firstErr;
+    }
+  }
+}
+
 function readJsonSafe(path) {
   if (!existsSync(path)) return { exists: false, data: null };
   try {
     const raw = readFileSync(path, 'utf8');
-    return { exists: true, data: JSON.parse(raw), raw };
+    return { exists: true, data: parseJsonTolerant(raw), raw };
   } catch (err) {
     log('error', 'auto_update_runner.plugin_registry_error', {
       path, phase: 'read', error: String(err),
@@ -179,25 +263,68 @@ function readJsonSafe(path) {
   }
 }
 
+// Generate a collision-resistant suffix combining ms-resolution timestamp,
+// PID, and crypto random bytes — guards against:
+//   * two concurrent rewire runs landing on the same second
+//   * Date-resolution clamping on filesystems with 1s mtime granularity
+function uniqueSuffix() {
+  const ms = Date.now();
+  const pid = process.pid;
+  const rand = randomBytes(4).toString('hex');
+  return `${ms}-${pid}-${rand}`;
+}
+
+// Codex-review fix (v3.14.1): the previous backupAndWrite() did
+// copyFileSync + writeFileSync in-place. That sequence is non-atomic — a
+// concurrent reader could see a half-written or truncated file, two
+// concurrent rewires within the same wall-clock second would clobber each
+// other's backup, and a crash between copy and write would leave the real
+// file empty. New flow:
+//   1. cp original -> <file>.bak.<unique>
+//   2. write candidate to <file>.tmp.<unique> (separate from real file)
+//   3. re-parse the temp file (validate) BEFORE swapping
+//   4. renameSync(temp, real) — atomic on POSIX, best-effort on Windows
+//   5. on any failure between steps 2-4, unlink the temp + leave the real
+//      file untouched. Rollback from backup remains the last-resort path.
 function backupAndWrite(path, newObj) {
-  const ts = Math.floor(Date.now() / 1000);
-  const bakPath = `${path}.bak.${ts}`;
+  const suffix = uniqueSuffix();
+  const bakPath = `${path}.bak.${suffix}`;
+  const tmpPath = `${path}.tmp.${suffix}`;
+
+  // 1. Backup with a unique name (no collisions even at sub-second cadence).
   copyFileSync(path, bakPath);
 
   const newRaw = JSON.stringify(newObj, null, 2) + '\n';
-  writeFileSync(path, newRaw);
 
-  // Validate by re-parsing.
+  let renamed = false;
   try {
-    JSON.parse(readFileSync(path, 'utf8'));
+    // 2. Write candidate to side-file in same directory.
+    writeFileSync(tmpPath, newRaw);
+
+    // 3. Validate by re-parsing the temp file (NOT the real file — the real
+    //    file hasn't been touched yet).
+    JSON.parse(readFileSync(tmpPath, 'utf8'));
+
+    // 4. Atomic swap. On POSIX rename is atomic when src+dst are on the same
+    //    filesystem; tmpPath is in the same directory as path, so this holds.
+    renameSync(tmpPath, path);
+    renamed = true;
   } catch (err) {
+    // Either write, parse, or rename failed.
     log('error', 'auto_update_runner.plugin_registry_error', {
-      path, phase: 'post_write_parse',
+      path, phase: 'atomic_write',
       error: String(err),
-      action: 'rolled_back_from_backup',
+      action: renamed ? 'rolled_back_from_backup' : 'tmp_left_unswapped',
       backup: bakPath,
     });
-    copyFileSync(bakPath, path);
+    // Clean up the temp file if we wrote one but never renamed it.
+    if (!renamed) {
+      try { unlinkSync(tmpPath); } catch { /* best-effort */ }
+    } else {
+      // Rename succeeded but a later step (none currently) might have failed.
+      // Roll back from backup to the pre-swap state.
+      try { copyFileSync(bakPath, path); } catch { /* best-effort */ }
+    }
     throw err;
   }
 
@@ -205,6 +332,8 @@ function backupAndWrite(path, newObj) {
 }
 
 // ---------- Path comparison helpers (cross-platform via node:path) ----------
+
+const IS_WINDOWS = platform() === 'win32';
 
 function pathExists(p) {
   try { return existsSync(p); } catch { return false; }
@@ -217,8 +346,34 @@ function normPath(p) {
   return r;
 }
 
+// Codex-review fix (v3.14.1): on macOS the dev-clone may resolve through
+// symlinks (`/Users/x/Projects/agent-bridge` vs. `/Users/x/Projects/.git-checkouts/...`)
+// and on Windows resolve()'s output can differ in case (`C:\Repo` vs
+// `c:\repo`). Either case made pathsEqual() return false even when both
+// paths pointed at the same directory, causing false stale detection and
+// breaking idempotent re-runs. We canonicalize via realpathSync.native when
+// the path exists and lower-case on Windows for case-insensitive compare.
+function canonicalize(p) {
+  if (!p) return '';
+  const r = normPath(p);
+  if (!r) return '';
+  let out = r;
+  try {
+    // Use realpathSync.native when available (proper Windows long-path
+    // handling). Falls back to plain realpathSync on older Node builds.
+    const real = realpathSync.native ? realpathSync.native(r) : realpathSync(r);
+    if (real) out = real;
+  } catch {
+    // Path doesn't exist OR symlink target is missing OR EACCES — keep the
+    // resolve()-only normalization. Callers already check pathExists()
+    // separately for the "exists" decision.
+  }
+  if (IS_WINDOWS) out = out.toLowerCase();
+  return out;
+}
+
 function pathsEqual(a, b) {
-  return normPath(a) === normPath(b);
+  return canonicalize(a) === canonicalize(b);
 }
 
 // Detect a Claude-plugins cache-style path:
@@ -296,8 +451,34 @@ function rewirePhase1ClaudeRegistry(stats) {
   const currentVersion = currentPluginVersion();
 
   for (const key of agentBridgeKeys) {
-    const entries = data.plugins[key];
-    if (!Array.isArray(entries)) continue;
+    const rawEntries = data.plugins[key];
+    let entries;
+    // Codex-review fix (v3.14.1): the previous code silently skipped
+    // (`continue`d) on a non-array agent-bridge entry. That hid genuinely
+    // malformed registry state for the very plugin this script owns. We now:
+    //   - normalize a single object into a one-element array (some plugin
+    //     hosts have historically written entries as either shape)
+    //   - log a warn for any other type and SKIP (no normalization possible)
+    if (Array.isArray(rawEntries)) {
+      entries = rawEntries;
+    } else if (rawEntries && typeof rawEntries === 'object') {
+      log('warn', 'auto_update_runner.plugin_registry_error', {
+        harness: 'claude-code',
+        marketplace_key: key,
+        reason: 'agent_bridge_entry_was_object_not_array',
+        action: 'normalized_to_single_element_array',
+      });
+      entries = [rawEntries];
+    } else {
+      log('warn', 'auto_update_runner.plugin_registry_error', {
+        harness: 'claude-code',
+        marketplace_key: key,
+        reason: 'agent_bridge_entry_unexpected_type',
+        type: typeof rawEntries,
+        action: 'skipped',
+      });
+      continue;
+    }
 
     const kept = [];
     for (const entry of entries) {
@@ -620,10 +801,20 @@ function main() {
     dry_run: DRY_RUN,
   });
 
-  const stats = { claudeChanged: false, openclawChanged: false, settingsChanged: false };
+  const stats = {
+    claudeChanged: false,
+    openclawChanged: false,
+    settingsChanged: false,
+    // Codex-review fix (v3.14.1): track phase failures so exit code reflects
+    // them. The previous code swallowed all phase errors and emitted a
+    // "clean / idempotent" done event, which made update.sh's success-path
+    // log a happy "rewire ok" even when the file was unparseable / unwritable.
+    errors: [],
+  };
 
   try { rewirePhase1ClaudeRegistry(stats); }
   catch (err) {
+    stats.errors.push({ phase: 'claude_code', error: String(err) });
     log('error', 'auto_update_runner.plugin_registry_error', {
       phase: 'claude_code', error: String(err),
     });
@@ -631,6 +822,7 @@ function main() {
 
   try { rewirePhase2OpenClawRegistry(stats); }
   catch (err) {
+    stats.errors.push({ phase: 'openclaw', error: String(err) });
     log('error', 'auto_update_runner.plugin_registry_error', {
       phase: 'openclaw', error: String(err),
     });
@@ -638,12 +830,37 @@ function main() {
 
   try { rewirePhase3MarketplaceRegistration(stats); }
   catch (err) {
+    stats.errors.push({ phase: 'marketplace', error: String(err) });
     log('error', 'auto_update_runner.plugin_registry_error', {
       phase: 'marketplace', error: String(err),
     });
   }
 
-  if (!stats.claudeChanged && !stats.openclawChanged && !stats.settingsChanged) {
+  const anyChanged = stats.claudeChanged || stats.openclawChanged || stats.settingsChanged;
+  const hadErrors = stats.errors.length > 0;
+
+  if (hadErrors) {
+    log('error', 'auto_update_runner.plugin_registry_done', {
+      changed: anyChanged,
+      claude_changed: stats.claudeChanged,
+      openclaw_changed: stats.openclawChanged,
+      settings_changed: stats.settingsChanged,
+      errors: stats.errors,
+      idempotent: false,
+      dry_run: DRY_RUN,
+    });
+    if (VERBOSE) {
+      process.stderr.write(`[plugin-registry-rewire] completed with ` +
+        `${stats.errors.length} phase error(s) — see ${LOG_FILE}\n`);
+    }
+    // Codex-review fix (v3.14.1): exit non-zero so scripts/update.sh's
+    // warn-path actually fires. update.sh deliberately does NOT abort the
+    // overall auto-update on this exit code; it just surfaces the failure.
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!anyChanged) {
     log('info', 'auto_update_runner.plugin_registry_done', {
       changed: false,
       idempotent: true,

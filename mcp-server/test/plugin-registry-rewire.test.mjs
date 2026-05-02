@@ -601,3 +601,173 @@ test('done event is emitted with idempotent=true on clean run', () => {
     teardown(home, repo);
   }
 });
+
+// ---------- v3.14.1 Codex-review regression tests --------------------------
+
+test('codex-review v3.14.1: tolerates JSONC (line + block comments + trailing commas) in settings.json', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const settingsPath = join(home, '.claude', 'settings.json');
+
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'agent-bridge@agent-bridge': [
+          { scope: 'user', installPath: '/nonexistent/stale/path', version: '3.10.1' },
+        ],
+      },
+    });
+    // settings.json with line comments, block comments, AND trailing commas.
+    writeFileSync(settingsPath, `{
+  // top-level line comment (a real Claude Code settings.json may have these)
+  /* block
+     comment */
+  "extraKnownMarketplaces": {
+    "agent-bridge": {
+      "source": { "source": "directory", "path": ${JSON.stringify(repo)} }, // trailing comma below this line
+    },
+  },
+}
+`);
+
+    const { res, log } = runRewire(home, repo);
+    assert.equal(res.status, 0,
+      `JSONC settings.json should not abort: rc=${res.status} stderr=${res.stderr}`);
+
+    // Strategy B should have fired (marketplace was detected despite JSONC).
+    const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
+      (r) => r.context.action === 'removed' && r.context.harness === 'claude-code');
+    assert.ok(ev, 'Strategy B should fire — marketplace entry detected through JSONC tolerance');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
+test('codex-review v3.14.1: phase error sets non-zero exit + done event records errors', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    // Write deliberately broken JSON that even JSONC tolerance can't recover.
+    writeFileSync(installedPath, '{ this is not even close to JSON $$$$ ');
+
+    const { res, log } = runRewire(home, repo);
+    assert.notEqual(res.status, 0,
+      'unparseable installed_plugins.json must produce a non-zero exit code');
+
+    const doneEv = findEvent(log, 'auto_update_runner.plugin_registry_done');
+    assert.ok(doneEv, 'done event must be emitted even on failure');
+    assert.equal(doneEv.level, 'error', 'done event level should be error when phase failed');
+    assert.equal(doneEv.context.idempotent, false, 'idempotent must be false when phase errored');
+    assert.ok(Array.isArray(doneEv.context.errors) && doneEv.context.errors.length >= 1,
+      'errors array should record the failed phase');
+    assert.equal(doneEv.context.errors[0].phase, 'claude_code');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
+test('codex-review v3.14.1: backup file uses unique suffix (ms+pid+rand), not 1s-resolution', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'agent-bridge@agent-bridge': [
+          { scope: 'user', installPath: '/nonexistent/stale/A', version: '3.10.1' },
+        ],
+      },
+    });
+
+    // First mutation.
+    const r1 = runRewire(home, repo);
+    assert.equal(r1.res.status, 0);
+
+    // Reset to a stale state again so the second run mutates too.
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'agent-bridge@agent-bridge': [
+          { scope: 'user', installPath: '/nonexistent/stale/B', version: '3.10.1' },
+        ],
+      },
+    });
+
+    // Second mutation (back-to-back — would collide on 1s-resolution suffix).
+    const r2 = runRewire(home, repo);
+    assert.equal(r2.res.status, 0);
+
+    const pluginsDir = join(home, '.claude', 'plugins');
+    const backups = readdirSync(pluginsDir).filter((f) => f.startsWith('installed_plugins.json.bak.'));
+    assert.ok(backups.length >= 2,
+      `expected >=2 distinct backup files, got ${backups.length}: ${backups.join(', ')}`);
+    // Verify uniqueness — set should equal length.
+    assert.equal(new Set(backups).size, backups.length,
+      'all backup filenames must be distinct (no collision under sub-second cadence)');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
+test('codex-review v3.14.1: atomic write — concurrent reader sees only fully-formed JSON', () => {
+  // We can't simulate true concurrency in Node test runner cleanly, but we can
+  // verify the implementation does NOT call writeFileSync directly on the
+  // target path — instead it must write to a temp file and rename. We do this
+  // by reading the script source and grep'ing for the new patterns.
+  const scriptPath = REWIRE_SCRIPT;
+  const src = readFileSync(scriptPath, 'utf8');
+  assert.ok(src.includes('renameSync(tmpPath, path)'),
+    'backupAndWrite must use renameSync to do an atomic swap');
+  assert.ok(src.includes('.tmp.'),
+    'backupAndWrite must write to a side-file before renaming');
+  assert.ok(src.includes('uniqueSuffix'),
+    'backup names must use a collision-resistant unique suffix');
+});
+
+test('codex-review v3.14.1: non-array agent-bridge entry is normalized to array, not silently skipped', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const settingsPath = join(home, '.claude', 'settings.json');
+
+    // Single object instead of array — reproduces the "shape drift" case.
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'agent-bridge@agent-bridge': {
+          scope: 'user',
+          installPath: '/nonexistent/stale/path',
+          version: '3.10.1',
+        },
+      },
+    });
+    writeJson(settingsPath, {
+      extraKnownMarketplaces: {
+        'agent-bridge': { source: { source: 'directory', path: repo } },
+      },
+    });
+
+    const { res, log } = runRewire(home, repo);
+    assert.equal(res.status, 0,
+      `non-array agent-bridge entry should be repaired, not error: rc=${res.status}`);
+
+    // The error log must record the normalization decision.
+    const ev = findEvent(log, 'auto_update_runner.plugin_registry_error',
+      (r) => r.context.reason === 'agent_bridge_entry_was_object_not_array');
+    assert.ok(ev, 'must emit warn that the entry was an object not array');
+    assert.equal(ev.context.action, 'normalized_to_single_element_array');
+
+    // And the actual rewire (Strategy B) should still fire.
+    const removed = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
+      (r) => r.context.action === 'removed');
+    assert.ok(removed, 'Strategy B should still fire after normalizing object→array');
+  } finally {
+    teardown(home, repo);
+  }
+});

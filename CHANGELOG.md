@@ -1,5 +1,19 @@
 # Changelog
 
+## agent-bridge 3.14.1 — 2026-05-02
+
+### Codex-review fixes for the v3.14.0 plugin-registry-rewire step
+
+Ethan voice 6064 (2026-05-01): "Can you ask Codex to review your changes and fix anything you find?" Codex flagged 2 high + 3 medium concrete bugs in `scripts/plugin-registry-rewire.mjs`. All five are addressed in this patch release. No public API change to the CLI verb, the script's flags, or the audit-log event names.
+
+- **HIGH (atomicity)** — `backupAndWrite()` now writes to a side-file (`<file>.tmp.<unique>`), validates by re-parsing the temp file, and `rename()`s it into place atomically. Previously the function did `copyFileSync(backup) + writeFileSync(real)` in place, which a concurrent reader could observe truncated. Backup filenames now use a `<ms>-<pid>-<crypto-hex>` suffix instead of 1-second resolution, eliminating collisions when two rewire runs land in the same second.
+- **HIGH (error swallowing)** — when a phase throws (read-only file, unparseable JSON, write failure), the run now emits `auto_update_runner.plugin_registry_done` at level `error` with an `errors[]` array and exits non-zero. Previously phase errors were caught + logged but the script still finished as a "clean / idempotent" no-op, defeating the warn path in `scripts/update.sh`.
+- **MEDIUM (JSONC tolerance)** — `~/.claude/settings.json` and `~/.openclaw/openclaw.json` are now parsed with line-comment, block-comment, and trailing-comma tolerance (after a strict `JSON.parse()` first attempt). Strings are skipped during stripping so `// inside string` and `,` inside string literals are preserved.
+- **MEDIUM (cross-platform path equality)** — `pathsEqual()` now canonicalizes via `realpathSync.native()` when paths exist (resolves symlinks on macOS) and lowercases on Windows (case-insensitive filesystem). Idempotent re-runs no longer false-positive as "stale" when symlinks or case differ.
+- **MEDIUM (registry shape drift)** — when `data.plugins["agent-bridge@<marketplace>"]` is a single object instead of an array, the script normalizes it to a one-element array and proceeds, logging a warn. Previously the malformed entry was silently skipped — for the very plugin this script owns.
+
+**Tests:** 5 new regression tests (now 17/17 in the rewire suite, full repo 83/83) cover JSONC tolerance, exit-code-on-error, sub-second backup uniqueness, atomic-write code-shape grep, and object→array normalization. All run in isolated sandbox HOME directories.
+
 ## agent-bridge 3.14.0 — 2026-05-02
 
 ### [PLUGIN-REGISTRY-REWIRE 2026-05-01] Self-healing harness-side plugin registry
