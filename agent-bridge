@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="3.14.1"
+VERSION="3.14.2"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -1985,7 +1985,7 @@ cmd_plugin_registry_rewire() {
   #   agent-bridge plugin-registry-rewire [--dry-run] [--verbose] [--repo-root=PATH]
   #
   # Forwards all flags to scripts/plugin-registry-rewire.mjs.
-  local resolved script_dir repo_root rewire_script
+  local resolved script_dir repo_root rewire_script candidate
   resolved="$0"
   while [ -h "$resolved" ]; do
     script_dir="$(cd -P "$(dirname "$resolved")" && pwd)"
@@ -1993,8 +1993,27 @@ cmd_plugin_registry_rewire() {
     [[ "$resolved" != /* ]] && resolved="$script_dir/$resolved"
   done
   repo_root="$(cd -P "$(dirname "$resolved")" && pwd)"
-  rewire_script="$repo_root/scripts/plugin-registry-rewire.mjs"
-  [ -f "$rewire_script" ] || die "plugin-registry-rewire.mjs not found at $rewire_script"
+
+  # Search candidates in order:
+  #   1. <script-dir>/scripts/plugin-registry-rewire.mjs   — dev clone layout
+  #   2. <script-dir>/plugin-registry-rewire.mjs           — installed bin layout (install.sh/.ps1 drops a sibling copy)
+  #   3. Known dev clone paths on macOS / Linux            — Ethan's standard locations
+  #   4. Known dev clone paths on Windows (Git Bash)       — when invoked from a non-workspace cwd
+  rewire_script=""
+  for candidate in \
+    "$repo_root/scripts/plugin-registry-rewire.mjs" \
+    "$repo_root/plugin-registry-rewire.mjs" \
+    "$HOME/Projects/agent-bridge/scripts/plugin-registry-rewire.mjs" \
+    "$HOME/.openclaw/workspace/agent-bridge/scripts/plugin-registry-rewire.mjs" \
+    "${USERPROFILE:-$HOME}/Projects/agent-bridge/scripts/plugin-registry-rewire.mjs" \
+    "${USERPROFILE:-$HOME}/.openclaw/workspace/agent-bridge/scripts/plugin-registry-rewire.mjs"; do
+    if [ -f "$candidate" ]; then
+      rewire_script="$candidate"
+      break
+    fi
+  done
+
+  [ -n "$rewire_script" ] || die "plugin-registry-rewire.mjs not found in any known location (searched: $repo_root/scripts/, $repo_root/, $HOME/Projects/agent-bridge/scripts/, $HOME/.openclaw/workspace/agent-bridge/scripts/). Re-run install.sh / install.ps1 to refresh the bundled script, or invoke from a workspace clone."
   command -v node >/dev/null 2>&1 || die "node is required for 'agent-bridge plugin-registry-rewire'"
   exec node "$rewire_script" "$@"
 }

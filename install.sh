@@ -4,9 +4,12 @@ set -euo pipefail
 # agent-bridge installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/EthanSK/agent-bridge/main/install.sh | bash
 
-REPO="https://raw.githubusercontent.com/EthanSK/agent-bridge/main/agent-bridge"
+REPO_BASE="https://raw.githubusercontent.com/EthanSK/agent-bridge/main"
+REPO="$REPO_BASE/agent-bridge"
+REWIRE_SCRIPT_URL="$REPO_BASE/scripts/plugin-registry-rewire.mjs"
 INSTALL_DIR="/usr/local/bin"
 BIN_NAME="agent-bridge"
+REWIRE_SCRIPT_NAME="plugin-registry-rewire.mjs"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,6 +52,23 @@ if [ -w "$INSTALL_DIR" ]; then
   ln -sf "$INSTALL_DIR/$BIN_NAME" "$INSTALL_DIR/claude-bridge" 2>/dev/null || true
 else
   sudo ln -sf "$INSTALL_DIR/$BIN_NAME" "$INSTALL_DIR/claude-bridge" 2>/dev/null || true
+fi
+
+# Bundle plugin-registry-rewire.mjs next to the bin so the CLI can find it
+# on installations that don't have a workspace clone in a known location.
+# (CLI also searches dev-clone paths; this is the bin-bundled fallback.)
+TMPREWIRE="$(mktemp)"
+if $FETCH "$REWIRE_SCRIPT_URL" > "$TMPREWIRE" 2>/dev/null && [ -s "$TMPREWIRE" ]; then
+  if [ -w "$INSTALL_DIR" ]; then
+    mv "$TMPREWIRE" "$INSTALL_DIR/$REWIRE_SCRIPT_NAME"
+    chmod +x "$INSTALL_DIR/$REWIRE_SCRIPT_NAME"
+  else
+    sudo mv "$TMPREWIRE" "$INSTALL_DIR/$REWIRE_SCRIPT_NAME"
+    sudo chmod +x "$INSTALL_DIR/$REWIRE_SCRIPT_NAME"
+  fi
+else
+  rm -f "$TMPREWIRE"
+  printf "${DIM}  (note: could not fetch plugin-registry-rewire.mjs; CLI will fall back to dev-clone search)${RESET}\n"
 fi
 
 printf '\n'

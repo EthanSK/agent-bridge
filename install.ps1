@@ -34,6 +34,16 @@ Write-Host '  Downloading agent-bridge...' -ForegroundColor DarkGray
 Invoke-WebRequest -Uri "$Repo/agent-bridge"     -OutFile $ScriptPath -UseBasicParsing
 Invoke-WebRequest -Uri "$Repo/agent-bridge.cmd" -OutFile $ShimPath   -UseBasicParsing
 
+# Bundle plugin-registry-rewire.mjs next to the bin so the CLI can find it
+# on installations that don't have a workspace clone in a known location.
+# (CLI also searches dev-clone paths; this is the bin-bundled fallback.)
+$RewireScriptPath = Join-Path $InstallDir 'plugin-registry-rewire.mjs'
+try {
+    Invoke-WebRequest -Uri "$Repo/scripts/plugin-registry-rewire.mjs" -OutFile $RewireScriptPath -UseBasicParsing
+} catch {
+    Write-Host '  (note: could not fetch plugin-registry-rewire.mjs; CLI will fall back to dev-clone search)' -ForegroundColor DarkGray
+}
+
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (-not ($userPath -split ';' -contains $InstallDir)) {
     $newPath = if ([string]::IsNullOrEmpty($userPath)) { $InstallDir } else { "$userPath;$InstallDir" }
