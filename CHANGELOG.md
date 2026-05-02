@@ -1,5 +1,53 @@
 # Changelog
 
+## agent-bridge 3.14.0 — 2026-05-02
+
+### [PLUGIN-REGISTRY-REWIRE 2026-05-01] Self-healing harness-side plugin registry
+
+Auto-update used to do `git pull && npm run build` and stop there. It never validated whether the harness-side plugin registry entries actually pointed at a path that existed on disk. After a manual rewire from a `~/.claude/plugins/cache/<...>/<old-version>/` cache path to a `~/Projects/agent-bridge/mcp-server` dev-clone path, stale cache-path entries persisted indefinitely — silently causing `/reload-plugins` errors and "stuck on old version" failures across the fleet. Manually-edited fixes had to be re-applied every time the same drift recurred.
+
+Ethan's voice 6059 (2026-05-01): "Doesn't [agent-bridge] auto-update? Does the auto-update not reinstall the plugin on the Claude path? It should, and OpenClaw if it's a different path to the repo. When we reinstall, it should make sure — add that rule. That's very important because this keeps happening."
+
+3.14.0 adds a new step (Step 3 of 7) to `scripts/update.sh` that runs after the npm rebuild and before the cache archive/sync. The step is implemented as a portable Node script (`scripts/plugin-registry-rewire.mjs`) so it works the same on macOS, Linux, and Windows. Three phases of validation, all targeting ONLY the agent-bridge plugin:
+
+- **Phase 1 — Claude Code registry** (`~/.claude/plugins/installed_plugins.json`): for each entry under any `agent-bridge@*` key, check `installPath`. If it does not exist OR points at a stale Claude-plugins cache path while the dev-clone is what's actually running, take action:
+  - **Strategy B (preferred)**: REMOVE the entry when a directory-source `extraKnownMarketplaces["agent-bridge"]` entry exists in `~/.claude/settings.json`. The marketplace handles registration on its own.
+  - **Strategy A (fallback)**: REWIRE `installPath` to `<repo-root>/mcp-server`, refresh `version` and `lastUpdated`, when the entry is the only registration channel.
+- **Phase 2 — OpenClaw registry** (`~/.openclaw/openclaw.json`): walk `plugins.load.paths[]` and rewire any agent-bridge-owned path that doesn't exist. Existing-but-different paths are deliberately left alone (Ethan may run an alt clone). Unrelated entries (Repost-with-agent, agent-completion-chime, etc.) are NEVER touched.
+- **Phase 3 — Marketplace registration** (`~/.claude/settings.json`): if `extraKnownMarketplaces["agent-bridge"].source.path` doesn't exist, rewire to current repo root. Existing-but-different paths are left alone.
+
+**Safety:**
+- Backup before every JSON edit (`<file>.bak.<unix-ts>`).
+- Re-validate JSON post-edit; rollback from backup on parse failure.
+- Idempotent — re-running with no stale state is a clean no-op.
+- Failure of this step does NOT abort the rest of the auto-update flow. The original update still landed; the registry mismatch is logged loudly and the rest of update.sh continues.
+- Strict ownership — only paths matching agent-bridge naming conventions are touched.
+
+**NDJSON events** added to `~/.claude/logs/skills.log` (`component: "agent-bridge"`, `skill: "auto-update-runner"`):
+- `auto_update_runner.plugin_registry_start`
+- `auto_update_runner.plugin_registry_rewired` (one per mutation, with action/before/after/reason)
+- `auto_update_runner.plugin_registry_clean` (one per phase that finds nothing to do)
+- `auto_update_runner.plugin_registry_skip` (deliberate leave-alone, e.g. alt clone)
+- `auto_update_runner.plugin_registry_backup`
+- `auto_update_runner.plugin_registry_error`
+- `auto_update_runner.plugin_registry_done`
+
+**Manual operator lever** — new CLI verb for retro-fixing existing fleet machines without waiting 3 hours for the probe:
+
+```bash
+agent-bridge plugin-registry-rewire           # apply
+agent-bridge plugin-registry-rewire --dry-run # preview
+agent-bridge plugin-registry-rewire --verbose # log to stderr
+```
+
+Same code path as the auto-update flow's Step 3.
+
+**Tests:** 12 new unit tests at `mcp-server/test/plugin-registry-rewire.test.mjs` cover Strategy A vs B selection, multi-entry handling, OpenClaw `plugins.load.paths` rewire, idempotent re-run, backup creation, alt-clone safety (existing-but-different path is NEVER overwritten), don't-touch-unrelated-plugins, dry-run, and stale cache-path detection. All run in isolated sandbox HOME directories so they never touch real user state.
+
+**Docs:** new `docs/auto-update.md` documents the full sequence end-to-end (probe + runner + rewire) plus operator levers, debugging recipe, and event reference. README's update-flow section gained a Step 3 bullet pointing at the new doc.
+
+Files touched: `scripts/plugin-registry-rewire.mjs` (new), `scripts/update.sh`, `agent-bridge` CLI (new `plugin-registry-rewire` verb + help text), `mcp-server/test/plugin-registry-rewire.test.mjs` (new), `docs/auto-update.md` (new), `README.md`, version bumps in `agent-bridge`, `mcp-server/package.json`, `mcp-server/package-lock.json`, `mcp-server/src/config.ts`, `mcp-server/.claude-plugin/plugin.json`, `mcp-server/test/heartbeat-shutdown-diag.test.mjs`, `mcp-server/test/unified-channel.test.mjs`, `CHANGELOG.md`.
+
 ## agent-bridge 3.13.0 — 2026-05-01
 
 ### [FLEET-CHIME 2026-05-01] Fleet-aware completion chimes inside Agent Bridge

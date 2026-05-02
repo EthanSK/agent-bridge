@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="3.13.0"
+VERSION="3.14.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -1975,6 +1975,30 @@ cmd_chime() {
   node "$chime_cli" "$@"
 }
 
+cmd_plugin_registry_rewire() {
+  # [PLUGIN-REGISTRY-REWIRE 2026-05-01] Manual on-demand invocation of the
+  # self-healing harness-side plugin-registry validator. Same code path as the
+  # auto-update flow's Step 3, but exposed as an operator lever so users can
+  # retro-fix existing fleet machines without waiting 3h for the probe.
+  #
+  # Usage:
+  #   agent-bridge plugin-registry-rewire [--dry-run] [--verbose] [--repo-root=PATH]
+  #
+  # Forwards all flags to scripts/plugin-registry-rewire.mjs.
+  local resolved script_dir repo_root rewire_script
+  resolved="$0"
+  while [ -h "$resolved" ]; do
+    script_dir="$(cd -P "$(dirname "$resolved")" && pwd)"
+    resolved="$(readlink "$resolved")"
+    [[ "$resolved" != /* ]] && resolved="$script_dir/$resolved"
+  done
+  repo_root="$(cd -P "$(dirname "$resolved")" && pwd)"
+  rewire_script="$repo_root/scripts/plugin-registry-rewire.mjs"
+  [ -f "$rewire_script" ] || die "plugin-registry-rewire.mjs not found at $rewire_script"
+  command -v node >/dev/null 2>&1 || die "node is required for 'agent-bridge plugin-registry-rewire'"
+  exec node "$rewire_script" "$@"
+}
+
 cmd_help() {
   printf '\n'
   printf "${BOLD}agent-bridge${RESET} v%s\n" "$VERSION"
@@ -1989,6 +2013,7 @@ cmd_help() {
   printf '  pair               Pair with another machine (interactive or flags)\n'
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
   printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
+  printf '  plugin-registry-rewire  Self-heal stale plugin-registry entries (Claude Code + OpenClaw)\n'
   printf '  connect <machine>  Open an interactive SSH session\n'
   printf '  run <machine> "cmd"  Run a plain shell command on a paired machine (diagnostics only)\n'
   printf '  list               List all paired machines\n'
@@ -2036,6 +2061,7 @@ main() {
     pair)     cmd_pair "$@" ;;
     config)   cmd_config "$@" ;;
     chime)    cmd_chime "$@" ;;
+    plugin-registry-rewire) cmd_plugin_registry_rewire "$@" ;;
     connect)  cmd_connect "$@" ;;
     run)      cmd_run "$@" ;;
     list)     cmd_list "$@" ;;

@@ -341,10 +341,11 @@ cd ~/Projects/agent-bridge       # or wherever you cloned it
 What it does:
 1. `git fetch origin && git pull --ff-only origin main`
 2. `(cd mcp-server && npm install && npm run build)` to rebuild the unified MCP server (tools + channel)
-3. Archives older inactive Claude Code plugin cache version directories under `~/.claude/plugins/cache/agent-bridge/agent-bridge/.archive/`
-4. Syncs remaining Claude Code plugin cache copies to the rebuilt MCP server
-5. (Optional) Restart the OpenClaw gateway via `openclaw gateway restart` if the `openclaw` CLI is on `$PATH`. Gated behind a Y/n prompt so you can say no during a live session. Skipped entirely with `--skip-openclaw`
-6. Attempts to trigger `/reload-plugins` in the running Claude Code terminal via the `self-reload-plugins` skill (only if that skill is installed in `~/.claude/skills/self-reload-plugins/`)
+3. **Plugin-registry-rewire** (3.14.0+) — validates `~/.claude/plugins/installed_plugins.json` and `~/.openclaw/openclaw.json` agent-bridge entries against the current dev-clone path; stale cache-path entries are removed (when a directory-source marketplace exists) or rewired (otherwise). See [docs/auto-update.md](docs/auto-update.md) for the full design. Run on demand via `agent-bridge plugin-registry-rewire`
+4. Archives older inactive Claude Code plugin cache version directories under `~/.claude/plugins/cache/agent-bridge/agent-bridge/.archive/`
+5. Syncs remaining Claude Code plugin cache copies to the rebuilt MCP server
+6. (Optional) Restart the OpenClaw gateway via `openclaw gateway restart` if the `openclaw` CLI is on `$PATH`. Gated behind a Y/n prompt so you can say no during a live session. Skipped entirely with `--skip-openclaw`
+7. Attempts to trigger `/reload-plugins` in the running Claude Code terminal via the `self-reload-plugins` skill (only if that skill is installed in `~/.claude/skills/self-reload-plugins/`)
 
 The script is idempotent — if `mcp-server/build/` is already up-to-date the npm build is a fast no-op. `--auto` is intended for Claude Code startup hooks: it implies `--yes --skip-openclaw`, suppresses prompts, and exits silently when no commits were pulled and no rebuild is needed.
 

@@ -7,10 +7,12 @@
 # Steps:
 #   1. git fetch + fast-forward pull on main
 #   2. npm install + npm run build in mcp-server/ (unified tools + channel)
-#   3. archive stale Claude Code plugin cache copies when safe
-#   4. sync any installed Claude Code plugin cache copies
-#   5. (optional) restart the OpenClaw gateway
-#   6. (macOS / Linux / Windows-via-Git-Bash) trigger /reload-plugins in the
+#   3. plugin-registry-rewire: validate harness-side plugin registry entries
+#      ([PLUGIN-REGISTRY-REWIRE 2026-05-01], v3.14.0+)
+#   4. archive stale Claude Code plugin cache copies when safe
+#   5. sync any installed Claude Code plugin cache copies
+#   6. (optional) restart the OpenClaw gateway
+#   7. (macOS / Linux / Windows-via-Git-Bash) trigger /reload-plugins in the
 #      running Claude Code terminal if ~/.claude/skills/self-reload-plugins is
 #      present
 #
@@ -291,7 +293,7 @@ fi
 # ---------- 1. Git pull -----------------------------------------------------
 
 hr
-say "==> Step 1/6: git fetch + pull"
+say "==> Step 1/7: git fetch + pull"
 
 # Capture HEAD before + after so later steps can early-exit if nothing changed.
 HEAD_BEFORE="$(git rev-parse HEAD)"
@@ -345,7 +347,7 @@ fi
 # ---------- 2. MCP server rebuild -------------------------------------------
 
 hr
-say "==> Step 2/6: rebuild mcp-server (tools-only)"
+say "==> Step 2/7: rebuild mcp-server (tools-only)"
 
 if [[ ! -d "mcp-server" ]]; then
   say "no mcp-server/ dir — skipping (this repo layout is unexpected)"
@@ -366,16 +368,46 @@ else
   popd >/dev/null
 fi
 
-# ---------- 3. Stale Claude plugin cache archive ----------------------------
+# ---------- 3. Plugin registry rewire ---------------------------------------
+#
+# [PLUGIN-REGISTRY-REWIRE 2026-05-01] Self-healing harness-side validation —
+# see scripts/plugin-registry-rewire.mjs for the full design. Runs AFTER the
+# build so it picks up the just-rebuilt package version, and BEFORE the cache
+# archive/sync so a "remove stale cache entry" decision is reflected before
+# we'd otherwise re-sync into the cache dir.
+#
+# Failure here MUST NOT abort the rest of the update flow. The original
+# update still landed; the registry mismatch is a follow-up issue.
 
 hr
-say "==> Step 3/6: stale Claude plugin cache archive"
+say "==> Step 3/7: plugin registry rewire"
+
+if [[ -f "$REPO_ROOT/scripts/plugin-registry-rewire.mjs" ]] && command -v node >/dev/null 2>&1; then
+  rewire_out_file="$(mktemp)"
+  if node "$REPO_ROOT/scripts/plugin-registry-rewire.mjs" >"$rewire_out_file" 2>&1; then
+    if (( ! AUTO )) || (( AUTO_VERBOSE )); then
+      [[ -s "$rewire_out_file" ]] && cat "$rewire_out_file"
+    fi
+  else
+    rewire_rc=$?
+    warn "plugin-registry-rewire exited code=$rewire_rc — see ~/.claude/logs/skills.log for details. Continuing."
+    cat "$rewire_out_file" >&2 || true
+  fi
+  rm -f "$rewire_out_file"
+else
+  say "    plugin-registry-rewire.mjs not present or node missing — skipping."
+fi
+
+# ---------- 4. Stale Claude plugin cache archive ----------------------------
+
+hr
+say "==> Step 4/7: stale Claude plugin cache archive"
 archive_stale_plugin_caches
 
-# ---------- 4. Claude plugin cache sync -------------------------------------
+# ---------- 5. Claude plugin cache sync -------------------------------------
 
 hr
-say "==> Step 4/6: Claude plugin cache sync"
+say "==> Step 5/7: Claude plugin cache sync"
 
 # 3.7.0+: clean up any old claude-code-channel install if it's still around.
 if [[ -d "claude-code-channel" ]]; then
@@ -439,10 +471,10 @@ else
   say "==> Synced $synced cache director$([[ "$synced" == 1 ]] && printf 'y' || printf 'ies')."
 fi
 
-# ---------- 5. OpenClaw gateway restart -------------------------------------
+# ---------- 6. OpenClaw gateway restart -------------------------------------
 
 hr
-say "==> Step 5/6: OpenClaw gateway restart"
+say "==> Step 6/7: OpenClaw gateway restart"
 
 if (( SKIP_OPENCLAW )); then
   say "--skip-openclaw — skipping."
@@ -466,10 +498,10 @@ else
   fi
 fi
 
-# ---------- 6. /reload-plugins via self-reload-plugins skill ----------------
+# ---------- 7. /reload-plugins via self-reload-plugins skill ----------------
 
 hr
-say "==> Step 6/6: Claude Code /reload-plugins"
+say "==> Step 7/7: Claude Code /reload-plugins"
 
 case "$(uname -s)" in
   Darwin|Linux|MINGW*|MSYS*|CYGWIN*) ;;
