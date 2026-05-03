@@ -205,7 +205,77 @@ function compareSemver(a: string, b: string): number | null {
               ? compareSemver(peerVersion, MCP_SERVER_VERSION)
               : null;
             const peerIsOlder = versionCompare !== null && versionCompare < 0;
-            if (peerIsOlder) {
+            // 3.14.8 — Non-Claude-channel parent gate.
+            //
+            // Bug fixed (2026-05-03 incident, Mac-Mini): openclaw-gateway
+            // spawns MCP children of the agent-bridge plugin as part of its
+            // own auto-update flow. Those children arrived at this Patch F
+            // block with a NEWER on-disk version than the user's main
+            // Claude Code channel-owner — and happily SIGTERM → SIGKILL'd
+            // the active main-CC channel-owner, disconnecting the user's
+            // interactive session.
+            //
+            // The watcher-role demotion in `main()` (line ~810) already
+            // detects "my parent is not Claude Code" via
+            // `parentLooksChannelCapable(parentCommandLine)` and forces us
+            // into tools-only mode — but that runs AFTER the IIFE here,
+            // so the kill happens BEFORE the demotion. Move the same
+            // detection up here, BEFORE we evict-by-version, and refuse
+            // to kill if our parent is not Claude-channel-capable.
+            //
+            // When this gate fires, we fall through into `main()` without
+            // killing AND without entering the standby+retry path.
+            // Main()'s parentLooksChannelCapable check will then run and
+            // demote our role to tools-only as a no-op continuation of
+            // this decision — same end-state as the existing
+            // watcher.role_demoted_non_channel_parent path, just reached
+            // via a different earlier check.
+            //
+            // The `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT=1` opt-out is
+            // honored here for parity with main()'s demotion logic — unit
+            // tests and intentional non-CC channel-owners (rare) can still
+            // exercise the kill path.
+            let skipEvictNonChannelParent = false;
+            if (
+              peerIsOlder
+              && process.env.AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT !== '1'
+            ) {
+              const myParentCmd = readParentCommandLine();
+              if (myParentCmd && !parentLooksChannelCapable(myParentCmd)) {
+                skipEvictNonChannelParent = true;
+                try {
+                  process.stderr.write(
+                    `agent-bridge: refusing to evict peer pid=${holder} v=${peerVersion} `
+                    + `because our parent is not Claude-channel-capable (likely openclaw-gateway / non-CC host); `
+                    + `falling through to tools-only demotion in main()\n`,
+                  );
+                } catch { /* best-effort */ }
+                try {
+                  logEvent({
+                    event: 'auto_update_runner.skip_evict_non_channel_parent',
+                    level: 'info',
+                    msg: 'Skipping Patch F evict-by-version: our parent is not Claude-channel-capable. Will demote self to tools-only in main() and let the existing channel-owner keep its lease.',
+                    context: {
+                      my_pid: process.pid,
+                      my_ppid: process.ppid,
+                      my_parent_comm: myParentCmd,
+                      target_pid: holder,
+                      target_version: peerVersion,
+                      my_version: MCP_SERVER_VERSION,
+                      peer_heartbeat_age_ms: Date.now() - updatedAt,
+                    },
+                  });
+                } catch { /* best-effort */ }
+              }
+            }
+            if (skipEvictNonChannelParent) {
+              // 3.14.8 — Non-Claude-channel parent gate already fired and
+              // logged `auto_update_runner.skip_evict_non_channel_parent`
+              // above. Skip BOTH the kill branch AND the standby branch:
+              // we are about to be demoted to tools-only by main(), so the
+              // existing channel-owner is none of our business. Fall
+              // through to main() with no further Patch F action.
+            } else if (peerIsOlder) {
               // 3.14.4 — Pre-kill warning event. Logged BEFORE the SIGTERM so
               // post-mortem incident reports (`agent-bridge mcp-incident-report`)
               // can show the exact intent right before the kill, not just the

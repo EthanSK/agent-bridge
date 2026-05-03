@@ -1,5 +1,22 @@
 # Changelog
 
+## agent-bridge 3.14.8 — 2026-05-03
+
+### Fix Patch F evict-by-version when MCP child's parent is non-Claude-channel (e.g. openclaw-gateway)
+
+Live incident on Mac-Mini (2026-05-03 11:53:38Z): openclaw-gateway (PID 71761) spawned MCP children of the agent-bridge plugin as part of its own auto-update flow. Those children ran `update.sh --auto`, built a newer on-disk version, restarted as that newer version, then arrived at the Patch F evict-by-version block — where they correctly identified the user's main Claude Code channel-owner (PID 62445, parent = `claude --resume` PID 10654) as holding an older-version lease… and SIGTERM → SIGKILL'd it. The user's main Claude Code session lost its MCP plugin connection mid-conversation.
+
+The watcher-role demotion in `main()` already detects "my parent is not Claude Code" (via `parentLooksChannelCapable(parentCommandLine)`) and forces non-CC-parented MCP children into tools-only mode — but that runs AFTER the IIFE that hosts Patch F's evict-by-version logic. The kill happened before the demotion ever got a chance.
+
+3.14.8 moves the same parent-detection up into the Patch F IIFE, BEFORE the kill. When the new gate fires, the older-version peer keeps its lease, no SIGTERM is sent, and `main()`'s downstream demotion does the rest of the work.
+
+- **`mcp-server/src/index.ts`** — Patch F IIFE block: before the existing `if (peerIsOlder)` evict branch, calls `readParentCommandLine()` + `parentLooksChannelCapable()` (the same helpers used by `watcher.role_demoted_non_channel_parent`). When parent is not Claude-channel-capable AND the existing peer is older, sets a `skipEvictNonChannelParent` flag, logs `auto_update_runner.skip_evict_non_channel_parent` at INFO level (with `my_pid`, `my_ppid`, `my_parent_comm`, `target_pid`, `target_version`, `my_version`, `peer_heartbeat_age_ms`), and falls through into `main()` without entering the kill OR standby branches. Main()'s existing `parentLooksChannelCapable` check then demotes us to tools-only as a continuation of the same decision.
+- **`AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT=1` opt-out** is honored at the new gate for parity with `main()`'s demotion logic — unit tests + intentional non-CC channel-owners (rare) can still exercise the kill path.
+- **`mcp-server/test/unified-channel.test.mjs`** — new test "`Patch F (3.14.8): refuses to evict older-version peer when our parent is non-Claude-channel`" spawns an older-version peer + writes a fresh lease, starts the new MCP child with the gate ENABLED (overrides the test default which disables it), waits 4 s, asserts the peer is still alive, asserts `auto_update_runner.skip_evict_non_channel_parent` fired, asserts `patch_f.peer_version_kill` and `auto_update_runner.kill_will_evict_active_session` did NOT fire, and asserts `watcher.role_demoted_non_channel_parent` fired downstream so the new child ends up tools-only. Source-level guard test verifies the wiring lives in the shipped `build/index.js`.
+- **Version bumps** — `mcp-server/package.json` + `mcp-server/package-lock.json`, `MCP_SERVER_VERSION` in `config.ts`, `mcp-server/.claude-plugin/plugin.json`, the bash CLI VERSION, and in-test version-equality assertions all bump 3.14.7 → 3.14.8.
+- **dot-claude-side gate left intact**: the existing `~/.claude/scripts/maybe-update-agent-bridge.sh` subagent-CC gate (added in 3.14.4) is unchanged — different code path, different responsibility, complementary.
+- **No change to `watcher.role_demoted_non_channel_parent`** — the new gate is a parallel callsite using the same shared helpers; downstream demotion logic is untouched.
+
 ## agent-bridge 3.14.7 — 2026-05-03
 
 ### Generalize public docs — drop user-specific names, neutralize tool descriptions
