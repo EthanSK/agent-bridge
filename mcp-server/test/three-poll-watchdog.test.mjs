@@ -39,7 +39,11 @@ function startServer(home, env = {}) {
       USERPROFILE: home,
       AGENT_BRIDGE_MACHINE_NAME: 'test-3-5-5',
       AGENT_BRIDGE_DISABLE_PARENT_CHECK: '1',
-      AGENT_BRIDGE_ROLE: 'tools-only',
+      // 4.0.0 — `AGENT_BRIDGE_ROLE` was removed. Tools-only mode is
+      // the natural outcome when `AGENT_BRIDGE_PERSONA` is unset.
+      // Tests that need channel-owner mode override `AGENT_BRIDGE_PERSONA`
+      // via the `env` argument below.
+      AGENT_BRIDGE_PERSONA: '',
       ...env,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -127,8 +131,8 @@ test('3.6.1: idle stdin (handshake delivered, pipe held open) does not trigger s
   // `readableEnded === true` during normal idle operation.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-idle-'));
   const server = startServer(home, {
-    AGENT_BRIDGE_ROLE: 'channel-owner',
-    AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+    // 4.0.0 — channel-owner mode is keyed off AGENT_BRIDGE_PERSONA.
+    AGENT_BRIDGE_PERSONA: 'default',
   });
   try {
     await sleep(800);
@@ -171,8 +175,8 @@ test('3.6.1: SIGTERM still triggers clean shutdown (orphan watchdog not regressi
   // mode; disable it here so the test can exercise the SIGTERM shutdown path.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-sigterm-'));
   const server = startServer(home, {
-    AGENT_BRIDGE_ROLE: 'channel-owner',
-    AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+    // 4.0.0 — channel-owner mode is keyed off AGENT_BRIDGE_PERSONA.
+    AGENT_BRIDGE_PERSONA: 'default',
     AGENT_BRIDGE_DISABLE_PATCH_G: '1',
   });
   try {

@@ -59,7 +59,7 @@ test('getMachine returns undefined for the local name and aliases (no SSH route 
   assert.equal(config.getMachine('self'), undefined);
 });
 
-test('sendLocalMessage writes to the correct per-target inbox subdir', () => {
+test('sendLocalMessage rewrites legacy claude-code target to persona-scoped claude-code/default (4.0.0 backward compat)', () => {
   const msg = inbox.createMessage(
     'TestMachine',
     'TestMachine',
@@ -73,13 +73,17 @@ test('sendLocalMessage writes to the correct per-target inbox subdir', () => {
 
   inbox.sendLocalMessage(msg);
 
-  const expectedPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', `${msg.id}.json`);
+  // 4.0.0 — Sender-side normalization rewrites the legacy literal
+  // `claude-code` to `claude-code/default` so the file lands in the
+  // default persona's persona-scoped subdir, where a 4.0.0+ receiver
+  // looks for inbound messages.
+  const expectedPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msg.id}.json`);
   const raw = readFileSync(expectedPath, 'utf8');
   const parsed = JSON.parse(raw);
 
   assert.equal(parsed.id, msg.id);
-  assert.equal(parsed.target, 'claude-code');
-  assert.equal(parsed.fromTarget, 'claude-code');
+  assert.equal(parsed.target, 'claude-code/default');
+  assert.equal(parsed.fromTarget, 'claude-code/default');
   assert.equal(parsed.content, 'hello local world');
   assert.equal(parsed.from, 'TestMachine');
   assert.equal(parsed.to, 'TestMachine');
@@ -88,6 +92,28 @@ test('sendLocalMessage writes to the correct per-target inbox subdir', () => {
   const outboxPath = join(sandbox, '.agent-bridge', 'outbox', `${msg.id}.json`);
   const outboxRaw = readFileSync(outboxPath, 'utf8');
   assert.equal(JSON.parse(outboxRaw).id, msg.id);
+});
+
+test('sendLocalMessage with explicit claude-code/foo target writes to claude-code/foo/ (no rewrite for already-scoped target)', () => {
+  const msg = inbox.createMessage(
+    'TestMachine',
+    'TestMachine',
+    'message',
+    'hello named persona',
+    null,
+    60,
+    'claude-code/foo',
+    'claude-code/default',
+  );
+
+  inbox.sendLocalMessage(msg);
+
+  const expectedPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'foo', `${msg.id}.json`);
+  const raw = readFileSync(expectedPath, 'utf8');
+  const parsed = JSON.parse(raw);
+
+  assert.equal(parsed.target, 'claude-code/foo', 'persona-scoped target preserved unchanged');
+  assert.equal(parsed.fromTarget, 'claude-code/default', 'fromTarget preserved unchanged');
 });
 
 test('sendLocalMessage routes to a custom OpenClaw target subdir', () => {
@@ -141,7 +167,9 @@ test('sendLocalMessage atomic write: no .tmp files left behind on success', () =
   );
   inbox.sendLocalMessage(msg);
 
-  const targetDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code');
+  // 4.0.0 — `claude-code` is rewritten to `claude-code/default` so the
+  // file lands in the persona-scoped subdir.
+  const targetDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default');
   const tmpFiles = readdirSync(targetDir).filter(f => f.startsWith('.agent-bridge-') && f.endsWith('.tmp'));
   assert.equal(tmpFiles.length, 0, `unexpected tmp files: ${tmpFiles.join(',')}`);
 });
@@ -174,11 +202,12 @@ test('mixed scenario: local send lands in local inbox even when paired remotes e
   assert.equal(config.isLocalMachineName('TestMachine'), true);
 
   // A local-targeted send goes to the local inbox without touching SSH.
+  // 4.0.0 — legacy `claude-code` is rewritten to `claude-code/default`.
   const msg = inbox.createMessage(
     'TestMachine', 'TestMachine', 'message', 'mixed', null, 60, 'claude-code', undefined,
   );
   inbox.sendLocalMessage(msg);
-  const localPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', `${msg.id}.json`);
+  const localPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msg.id}.json`);
   assert.equal(JSON.parse(readFileSync(localPath, 'utf8')).id, msg.id);
 });
 
@@ -187,11 +216,13 @@ test('getInboxStats reports a healthy shared watcher lease from a tools-only pro
   const locksDir = join(sandbox, '.agent-bridge', 'locks');
   mkdirSync(locksDir, { recursive: true });
   const now = Date.now();
+  // 4.0.0 — lease key is `claude-code__<persona>.watcher-lock.json` and
+  // the lease's `target` field is `claude-code/<persona>`.
   writeFileSync(
-    join(locksDir, 'claude-code.watcher-lock.json'),
+    join(locksDir, 'claude-code__default.watcher-lock.json'),
     JSON.stringify({
       pid: process.pid,
-      target: 'claude-code',
+      target: 'claude-code/default',
       role: 'channel-owner',
       token: `test-${now}`,
       startedAt: now,

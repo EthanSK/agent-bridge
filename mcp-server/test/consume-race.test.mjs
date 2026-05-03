@@ -52,9 +52,13 @@ process.env.AGENT_BRIDGE_DISABLE_PATCH_F = '1';
 const inbox = await import('../build/inbox.js');
 const watcher = await import('../build/watcher.js');
 
-const inboxDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code');
-const pendingAckDir = join(sandbox, '.agent-bridge', 'inbox', '.pending-ack', 'claude-code');
-const archiveDir = join(sandbox, '.agent-bridge', 'inbox', '.archive', 'claude-code');
+// 4.0.0 — persona-scoped subdir under claude-code/default/. The watcher
+// resolves its dirs through `getActiveClaudeCodeTarget()`, which falls
+// back to `claude-code/default` when no `setActivePersona()` call has
+// run (this test imports the modules directly and never calls it).
+const inboxDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default');
+const pendingAckDir = join(sandbox, '.agent-bridge', 'inbox', '.pending-ack', 'claude-code', 'default');
+const archiveDir = join(sandbox, '.agent-bridge', 'inbox', '.archive', 'claude-code', 'default');
 const exhaustedDir = join(sandbox, '.agent-bridge', 'inbox', '.failed', '.exhausted');
 const deliveredFile = join(sandbox, '.agent-bridge', 'inbox', '.delivered');
 

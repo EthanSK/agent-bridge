@@ -9,7 +9,10 @@ import { spawn } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const workerPath = join(__dirname, 'watcher-standby-worker.mjs');
-const leasePath = (home) => join(home, '.agent-bridge', 'locks', 'claude-code.watcher-lock.json');
+// 4.0.0 — lease key is `claude-code__<persona>.watcher-lock.json`. The
+// standby-worker.mjs spawns startWatcher() directly without calling
+// `setActivePersona`, so the active target is the default-persona one.
+const leasePath = (home) => join(home, '.agent-bridge', 'locks', 'claude-code__default.watcher-lock.json');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

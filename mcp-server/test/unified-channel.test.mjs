@@ -47,10 +47,13 @@ function startServer(home, env = {}) {
       USERPROFILE: home,
       AGENT_BRIDGE_MACHINE_NAME: 'test-unified',
       AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG: '1',
-      // Default to channel-owner role with parent-channel-capability check
-      // disabled — unit tests are not Claude Code, so the parentLooksChannelCapable
-      // check would otherwise demote us to tools-only.
-      AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+      // 4.0.0 — `AGENT_BRIDGE_ROLE` + `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT`
+      // were removed. Channel-owner mode is keyed off
+      // `AGENT_BRIDGE_PERSONA`. Unit tests are not Claude Code so the
+      // cmdline-fallback would otherwise demote us to tools-only;
+      // setting `AGENT_BRIDGE_PERSONA=default` puts us into channel-owner
+      // mode regardless of parent.
+      AGENT_BRIDGE_PERSONA: 'default',
       // Patch G ignores SIGTERM when parent is alive; tests that want to use
       // SIGTERM-driven shutdown set AGENT_BRIDGE_DISABLE_PATCH_G: '1'.
       AGENT_BRIDGE_DISABLE_PATCH_G: '1',
@@ -102,17 +105,20 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant — 3.14.9, sourced from config.ts
+  // Version constant — 4.0.0, sourced from config.ts
   assert.ok(
-    /MCP_SERVER_VERSION\s*=\s*['"]3\.14\.9['"]/.test(configSrc),
-    'MCP_SERVER_VERSION must be 3.14.9 in config.ts',
+    /MCP_SERVER_VERSION\s*=\s*['"]4\.0\.0['"]/.test(configSrc),
+    'MCP_SERVER_VERSION must be 4.0.0 in config.ts',
   );
+  // 4.0.0 — `parentLooksChannelCapable` lives in persona.js. Assert the
+  // built persona module carries the Claude Code parent signatures.
+  const personaSrc = await readFile(join(__dirname, '..', 'build', 'persona.js'), 'utf8');
   assert.ok(
-    indexSrc.includes('/claude\\.app\\/Contents\\/MacOS\\/claude'),
+    personaSrc.includes('/claude\\.app\\/Contents\\/MacOS\\/claude'),
     'Claude Code desktop parent signature accepted as channel-capable',
   );
   assert.ok(
-    indexSrc.includes('anthropic\\.claude-code-'),
+    personaSrc.includes('anthropic\\.claude-code-'),
     'Claude Code VS Code parent signature accepted as channel-capable',
   );
 });
@@ -124,16 +130,16 @@ test('Patch F (3.7.1): server stays in standby when a same-version healthy peer 
   // exit — it should log patch_f.standby and stay alive, polling the lease.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-standby-'));
   const lockDir = join(home, '.agent-bridge', 'locks');
-  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  const lockPath = join(lockDir, 'claude-code__default.watcher-lock.json');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
   const fakeLease = {
     pid: process.pid,
-    target: 'claude-code',
+    target: 'claude-code/default',
     role: 'channel-owner',
     token: `${process.pid}-fake-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    version: '3.14.9', // same version as our build → no kill
+    version: '4.0.0', // same version as our build → no kill
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
@@ -173,7 +179,7 @@ test('Patch F (3.7.1): standby plugin acquires lease once peer heartbeat goes st
   // pid number.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-promote-'));
   const lockDir = join(home, '.agent-bridge', 'locks');
-  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  const lockPath = join(lockDir, 'claude-code__default.watcher-lock.json');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
 
   // Mint a definitely-dead pid.
@@ -187,7 +193,7 @@ test('Patch F (3.7.1): standby plugin acquires lease once peer heartbeat goes st
   // the lease via the stale-lease branch. We assert the steal happens.
   const fakeLease = {
     pid: deadPid,
-    target: 'claude-code',
+    target: 'claude-code/default',
     role: 'channel-owner',
     token: `${deadPid}-dead-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
@@ -196,7 +202,7 @@ test('Patch F (3.7.1): standby plugin acquires lease once peer heartbeat goes st
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
-  const child = startServer(home, { AGENT_BRIDGE_ROLE: 'channel-owner' });
+  const child = startServer(home, { /* startServer defaults to AGENT_BRIDGE_PERSONA=default */ });
   try {
     // Wait up to ~10 s for the plugin to acquire the lease (either directly
     // through Patch F fall-through or via the standby retry path).
@@ -235,7 +241,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
   // wait for the exit, and then steal the lease.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-f-version-kill-'));
   const lockDir = join(home, '.agent-bridge', 'locks');
-  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  const lockPath = join(lockDir, 'claude-code__default.watcher-lock.json');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
 
   const peer = spawn(process.execPath, [
@@ -250,7 +256,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
   try {
     const peerLease = {
       pid: peer.pid,
-      target: 'claude-code',
+      target: 'claude-code/default',
       role: 'channel-owner',
       token: `${peer.pid}-old-${Math.random().toString(36).slice(2, 10)}`,
       startedAt: Date.now(),
@@ -259,7 +265,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
     };
     await writeFile(lockPath, JSON.stringify(peerLease, null, 2));
 
-    const child = startServer(home, { AGENT_BRIDGE_ROLE: 'channel-owner' });
+    const child = startServer(home, { /* startServer defaults to AGENT_BRIDGE_PERSONA=default */ });
     try {
       // Wait for the peer to die (SIGTERMed by Patch F).
       const peerExited = await Promise.race([
@@ -289,7 +295,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
       const killEvent = events.find((e) => e.event === 'patch_f.peer_version_kill');
       assert.ok(killEvent, 'expected patch_f.peer_version_kill event for stale-version peer');
       assert.equal(killEvent.context.peer_version, '3.6.0', 'peer_version logged');
-      assert.equal(killEvent.context.our_version, '3.14.9', 'our_version logged');
+      assert.equal(killEvent.context.our_version, '4.0.0', 'our_version logged');
       assert.equal(killEvent.context.peer_pid, peer.pid, 'peer_pid logged');
     } finally {
       try { child.kill('SIGTERM'); } catch {}
@@ -306,8 +312,15 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
   }
 });
 
-// ─── Patch F (3.14.8) — non-Claude-channel parent gate ─────────────────────
-test('Patch F (3.14.8): refuses to evict older-version peer when our parent is non-Claude-channel (e.g. openclaw-gateway)', { timeout: 15_000 }, async () => {
+// ─── 4.0.0 replacement for the 3.14.8 gate ─────────────────────────────────
+// In 4.0.0 the inline 3.14.8 gate was removed. Its job (preventing
+// openclaw-gateway-spawned MCP children from killing the user's main CC
+// channel-owner) is now handled structurally by persona resolution at
+// module load: a non-CC parent without `AGENT_BRIDGE_PERSONA` set ends
+// up in tools-only mode and never reaches Patch F's kill block. This
+// test verifies that pathway: the older peer survives because the new
+// child is in tools-only mode, not because of an inline gate.
+test('4.0.0 (replaces 3.14.8 gate): non-Claude-channel parent + no AGENT_BRIDGE_PERSONA → tools-only at module load, peer NOT killed', { timeout: 15_000 }, async () => {
   // Bug context: openclaw-gateway-spawned MCP children of the agent-bridge
   // plugin would arrive at Patch F's evict-by-version with a NEWER on-disk
   // version than the user's main Claude Code channel-owner, and SIGTERM →
@@ -318,12 +331,15 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
   // Test mechanism: the test runner (this `node` process) is the plugin's
   // parent. Its command line does NOT match parentLooksChannelCapable
   // (no --channels flag, no /claude.app/Contents/MacOS/claude path, no
-  // anthropic.claude-code-* path). So by NOT passing
-  // AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT=1, the new gate must fire and
-  // the older-version peer must SURVIVE.
+  // anthropic.claude-code-* path). 4.0.0 normally puts non-CC parents
+  // into tools-only mode at module load when AGENT_BRIDGE_PERSONA is
+  // unset, so Patch F never runs in the first place. To exercise the
+  // 3.14.8 gate as a defence-in-depth backstop we explicitly SET
+  // AGENT_BRIDGE_PERSONA=default (forcing channel-owner mode despite
+  // the non-CC parent), then assert the inner gate refuses to evict.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3.14.8-non-channel-parent-'));
   const lockDir = join(home, '.agent-bridge', 'locks');
-  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  const lockPath = join(lockDir, 'claude-code__default.watcher-lock.json');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
 
   // Long-lived helper that traps SIGTERM. If Patch F erroneously fires,
@@ -338,17 +354,19 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
   try {
     const peerLease = {
       pid: peer.pid,
-      target: 'claude-code',
+      target: 'claude-code/default',
       role: 'channel-owner',
       token: `${peer.pid}-old-${Math.random().toString(36).slice(2, 10)}`,
       startedAt: Date.now(),
       updatedAt: Date.now(),
-      version: '3.6.0', // strictly older than our 3.14.9 build
+      version: '3.6.0', // strictly older than our 4.0.0 build
     };
     await writeFile(lockPath, JSON.stringify(peerLease, null, 2));
 
-    // CRITICAL: override AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT to '0' so
-    // the gate is allowed to run. (startServer defaults to '1'.)
+    // 4.0.0 — explicitly clear AGENT_BRIDGE_PERSONA so the cmdline-
+    // fallback runs. The test runner's parent cmdline does NOT match
+    // parentLooksChannelCapable (no Claude flags), so identity.mode
+    // resolves to tools-only at module load and Patch F never runs.
     const child = spawn(process.execPath, [indexPath], {
       env: {
         ...process.env,
@@ -357,8 +375,7 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
         AGENT_BRIDGE_MACHINE_NAME: 'test-unified',
         AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG: '1',
         AGENT_BRIDGE_DISABLE_PATCH_G: '1',
-        AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '0',
-        AGENT_BRIDGE_ROLE: 'channel-owner',
+        AGENT_BRIDGE_PERSONA: '',
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -380,33 +397,20 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
       assert.equal(
         peerStillAlive,
         true,
-        'older-version peer must NOT be killed when our parent is non-Claude-channel (3.14.8 gate)',
+        'older-version peer must NOT be killed when our parent is non-Claude-channel (4.0.0 tools-only at module load)',
       );
 
       const events = await readEvents(home);
 
-      // Skip event must be present.
-      const skipEvent = events.find(
-        (e) => e.event === 'auto_update_runner.skip_evict_non_channel_parent',
-      );
-      assert.ok(
-        skipEvent,
-        'expected auto_update_runner.skip_evict_non_channel_parent event',
-      );
-      assert.equal(skipEvent.level, 'info', 'skip event is INFO level');
-      assert.equal(skipEvent.context.target_pid, peer.pid, 'target_pid (older peer) logged');
-      assert.equal(skipEvent.context.target_version, '3.6.0', 'target_version logged');
-      assert.equal(skipEvent.context.my_version, '3.14.9', 'my_version logged');
-      assert.equal(typeof skipEvent.context.my_ppid, 'number', 'my_ppid logged');
-      assert.equal(typeof skipEvent.context.my_parent_comm, 'string', 'my_parent_comm logged');
-      assert.equal(typeof skipEvent.context.peer_heartbeat_age_ms, 'number', 'peer_heartbeat_age_ms logged');
-
-      // Kill events must NOT be present.
+      // 4.0.0 — Patch F was never reached. The kill events must NOT be
+      // present. The watcher.role_demoted_non_channel_parent event MUST
+      // be present because main() logs it when persona+cmdline-fallback
+      // both fail.
       const killEvent = events.find((e) => e.event === 'patch_f.peer_version_kill');
       assert.equal(
         killEvent,
         undefined,
-        'patch_f.peer_version_kill must NOT fire when 3.14.8 gate skips the evict',
+        'patch_f.peer_version_kill must NOT fire when child is tools-only at module load',
       );
       const preKillWarn = events.find(
         (e) => e.event === 'auto_update_runner.kill_will_evict_active_session',
@@ -414,18 +418,20 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
       assert.equal(
         preKillWarn,
         undefined,
-        'auto_update_runner.kill_will_evict_active_session must NOT fire when gate skips the evict',
+        'auto_update_runner.kill_will_evict_active_session must NOT fire when child is tools-only',
       );
 
-      // The watcher.role_demoted_non_channel_parent event in main() must
-      // also fire — same parent-detection should reach the same conclusion
-      // and demote the new child to tools-only.
       const demoted = events.find(
         (e) => e.event === 'watcher.role_demoted_non_channel_parent',
       );
       assert.ok(
         demoted,
-        'watcher.role_demoted_non_channel_parent must fire after the gate skip — same end-state',
+        '4.0.0: watcher.role_demoted_non_channel_parent MUST fire — persona env unset and cmdline-fallback negative ⇒ tools-only',
+      );
+      assert.equal(
+        demoted.context.identity_reason,
+        'tools_only_no_channel_flag',
+        'demotion event must carry identity_reason=tools_only_no_channel_flag',
       );
     } finally {
       try { child.kill('SIGTERM'); } catch {}
@@ -442,25 +448,34 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
   }
 });
 
-test('Patch F (3.14.8): source-level wiring of skip_evict_non_channel_parent', async () => {
+test('4.0.0: persona resolution wires the parent-capability decision via persona.ts', async () => {
+  // 4.0.0 — the inline 3.14.8 gate was removed. Its job is now done by
+  // `resolveIdentity` in persona.ts at module load. Assert that:
+  //   1. persona.ts ships the `parentLooksChannelCapable` helper
+  //   2. persona.ts ships the `readParentCommandLine` helper
+  //   3. index.ts imports those helpers (so the IIFE + main() agree)
+  //   4. index.ts no longer carries the in-the-loop skip_evict_*
+  //      event name (its replacement is structural).
   const indexSrc = await readFile(indexPath, 'utf8');
+  const personaSrc = await readFile(join(__dirname, '..', 'build', 'persona.js'), 'utf8');
   assert.ok(
+    personaSrc.includes('parentLooksChannelCapable'),
+    'parentLooksChannelCapable must live in persona.ts (4.0.0)',
+  );
+  assert.ok(
+    personaSrc.includes('readParentCommandLine'),
+    'readParentCommandLine must live in persona.ts (4.0.0)',
+  );
+  assert.ok(
+    indexSrc.includes('resolveIdentity'),
+    'index.ts must call resolveIdentity at module load (4.0.0)',
+  );
+  // The 3.14.8 in-the-loop skip event should be gone — its replacement
+  // is the persona-resolution-driven tools-only mode.
+  assert.equal(
     indexSrc.includes('auto_update_runner.skip_evict_non_channel_parent'),
-    '3.14.8 skip event name wired in built index.js',
-  );
-  assert.ok(
-    indexSrc.includes('skipEvictNonChannelParent'),
-    '3.14.8 gate flag wired in built index.js',
-  );
-  // Same parent-detection path as the watcher demotion — must call the
-  // shared helpers.
-  assert.ok(
-    indexSrc.includes('readParentCommandLine'),
-    '3.14.8 gate must reuse readParentCommandLine helper',
-  );
-  assert.ok(
-    indexSrc.includes('parentLooksChannelCapable'),
-    '3.14.8 gate must reuse parentLooksChannelCapable helper',
+    false,
+    '4.0.0: the inline 3.14.8 skip event was replaced by structural persona resolution',
   );
 });
 
@@ -475,7 +490,7 @@ test('Patch G: SIGTERM is ignored when parent is alive and channel-owner watcher
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-patch-g-'));
   const child = startServer(home, {
     AGENT_BRIDGE_DISABLE_PATCH_G: '0',
-    AGENT_BRIDGE_ROLE: 'channel-owner',
+    // 4.0.0 — startServer already sets AGENT_BRIDGE_PERSONA=default.
   });
   try {
     await sleep(1500);
@@ -520,7 +535,11 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
       AGENT_BRIDGE_MACHINE_NAME: 'test-patch-h',
       AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG: '1',
       AGENT_BRIDGE_DISABLE_PATCH_G: '1',
-      AGENT_BRIDGE_ROLE: 'tools-only', // we don't need the watcher here
+      // 4.0.0 — tools-only mode is the natural outcome when
+      // AGENT_BRIDGE_PERSONA is unset and parent cmdline lacks the
+      // channel flag. Explicitly clear PERSONA in case the test runner
+      // shell has it set.
+      AGENT_BRIDGE_PERSONA: '',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -614,7 +633,7 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
     assert.equal(typeof parsed.pid, 'number', 'status.pid is a number');
     assert.equal(parsed.pid, child.pid, 'status.pid matches the plugin child pid');
     assert.equal(typeof parsed.uptime_s, 'number', 'status.uptime_s is a number');
-    assert.equal(parsed.version, '3.14.9', 'status.version is 3.14.9');
+    assert.equal(parsed.version, '4.0.0', 'status.version is 4.0.0');
     assert.equal(typeof parsed.machine, 'string', 'status.machine is a string');
     assert.equal(parsed.machine, 'test-patch-h', 'status.machine reflects env override');
     assert.equal(typeof parsed.watcher_active, 'boolean', 'status.watcher_active is boolean');
@@ -632,11 +651,12 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
 // ─── End-to-end inbox delivery via unified plugin ──────────────────────────
 test('unified plugin: watcher detects new inbox file, pushes channel notification, stages pending-ack (3.9.0)', { timeout: 25_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-unified-delivery-'));
-  const inboxDir = join(home, '.agent-bridge', 'inbox', 'claude-code');
-  const pendingAckDir = join(home, '.agent-bridge', 'inbox', '.pending-ack', 'claude-code');
+  // 4.0.0 — persona-scoped subdir under claude-code/default/.
+  const inboxDir = join(home, '.agent-bridge', 'inbox', 'claude-code', 'default');
+  const pendingAckDir = join(home, '.agent-bridge', 'inbox', '.pending-ack', 'claude-code', 'default');
 
   const child = startServer(home, {
-    AGENT_BRIDGE_ROLE: 'channel-owner',
+    // startServer already sets AGENT_BRIDGE_PERSONA=default.
   });
   try {
     // Wait for plugin startup.
@@ -654,7 +674,7 @@ test('unified plugin: watcher detects new inbox file, pushes channel notificatio
       timestamp: new Date().toISOString(),
       replyTo: null,
       ttl: 600,
-      target: 'claude-code',
+      target: 'claude-code/default',
       fromTarget: 'claude-code',
     };
     const msgPath = join(inboxDir, `${msgId}.json`);
@@ -724,7 +744,7 @@ test('unified plugin: watcher detects new inbox file, pushes channel notificatio
 test('3.14.4: kill_will_evict_active_session fires before peer_version_kill', { timeout: 12_000 }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3.14.4-prekill-'));
   const lockDir = join(home, '.agent-bridge', 'locks');
-  const lockPath = join(lockDir, 'claude-code.watcher-lock.json');
+  const lockPath = join(lockDir, 'claude-code__default.watcher-lock.json');
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
 
   const peer = spawn(process.execPath, [
@@ -737,16 +757,16 @@ test('3.14.4: kill_will_evict_active_session fires before peer_version_kill', { 
   try {
     const peerLease = {
       pid: peer.pid,
-      target: 'claude-code',
+      target: 'claude-code/default',
       role: 'channel-owner',
       token: `${peer.pid}-old-${Math.random().toString(36).slice(2, 10)}`,
       startedAt: Date.now(),
       updatedAt: Date.now(), // fresh heartbeat — would_orphan_this_session=true
-      version: '3.6.0', // older than 3.14.9
+      version: '3.6.0', // older than 4.0.0
     };
     await writeFile(lockPath, JSON.stringify(peerLease, null, 2));
 
-    const child = startServer(home, { AGENT_BRIDGE_ROLE: 'channel-owner' });
+    const child = startServer(home, { /* startServer defaults to AGENT_BRIDGE_PERSONA=default */ });
     try {
       await Promise.race([
         new Promise((resolve) => peer.once('exit', resolve)),
@@ -761,7 +781,7 @@ test('3.14.4: kill_will_evict_active_session fires before peer_version_kill', { 
       assert.ok(preKill, 'expected auto_update_runner.kill_will_evict_active_session event before peer kill');
       assert.equal(preKill.context.peer_pid, peer.pid, 'peer_pid logged in pre-kill warning');
       assert.equal(preKill.context.peer_version, '3.6.0', 'peer_version logged');
-      assert.equal(preKill.context.our_version, '3.14.9', 'our_version logged');
+      assert.equal(preKill.context.our_version, '4.0.0', 'our_version logged');
       assert.equal(preKill.context.would_orphan_this_session, true, 'fresh heartbeat → would_orphan_this_session=true');
       assert.ok(typeof preKill.context.human_summary === 'string', 'human_summary string present');
       assert.ok(preKill.context.human_summary.includes('disconnect'), 'human_summary mentions disconnect risk');
@@ -794,7 +814,7 @@ test('3.14.4: epitaph fires on SIGTERM-initiated shutdown', { timeout: 10_000 },
   // Spin up a server with Patch G disabled so SIGTERM actually triggers shutdown.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3.14.4-epitaph-'));
   const child = startServer(home, {
-    AGENT_BRIDGE_ROLE: 'channel-owner',
+    // 4.0.0 — startServer already sets AGENT_BRIDGE_PERSONA=default.
     AGENT_BRIDGE_DISABLE_PATCH_G: '1',
   });
   try {
@@ -811,7 +831,7 @@ test('3.14.4: epitaph fires on SIGTERM-initiated shutdown', { timeout: 10_000 },
     const events = await readEvents(home);
     const epitaph = events.find((e) => e.event === 'auto_update_runner.epitaph');
     assert.ok(epitaph, 'expected auto_update_runner.epitaph event after SIGTERM-initiated shutdown');
-    assert.equal(epitaph.context.version, '3.14.9', 'epitaph carries our version');
+    assert.equal(epitaph.context.version, '4.0.0', 'epitaph carries our version');
     assert.ok(
       typeof epitaph.context.kill_reason === 'string' && epitaph.context.kill_reason.length > 0,
       'epitaph carries a kill_reason string',
@@ -858,8 +878,19 @@ test('3.14.4: agent-bridge mcp-incident-report extracts events around timestamp'
   );
 
   const cliPath = join(__dirname, '..', '..', 'agent-bridge');
+  // Resolve the running node's real binary dir so the bash CLI's `node`
+  // invocation works even when HOME is sandboxed (some user shims under
+  // ~/bin/node depend on $HOME/.nvm being readable, which a sandbox HOME
+  // hides). Prepending the real bin dir to PATH gives bash a deterministic
+  // node it can exec.
+  const { dirname: pathDirname } = await import('node:path');
+  const realNodeDir = pathDirname(process.execPath);
   const { stdout } = await execFileP('bash', [cliPath, 'mcp-incident-report', '--around', '2026-05-03T12:00:05.000Z'], {
-    env: { ...process.env, HOME: home },
+    env: {
+      ...process.env,
+      HOME: home,
+      PATH: `${realNodeDir}:${process.env.PATH ?? ''}`,
+    },
     timeout: 8_000,
   });
 

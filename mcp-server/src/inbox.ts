@@ -39,9 +39,12 @@ import {
   DEFAULT_TTL_SECONDS,
   OUTBOX_MAX_AGE_MS,
   CLAUDE_CODE_TARGET,
+  DEFAULT_PERSONA,
+  claudeCodeTargetForPersona,
   inboxSubdir,
   archiveSubdir,
   failedSubdir,
+  leaseFileNameForTarget,
   isValidTarget,
 } from './config.js';
 import { sshWriteFile } from './ssh.js';
@@ -134,6 +137,98 @@ type SharedWatcherLease = {
   fresh: boolean | null;
 };
 
+// ── 4.0.0 — Active persona state ─────────────────────────────────────────────
+
+/**
+ * 4.0.0 — Active Claude Code persona for THIS mcp-server child. Set once
+ * at init time (`setActivePersona`) by `index.ts` after persona resolution.
+ * Defaults to `DEFAULT_PERSONA` so unit tests / tools-only hosts that read
+ * stats etc. without calling `setActivePersona` still see a coherent
+ * persona-scoped layout.
+ */
+let activePersona: string = DEFAULT_PERSONA;
+let activeClaudeCodeTarget: string = claudeCodeTargetForPersona(DEFAULT_PERSONA);
+/**
+ * 4.0.0 — true once `setActivePersona` has been called. Used by
+ * `getActiveClaudeCodeTarget()` to distinguish "we have a real persona
+ * binding" from "we are still on the cold default because nobody bound
+ * us yet". Tools-only children NEVER call setActivePersona, so they
+ * observe `personaIsBound === false` and `getActiveClaudeCodeTarget()`
+ * returns null. Path-resolution callers use
+ * `getActiveClaudeCodeTargetOrDefault()` which falls back to
+ * `claude-code/default` regardless of binding state.
+ */
+let personaIsBound = false;
+
+/**
+ * Set the active Claude Code persona for this MCP child. Called by
+ * `index.ts` after persona resolution. Idempotent. Subsequent calls to
+ * `getClaudeCodeInboxDir()` / `getClaudeCodeArchiveDir()` /
+ * `getClaudeCodeFailedDir()` will resolve to the new persona's subdir.
+ */
+export function setActivePersona(persona: string): void {
+  if (!persona || typeof persona !== 'string') {
+    throw new Error(`setActivePersona: invalid persona ${JSON.stringify(persona)}`);
+  }
+  activePersona = persona;
+  activeClaudeCodeTarget = claudeCodeTargetForPersona(persona);
+  personaIsBound = true;
+}
+
+/** Active persona this MCP child is bound to (for diagnostics). */
+export function getActivePersona(): string {
+  return activePersona;
+}
+
+/**
+ * Active persona-scoped Claude Code target string ("claude-code/<persona>"),
+ * or `null` when no persona has been bound (tools-only children). Callers
+ * that need a non-null fallback (e.g. the inbox/watcher subdir resolvers)
+ * should use the dir-scoped helpers — those always have a coherent persona
+ * to fall back to. Sender code that wants the "did we bind?" signal calls
+ * this helper directly and falls back to `claude-code` (legacy) on null.
+ */
+export function getActiveClaudeCodeTarget(): string | null {
+  return personaIsBound ? activeClaudeCodeTarget : null;
+}
+
+/**
+ * 4.0.0 — Path-resolution variant: always returns a non-null target so
+ * inbox/archive/failed dir helpers can compose paths without null-checks.
+ * Falls back to `claude-code/default` when no persona is bound (matches
+ * pre-codex-fix behavior of `getActiveClaudeCodeTarget`).
+ */
+export function getActiveClaudeCodeTargetOrDefault(): string {
+  return activeClaudeCodeTarget;
+}
+
+/**
+ * 4.0.0 — Persona-scoped inbox/archive/failed subdir getters. The watcher
+ * and inbox modules call these instead of the deleted const exports
+ * because the active persona is set at runtime by `index.ts` after
+ * persona resolution. The legacy `inbox/claude-code/<file>.json`
+ * (no persona segment) is supported via `getLegacyClaudeCodeInboxDir()`
+ * and the one-time migration scan in `migrateLegacyInboxFiles()`.
+ */
+export function getClaudeCodeInboxDir(): string {
+  return inboxSubdir(activeClaudeCodeTarget);
+}
+export function getClaudeCodeArchiveDir(): string {
+  return archiveSubdir(activeClaudeCodeTarget);
+}
+export function getClaudeCodeFailedDir(): string {
+  return failedSubdir(activeClaudeCodeTarget);
+}
+
+/**
+ * 4.0.0 — The *legacy* `inbox/claude-code/` path (no persona segment).
+ * Pre-4.0.0 senders write here; the migration scan moves these files
+ * into the active persona's subdir at startup.
+ */
+export function getLegacyClaudeCodeInboxDir(): string {
+  return inboxSubdir(CLAUDE_CODE_TARGET);
+}
+
 // ── Directory helpers ────────────────────────────────────────────────────────
 
 export function ensureInboxDirs(): void {
@@ -143,9 +238,10 @@ export function ensureInboxDirs(): void {
     FAILED_DIR,
     ARCHIVE_DIR,
     UNROUTED_DIR,
-    CLAUDE_CODE_INBOX_DIR,
-    CLAUDE_CODE_ARCHIVE_DIR,
-    CLAUDE_CODE_FAILED_DIR,
+    inboxSubdir(CLAUDE_CODE_TARGET), // parent claude-code/ (legacy + persona container)
+    getClaudeCodeInboxDir(),
+    getClaudeCodeArchiveDir(),
+    getClaudeCodeFailedDir(),
   ]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -154,14 +250,98 @@ export function ensureInboxDirs(): void {
 }
 
 /**
- * The inbox subdir this mcp-server (Claude Code side) owns. All scanning,
- * watching and consuming operates on this subdir — the parent `inbox/` is now
- * a fan-out root shared with the openclaw-channel plugin (and any future
- * harness) and is not scanned directly.
+ * 4.0.0 — One-time migration: any JSON file living directly at
+ * `inbox/claude-code/<file>.json` (no persona segment) was written by a
+ * pre-4.0.0 sender that addressed `target=claude-code`. The receiver
+ * routes those to the `default` persona's subdir on first boot, so the
+ * default persona's channel-owner picks them up via its normal poll +
+ * channel push. Non-default personas leave legacy files alone — they
+ * belong to whoever is bound to `default`.
+ *
+ * Returns the number of legacy files moved. Logs one
+ * `inbox.legacy_migrated` event with a list of file IDs so post-mortem
+ * tooling can correlate any "where did this message go?" question
+ * against the boot log.
+ *
+ * Idempotent: subsequent boots find the legacy directory already drained
+ * and quickly no-op.
  */
-export const CLAUDE_CODE_INBOX_DIR = inboxSubdir(CLAUDE_CODE_TARGET);
-export const CLAUDE_CODE_ARCHIVE_DIR = archiveSubdir(CLAUDE_CODE_TARGET);
-export const CLAUDE_CODE_FAILED_DIR = failedSubdir(CLAUDE_CODE_TARGET);
+export function migrateLegacyClaudeCodeInboxFiles(): number {
+  if (activePersona !== DEFAULT_PERSONA) return 0;
+  const legacyDir = getLegacyClaudeCodeInboxDir();
+  const targetDir = getClaudeCodeInboxDir();
+  // The legacy dir IS the parent of the persona subdir, so be careful
+  // to scan only the top-level (don't recurse into persona/, .archive/
+  // etc.). `withFileTypes: true` gives us the type without a follow-up
+  // stat per entry.
+  let moved = 0;
+  const movedIds: string[] = [];
+  try {
+    if (!existsSync(legacyDir)) return 0;
+    const entries = readdirSync(legacyDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith('.json')) continue;
+      // Skip hidden / metadata files.
+      if (entry.name.startsWith('.')) continue;
+      const src = join(legacyDir, entry.name);
+      // Best-effort sanity: parse to capture the message id for logging.
+      let msgId: string | null = null;
+      try {
+        const raw = readFileSync(src, 'utf8');
+        const msg = JSON.parse(raw) as Partial<BridgeMessage>;
+        if (typeof msg.id === 'string') msgId = msg.id;
+      } catch { /* best-effort */ }
+      if (!existsSync(targetDir)) {
+        try { mkdirSync(targetDir, { recursive: true, mode: 0o700 }); } catch { /* ignore */ }
+      }
+      const dest = join(targetDir, entry.name);
+      try {
+        // If a same-named file already exists in the persona subdir, the
+        // newer (persona-routed) write wins. Quarantine the legacy
+        // duplicate to `.failed/_unrouted/` (with a `.legacy-dup-` prefix
+        // so post-mortem tooling can identify it) rather than clobber
+        // the persona-subdir write or pollute the live inbox with a
+        // `.legacy-*.json` file that the watcher would still pick up
+        // and process under a non-canonical filename.
+        if (existsSync(dest)) {
+          const altDest = join(UNROUTED_DIR, `.legacy-dup-${Date.now()}-${entry.name}`);
+          try { mkdirSync(UNROUTED_DIR, { recursive: true, mode: 0o700 }); } catch { /* ignore */ }
+          renameSync(src, altDest);
+          moved += 1;
+          if (msgId) movedIds.push(`${msgId}→quarantined:${altDest.split('/').pop()}`);
+          continue;
+        }
+        renameSync(src, dest);
+        moved += 1;
+        if (msgId) movedIds.push(msgId);
+      } catch (err) {
+        logError(`migrateLegacyClaudeCodeInboxFiles: failed to move ${entry.name}: ${err}`);
+      }
+    }
+  } catch (err) {
+    logWarn(`migrateLegacyClaudeCodeInboxFiles: scan failed: ${err}`);
+  }
+  if (moved > 0) {
+    logInfo(
+      `Migrated ${moved} legacy claude-code inbox file(s) to persona "${activePersona}" `
+      + `(${movedIds.slice(0, 10).join(', ')}${movedIds.length > 10 ? `, +${movedIds.length - 10} more` : ''})`,
+    );
+    logEvent({
+      event: 'inbox.legacy_migrated',
+      level: 'info',
+      msg: `Migrated ${moved} legacy claude-code inbox file(s) to persona "${activePersona}"`,
+      context: {
+        persona: activePersona,
+        moved,
+        ids: movedIds,
+        legacyDir,
+        targetDir,
+      },
+    });
+  }
+  return moved;
+}
 
 /**
  * One-shot migration: any JSON file at the top level of INBOX_DIR is a legacy
@@ -335,8 +515,8 @@ function refreshCacheIfNeeded(): void {
 
   pendingFiles.clear();
   try {
-    if (existsSync(CLAUDE_CODE_INBOX_DIR)) {
-      const files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(
+    if (existsSync(getClaudeCodeInboxDir())) {
+      const files = readdirSync(getClaudeCodeInboxDir()).filter(
         f => f.endsWith('.json'),
       );
       for (const f of files) {
@@ -352,6 +532,24 @@ function refreshCacheIfNeeded(): void {
 
 // ── Message parsing (with quarantine for malformed files) ────────────────────
 
+/**
+ * 4.0.0 — Persona-scoped target check. A message file living in
+ * `inbox/claude-code/<persona>/` is considered well-targeted when its
+ * `target` field is EITHER:
+ *   - the legacy `claude-code` literal (pre-4.0.0 senders, routed here
+ *     by the migration scan or the sender-side normalization), OR
+ *   - the active persona-scoped target (`claude-code/<activePersona>`).
+ *
+ * Anything else is malformed for this persona — it'll be quarantined
+ * to `.failed/claude-code/<persona>/` so the post-mortem chain stays
+ * intact.
+ */
+function isTargetForActivePersona(target: string): boolean {
+  if (target === CLAUDE_CODE_TARGET) return true;
+  if (target === activeClaudeCodeTarget) return true;
+  return false;
+}
+
 function parseMessageFile(filePath: string): BridgeMessage | null {
   try {
     const raw = readFileSync(filePath, 'utf8');
@@ -362,16 +560,19 @@ function parseMessageFile(filePath: string): BridgeMessage | null {
     if (!msg.target || !isValidTarget(msg.target)) {
       throw new Error(`Missing/invalid target: ${JSON.stringify(msg.target ?? null)}`);
     }
-    if (msg.target !== CLAUDE_CODE_TARGET) {
-      throw new Error(`Message target ${JSON.stringify(msg.target)} does not match ${CLAUDE_CODE_TARGET}`);
+    if (!isTargetForActivePersona(msg.target)) {
+      throw new Error(
+        `Message target ${JSON.stringify(msg.target)} does not match `
+        + `${JSON.stringify(activeClaudeCodeTarget)} (or legacy ${JSON.stringify(CLAUDE_CODE_TARGET)})`,
+      );
     }
     return msg;
   } catch (err) {
     const fileName = filePath.split('/').pop() ?? filePath;
-    logWarn(`Malformed claude-code inbox file ${fileName}, moving to .failed/${CLAUDE_CODE_TARGET}/: ${err}`);
+    logWarn(`Malformed claude-code inbox file ${fileName}, moving to .failed/${activeClaudeCodeTarget}/: ${err}`);
     try {
-      if (!existsSync(CLAUDE_CODE_FAILED_DIR)) mkdirSync(CLAUDE_CODE_FAILED_DIR, { recursive: true, mode: 0o700 });
-      const dest = join(CLAUDE_CODE_FAILED_DIR, fileName);
+      if (!existsSync(getClaudeCodeFailedDir())) mkdirSync(getClaudeCodeFailedDir(), { recursive: true, mode: 0o700 });
+      const dest = join(getClaudeCodeFailedDir(), fileName);
       renameSync(filePath, dest);
     } catch (moveErr) {
       logError(`Failed to quarantine ${fileName}: ${moveErr}`);
@@ -461,12 +662,27 @@ export function createMessage(
 export function sendLocalMessage(message: BridgeMessage): void {
   if (!message.target || !isValidTarget(message.target)) {
     throw new Error(
-      `BridgeMessage.target is required for local delivery (e.g. "claude-code", "openclaw/clawdiboi2"). `
+      `BridgeMessage.target is required for local delivery (e.g. "claude-code/default", "openclaw/clawdiboi2"). `
       + `Got: ${JSON.stringify(message.target ?? null)}`,
     );
   }
 
   ensureInboxDirs();
+
+  // 4.0.0 — backward-compat: a sender that addresses the legacy
+  // `target=claude-code` (no slash) lands at the default persona's subdir
+  // on the receiver. We rewrite the in-memory message AND its `target`
+  // field in the JSON-on-disk so the watcher's persona-scoped target
+  // check accepts it. The outbox copy carries the rewritten target too,
+  // matching the canonical inbox file.
+  if (message.target === CLAUDE_CODE_TARGET) {
+    message.target = claudeCodeTargetForPersona(DEFAULT_PERSONA);
+  }
+  if (message.fromTarget === CLAUDE_CODE_TARGET) {
+    // Reply round-trip: rewrite the sender's own return-target so the
+    // receiver's eventual reply lands on the default persona.
+    message.fromTarget = claudeCodeTargetForPersona(DEFAULT_PERSONA);
+  }
 
   const targetDir = inboxSubdir(message.target);
   if (!existsSync(targetDir)) {
@@ -556,9 +772,20 @@ export async function sendMessage(
 ): Promise<void> {
   if (!message.target || !isValidTarget(message.target)) {
     throw new Error(
-      `BridgeMessage.target is required (e.g. "claude-code", "openclaw/clawdiboi2"). `
+      `BridgeMessage.target is required (e.g. "claude-code/default", "openclaw/clawdiboi2"). `
       + `Got: ${JSON.stringify(message.target ?? null)}`,
     );
+  }
+  // 4.0.0 — legacy `claude-code` addressing is rewritten to
+  // `claude-code/default` so the receiver's default-persona watcher
+  // picks it up via its native subdir scan. Without this, a 4.0.0+
+  // receiver would route the file to `.failed/_unrouted/` because it
+  // landed at `inbox/claude-code/<file>.json` (no persona segment).
+  if (message.target === CLAUDE_CODE_TARGET) {
+    message.target = claudeCodeTargetForPersona(DEFAULT_PERSONA);
+  }
+  if (message.fromTarget === CLAUDE_CODE_TARGET) {
+    message.fromTarget = claudeCodeTargetForPersona(DEFAULT_PERSONA);
   }
   const remotePath = `~/.agent-bridge/inbox/${message.target}/${message.id}.json`;
   const content = JSON.stringify(message, null, 2);
@@ -646,7 +873,7 @@ export function readInbox(): BridgeMessage[] {
   // Batch-read all pending files
   const fileNames = Array.from(pendingFiles);
   for (const fileName of fileNames) {
-    const filePath = join(CLAUDE_CODE_INBOX_DIR, fileName);
+    const filePath = join(getClaudeCodeInboxDir(), fileName);
 
     // Skip files that no longer exist (race with external consumers)
     if (!existsSync(filePath)) {
@@ -710,7 +937,7 @@ export function consumeInbox(): BridgeMessage[] {
   const messages = readInbox();
 
   for (const msg of messages) {
-    const filePath = join(CLAUDE_CODE_INBOX_DIR, `${msg.id}.json`);
+    const filePath = join(getClaudeCodeInboxDir(), `${msg.id}.json`);
     try {
       unlinkSync(filePath);
       logDebug(`Consumed message ${msg.id}`);
@@ -739,10 +966,10 @@ export function clearInbox(): number {
   ensureInboxDirs();
   let count = 0;
   try {
-    const files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(f => f.endsWith('.json'));
+    const files = readdirSync(getClaudeCodeInboxDir()).filter(f => f.endsWith('.json'));
     for (const file of files) {
       try {
-        unlinkSync(join(CLAUDE_CODE_INBOX_DIR, file));
+        unlinkSync(join(getClaudeCodeInboxDir(), file));
         count++;
       } catch { /* ignore */ }
     }
@@ -771,7 +998,7 @@ export function pruneInbox(): number {
 
   let files: string[];
   try {
-    files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(f => f.endsWith('.json'));
+    files = readdirSync(getClaudeCodeInboxDir()).filter(f => f.endsWith('.json'));
   } catch {
     return 0;
   }
@@ -780,7 +1007,7 @@ export function pruneInbox(): number {
   const entries: { fileName: string; msg: BridgeMessage; filePath: string }[] = [];
 
   for (const fileName of files) {
-    const filePath = join(CLAUDE_CODE_INBOX_DIR, fileName);
+    const filePath = join(getClaudeCodeInboxDir(), fileName);
     const msg = parseMessageFile(filePath);
     if (!msg) {
       // Already quarantined
@@ -903,7 +1130,7 @@ export function stopPruneTimer(): void {
 // ── Inbox stats ──────────────────────────────────────────────────────────────
 
 function watcherLeasePathForTarget(target: string): string {
-  return join(LOCKS_DIR, `${target.replaceAll('/', '__')}.watcher-lock.json`);
+  return join(LOCKS_DIR, leaseFileNameForTarget(target));
 }
 
 function pidIsAlive(pid: number): boolean {
@@ -925,7 +1152,7 @@ function readSharedWatcherLease(): SharedWatcherLease {
     fresh: null,
   };
 
-  const filePath = watcherLeasePathForTarget(CLAUDE_CODE_TARGET);
+  const filePath = watcherLeasePathForTarget(activeClaudeCodeTarget);
   if (!existsSync(filePath)) return empty;
 
   try {
@@ -938,7 +1165,7 @@ function readSharedWatcherLease(): SharedWatcherLease {
     };
     const pid = Number(parsed.pid);
     const role = typeof parsed.role === 'string' ? parsed.role : null;
-    if (!Number.isInteger(pid) || pid <= 0 || parsed.target !== CLAUDE_CODE_TARGET) {
+    if (!Number.isInteger(pid) || pid <= 0 || parsed.target !== activeClaudeCodeTarget) {
       return { ...empty, role };
     }
 
@@ -975,11 +1202,11 @@ export function getInboxStats(): InboxStats {
   const nowMs = Date.now();
 
   try {
-    const files = readdirSync(CLAUDE_CODE_INBOX_DIR).filter(f => f.endsWith('.json'));
+    const files = readdirSync(getClaudeCodeInboxDir()).filter(f => f.endsWith('.json'));
     pendingCount = files.length;
 
     for (const f of files) {
-      const fp = join(CLAUDE_CODE_INBOX_DIR, f);
+      const fp = join(getClaudeCodeInboxDir(), f);
       try {
         const stat = statSync(fp);
         totalSize += stat.size;
@@ -1033,8 +1260,17 @@ export function getInboxStats(): InboxStats {
 
 /**
  * Initialize the inbox system: load processed IDs, populate cache, start pruning.
+ *
+ * 4.0.0 — `opts.isChannelOwner` gates persona-coupled side effects so
+ * tools-only children (no inbox lease) do NOT mutate default-persona
+ * delivery state. Specifically: the legacy
+ * `inbox/claude-code/*.json` → `inbox/claude-code/default/` migration is
+ * skipped when the caller is tools-only — only the default-persona
+ * channel-owner ever drains the legacy dir, preventing a race where two
+ * tools-only siblings + the legitimate default-persona owner all race
+ * the migration.
  */
-export function initInbox(): void {
+export function initInbox(opts: { isChannelOwner?: boolean } = {}): void {
   ensureInboxDirs();
   const migrated = migrateLegacyFlatFiles();
   if (migrated > 0) {
@@ -1043,11 +1279,19 @@ export function initInbox(): void {
       + `${UNROUTED_DIR}. Senders must set BridgeMessage.target.`,
     );
   }
+  // 4.0.0 — drain legacy `inbox/claude-code/<file>.json` (no persona
+  // segment) into the active persona's subdir. Only the default-persona
+  // channel-owner adopts these; tools-only children and non-default
+  // personas leave them alone so the channel-owner is the single
+  // authoritative drainer.
+  if (opts.isChannelOwner) {
+    migrateLegacyClaudeCodeInboxFiles();
+  }
   loadProcessedIds();
   loadDeliveredIds();
   refreshCacheIfNeeded();
   startPruneTimer();
-  logInfo('Inbox system initialized (target-routed, watching claude-code/)');
+  logInfo(`Inbox system initialized (persona="${activePersona}", target="${activeClaudeCodeTarget}")`);
 }
 
 /**

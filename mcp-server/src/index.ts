@@ -67,13 +67,22 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { CLAUDE_CODE_TARGET, LOCKS_DIR, LOGS_DIR, MCP_SERVER_VERSION, ensureDirectories, getLocalMachineName } from './config.js';
-import { initInbox, shutdownInbox } from './inbox.js';
+import {
+  AGENT_BRIDGE_PERSONA_ENV,
+  LOCKS_DIR,
+  LOGS_DIR,
+  MCP_SERVER_VERSION,
+  ensureDirectories,
+  getLocalMachineName,
+  leaseFileNameForTarget,
+} from './config.js';
+import { initInbox, setActivePersona, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
+import { resolveIdentity } from './persona.js';
 import { registerTools } from './tools.js';
 import { startWatcher, stopWatcher, replayUndeliveredMessages, registerAliveSignals, subscribeToPromotion } from './watcher.js';
 import { logInfo, logError, logWarn } from './logger.js';
@@ -111,6 +120,25 @@ try {
   process.on('exit', () => { try { stderrLogStream.end(); } catch { /* ignore */ } });
 } catch { /* if we cannot install the tee, just keep going */ }
 
+// 4.0.0 — Resolve persona + mode ONCE, before Patch F. The shared
+// `PersonaResolution` is used by:
+//   - Patch F's IIFE below (decides which lease file to inspect, AND
+//     whether to skip the kill+standby logic entirely when we are
+//     tools-only),
+//   - `setActivePersona()` (so all inbox/watcher subdir resolution
+//     uses the resolved persona),
+//   - `main()` (skips watcher startup when tools-only),
+//   - The status tool + epitaph events.
+//
+// `AGENT_BRIDGE_ROLE`, `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT`, and
+// `AGENT_BRIDGE_DISABLE_WATCHER` were removed in 4.0.0 — they have NO
+// effect. Persona + cmdline-fallback fully supersede them. Setting any
+// of them is silently ignored (we do not even read them anywhere).
+const identity = resolveIdentity();
+if (identity.mode === 'channel-owner' && identity.persona) {
+  setActivePersona(identity.persona);
+}
+
 // 3.7.1 — Patch F (heartbeat-recency guard against parallel spawn) — REVISED.
 //
 // The 3.7.0 form of Patch F **exited** when an existing fresh peer held the
@@ -138,9 +166,10 @@ try {
 // same-version peer, and we never kill when the version is unknown (treat as
 // same-version — safer default).
 //
-// Skipped when AGENT_BRIDGE_ROLE=tools-only — tools-only hosts (OpenClaw,
-// Codex sidekicks) do not contend for the inbox lease, so they have no
-// reason to back off or kill peers.
+// Skipped when `identity.mode === 'tools-only'` — tools-only hosts
+// (OpenClaw, Codex sidekicks, Claude sessions without the agent-bridge
+// channel flag, etc.) do not contend for the inbox lease, so they have
+// no reason to back off or kill peers.
 function compareSemver(a: string, b: string): number | null {
   // Returns negative if a < b, 0 if equal, positive if a > b. Returns null
   // when either input is not a parseable dotted-numeric semver-ish string —
@@ -160,22 +189,49 @@ function compareSemver(a: string, b: string): number | null {
 }
 
 {
-  const requestedRole = process.env.AGENT_BRIDGE_ROLE?.trim() || 'channel-owner';
+  // 4.0.0 — Patch F runs only when identity mode is `channel-owner`.
+  // Tools-only children never inspect the lease; they would never
+  // SIGTERM a peer because they do not contend for the lease in the
+  // first place. The `AGENT_BRIDGE_DISABLE_PATCH_F` test escape hatch
+  // is preserved.
   if (
-    requestedRole !== 'tools-only'
+    identity.mode === 'channel-owner'
+    && identity.target
     && process.env.AGENT_BRIDGE_DISABLE_PATCH_F !== '1'
   ) {
-    const leasePath = join(
-      LOCKS_DIR,
-      `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`,
-    );
+    // 4.0.0 — Build the list of lease paths Patch F should examine.
+    // Always check the persona-keyed lease for THIS persona. When the
+    // active persona is `default`, ALSO inspect the pre-4.0.0 legacy
+    // lease (`claude-code.watcher-lock.json`) so a live v3 watcher
+    // is visible to v4 arbitration during a rolling upgrade. Without
+    // this, a v3 owner and a v4 default-persona owner would both
+    // run, splitting delivery between legacy/default dirs and racing
+    // the startup migration.
+    const personaLeasePath = join(LOCKS_DIR, leaseFileNameForTarget(identity.target));
+    const legacyLeasePath = join(LOCKS_DIR, leaseFileNameForTarget('claude-code'));
+    const leasePaths: { path: string; isLegacy: boolean }[] = [
+      { path: personaLeasePath, isLegacy: false },
+    ];
+    if (identity.persona === 'default') {
+      leasePaths.push({ path: legacyLeasePath, isLegacy: true });
+    }
+    for (const { path: leasePath, isLegacy } of leasePaths) {
     try {
       if (existsSync(leasePath)) {
         const raw = readFileSync(leasePath, 'utf8');
         const meta = JSON.parse(raw) as { pid?: number; updatedAt?: number; version?: string };
         const holder = Number(meta?.pid);
         const updatedAt = Number(meta?.updatedAt);
-        const peerVersion = typeof meta?.version === 'string' ? meta.version : undefined;
+        // 4.0.0 — A holder of the LEGACY `claude-code.watcher-lock.json`
+        // lease is by construction a pre-4.0.0 build (v4+ always writes
+        // to the persona-keyed lease). If the legacy file lacks a
+        // `version` field (3.7.0 and earlier) we still want the kill
+        // path to fire so we can take over the inbox/claude-code/
+        // delivery surface and finish the rolling upgrade. Synthesize
+        // a placeholder strictly-older version when we can't parse one.
+        const peerVersion = typeof meta?.version === 'string'
+          ? meta.version
+          : (isLegacy ? '3.0.0' : undefined);
         if (
           Number.isInteger(holder)
           && holder > 0
@@ -205,77 +261,19 @@ function compareSemver(a: string, b: string): number | null {
               ? compareSemver(peerVersion, MCP_SERVER_VERSION)
               : null;
             const peerIsOlder = versionCompare !== null && versionCompare < 0;
-            // 3.14.8 — Non-Claude-channel parent gate.
+            // 4.0.0 — The 3.14.8 non-Claude-channel parent gate was
+            // REMOVED here. Its job (preventing openclaw-gateway-spawned
+            // MCP children from killing the user's main CC channel-owner)
+            // is now handled structurally by persona resolution at
+            // module load: non-CC parents without `AGENT_BRIDGE_PERSONA`
+            // end up in tools-only mode and never reach this block.
             //
-            // Bug fixed (2026-05-03 incident, Mac-Mini): openclaw-gateway
-            // spawns MCP children of the agent-bridge plugin as part of its
-            // own auto-update flow. Those children arrived at this Patch F
-            // block with a NEWER on-disk version than the user's main
-            // Claude Code channel-owner — and happily SIGTERM → SIGKILL'd
-            // the active main-CC channel-owner, disconnecting the user's
-            // interactive session.
-            //
-            // The watcher-role demotion in `main()` (line ~810) already
-            // detects "my parent is not Claude Code" via
-            // `parentLooksChannelCapable(parentCommandLine)` and forces us
-            // into tools-only mode — but that runs AFTER the IIFE here,
-            // so the kill happens BEFORE the demotion. Move the same
-            // detection up here, BEFORE we evict-by-version, and refuse
-            // to kill if our parent is not Claude-channel-capable.
-            //
-            // When this gate fires, we fall through into `main()` without
-            // killing AND without entering the standby+retry path.
-            // Main()'s parentLooksChannelCapable check will then run and
-            // demote our role to tools-only as a no-op continuation of
-            // this decision — same end-state as the existing
-            // watcher.role_demoted_non_channel_parent path, just reached
-            // via a different earlier check.
-            //
-            // The `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT=1` opt-out is
-            // honored here for parity with main()'s demotion logic — unit
-            // tests and intentional non-CC channel-owners (rare) can still
-            // exercise the kill path.
-            let skipEvictNonChannelParent = false;
-            if (
-              peerIsOlder
-              && process.env.AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT !== '1'
-            ) {
-              const myParentCmd = readParentCommandLine();
-              if (myParentCmd && !parentLooksChannelCapable(myParentCmd)) {
-                skipEvictNonChannelParent = true;
-                try {
-                  process.stderr.write(
-                    `agent-bridge: refusing to evict peer pid=${holder} v=${peerVersion} `
-                    + `because our parent is not Claude-channel-capable (likely openclaw-gateway / non-CC host); `
-                    + `falling through to tools-only demotion in main()\n`,
-                  );
-                } catch { /* best-effort */ }
-                try {
-                  logEvent({
-                    event: 'auto_update_runner.skip_evict_non_channel_parent',
-                    level: 'info',
-                    msg: 'Skipping Patch F evict-by-version: our parent is not Claude-channel-capable. Will demote self to tools-only in main() and let the existing channel-owner keep its lease.',
-                    context: {
-                      my_pid: process.pid,
-                      my_ppid: process.ppid,
-                      my_parent_comm: myParentCmd,
-                      target_pid: holder,
-                      target_version: peerVersion,
-                      my_version: MCP_SERVER_VERSION,
-                      peer_heartbeat_age_ms: Date.now() - updatedAt,
-                    },
-                  });
-                } catch { /* best-effort */ }
-              }
-            }
-            if (skipEvictNonChannelParent) {
-              // 3.14.8 — Non-Claude-channel parent gate already fired and
-              // logged `auto_update_runner.skip_evict_non_channel_parent`
-              // above. Skip BOTH the kill branch AND the standby branch:
-              // we are about to be demoted to tools-only by main(), so the
-              // existing channel-owner is none of our business. Fall
-              // through to main() with no further Patch F action.
-            } else if (peerIsOlder) {
+            // Reaching this block at all therefore means the operator
+            // EXPLICITLY opted into channel-owner mode (via
+            // `AGENT_BRIDGE_PERSONA`), and they expect the kill path to
+            // fire to force version migration. Re-introducing a parent-
+            // capability check here would silently break that opt-in.
+            if (peerIsOlder) {
               // 3.14.4 — Pre-kill warning event. Logged BEFORE the SIGTERM so
               // post-mortem incident reports (`agent-bridge mcp-incident-report`)
               // can show the exact intent right before the kill, not just the
@@ -446,6 +444,7 @@ function compareSemver(a: string, b: string): number | null {
         });
       } catch { /* best-effort */ }
     }
+    } // end for (lease paths)
   }
 }
 
@@ -646,58 +645,57 @@ process.on('SIGPIPE', () => {
   } catch {}
 });
 
-function readParentCommandLine(): string {
-  // Best-effort diagnostic guard for POSIX hosts. If this fails (for example
-  // on Windows), return an empty string and leave the explicit role alone.
-  try {
-    return execFileSync('ps', ['-p', String(process.ppid), '-o', 'command='], {
-      encoding: 'utf8',
-      timeout: 1000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return '';
-  }
-}
-
-function parentLooksChannelCapable(commandLine: string): boolean {
-  // Claude channel notifications are only delivered to sessions launched with
-  // channel-capable Claude Code hosts. Older experimental builds advertised
-  // that via CLI flags; current Claude Code 2.1.x desktop/VS Code builds expose
-  // it through the MCP handshake instead, so their parent command line no longer
-  // contains a `--channels` flag. Plain MCP/tool sessions may still start this
-  // server from the same plugin manifest but cannot process
-  // notifications/claude/channel. If they win the watcher lease, messages are
-  // marked delivered and then disappear from the intended live channel. Treat
-  // only known Claude Code channel host signatures as channel-capable.
-  return /--channels(?:\s|=|$)/.test(commandLine)
-    || /--dangerously-load-development-channels(?:\s|=|$)/.test(commandLine)
-    || /\/claude\.app\/Contents\/MacOS\/claude(?:\s|$)/i.test(commandLine)
-    || /\/anthropic\.claude-code-[^\s/]+\/resources\/native-binary\/claude(?:\s|$)/i.test(commandLine);
-}
+// 4.0.0 — `readParentCommandLine` and `parentLooksChannelCapable` now
+// live in `persona.ts` so the same helpers can be unit-tested in
+// isolation AND so Patch F's IIFE + `main()` agree on the parent
+// detection algorithm by construction.
 
 async function main(): Promise<void> {
   // Ensure all directories exist
   ensureDirectories();
 
   // Initialize the inbox system (dirs, processed IDs, cache, prune timer)
-  initInbox();
+  // 4.0.0 — pass `isChannelOwner` so tools-only children do not run the
+  // legacy `inbox/claude-code/` → `inbox/claude-code/default/` migration.
+  // That migration is reserved for the legitimate default-persona owner.
+  initInbox({ isChannelOwner: identity.mode === 'channel-owner' });
 
   const localName = getLocalMachineName();
-  // 3.7.0 default flip: this MCP server is now channel-owner by default
-  // again (re-merging the 3.6.0 split). Set AGENT_BRIDGE_ROLE=tools-only
-  // explicitly to opt out — only useful for non-Claude hosts (OpenClaw,
-  // Codex, etc.) that want the bridge_* tools but DO NOT need to own the
-  // inbox watcher.
-  logInfo(
-    `agent-bridge mcp-server starting on "${localName}" `
-    + '(unified plugin: tools + channel watcher) '
-    + '— set AGENT_BRIDGE_ROLE=tools-only to disable the watcher for tools-only hosts',
-  );
+  // 4.0.0 — Identity is resolved at module load (see top of file). Log
+  // a banner that reflects the actual mode/persona so post-mortems do
+  // not have to grep multiple events to figure out what this child is
+  // doing.
+  if (identity.mode === 'channel-owner') {
+    logInfo(
+      `agent-bridge mcp-server starting on "${localName}" `
+      + `(unified plugin: tools + channel watcher) — `
+      + `persona="${identity.persona}" target="${identity.target}" reason=${identity.reason}`,
+    );
+  } else {
+    logInfo(
+      `agent-bridge mcp-server starting on "${localName}" `
+      + `(tools-only mode: no inbox lease, no channel watcher) — `
+      + `reason=${identity.reason}. Set ${AGENT_BRIDGE_PERSONA_ENV}=<persona> to enable channel mode `
+      + `(see README "Personas + Setup").`,
+    );
+  }
   logEvent({
     event: 'server.starting',
     msg: `agent-bridge MCP server starting on "${localName}"`,
-    context: { machineName: localName, version: VERSION, pid: process.pid, nodeVersion: process.version },
+    context: {
+      machineName: localName,
+      version: VERSION,
+      pid: process.pid,
+      nodeVersion: process.version,
+      persona: identity.persona,
+      target: identity.target,
+      mode: identity.mode,
+      identity_reason: identity.reason,
+      raw_persona_env: identity.rawPersonaEnv,
+      // Truncate the parent cmdline to keep the log line bounded; the
+      // diagnostic value is "is it Claude or not" not the full argv.
+      parent_cmdline: identity.parentCommandLine.slice(0, 256),
+    },
   });
 
   // Create MCP server with channel capability + tools capability.
@@ -822,14 +820,14 @@ async function main(): Promise<void> {
       // 3.9.0 [CONSUME-RACE] — toolCallsReceivedCount is incremented by the
       // server.registerTool shim above, BEFORE the handler runs. We do not
       // double-count here (the shim already covers this tool).
-      const leasePath = join(
-        LOCKS_DIR,
-        `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`,
-      );
+      const leaseTarget = identity.target ?? null;
+      const leasePath = leaseTarget
+        ? join(LOCKS_DIR, leaseFileNameForTarget(leaseTarget))
+        : null;
       let lease: Record<string, unknown> | null = null;
       let watcherActive = false;
       try {
-        if (existsSync(leasePath)) {
+        if (leasePath && existsSync(leasePath)) {
           const raw = readFileSync(leasePath, 'utf8');
           const parsed = JSON.parse(raw) as Record<string, unknown>;
           lease = parsed;
@@ -844,6 +842,13 @@ async function main(): Promise<void> {
         uptime_s: Math.floor(process.uptime()),
         version: VERSION,
         machine: localName,
+        // 4.0.0 — surface persona + target so the diagnostic tool can
+        // distinguish two channel-owner Claude Code instances on the
+        // same machine (e.g. `default` vs `yolo`).
+        persona: identity.persona,
+        target: identity.target,
+        mode: identity.mode,
+        identity_reason: identity.reason,
         watcher_active: watcherActive,
         lease,
         tool_boot_time_ms: TOOL_BOOT_TIME_MS,
@@ -857,61 +862,62 @@ async function main(): Promise<void> {
     },
   );
 
-  // Watcher ownership.
-  //
-  // 3.7.0: AGENT_BRIDGE_ROLE defaults to 'channel-owner' (re-merge of the
-  // 3.6.0 split). Setting AGENT_BRIDGE_ROLE=tools-only opts out — only
-  // useful for non-Claude hosts that want bridge_* tools but do NOT want to
-  // contend for the claude-code inbox lease.
+  // 4.0.0 — Watcher ownership is fully driven by the persona resolution
+  // computed at module load. Persona env var set OR cmdline-fallback
+  // matched ⇒ `identity.mode === 'channel-owner'` and we attempt to
+  // claim the lease. Anything else ⇒ tools-only.
   //
   // Lease arbitration (single owner with stale-lock recovery) lives in
-  // watcher.ts:tryAcquireWatcherLease — multiple agent-bridge processes can
-  // start, but only one holds the lease at any moment. Late starters go to
-  // standby and retry every 2 s.
-  const requestedBridgeRole = process.env.AGENT_BRIDGE_ROLE?.trim() || 'channel-owner';
-  const parentCommandLine = readParentCommandLine();
-  let bridgeRole = requestedBridgeRole;
-  if (
-    bridgeRole === 'channel-owner'
-    && process.env.AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT !== '1'
-    && parentCommandLine
-    && !parentLooksChannelCapable(parentCommandLine)
-  ) {
-    logWarn(
-      'AGENT_BRIDGE_ROLE=channel-owner requested, but parent process does not look channel-capable; '
-      + 'demoting this MCP server to tools-only so it cannot steal claude-code inbox delivery.',
-    );
-    logEvent({
-      event: 'watcher.role_demoted_non_channel_parent',
-      level: 'warn',
-      msg: 'Demoted channel-owner to tools-only because parent lacks Claude channel flags',
-      context: {
-        pid: process.pid,
-        parentPid: process.ppid,
-        requestedRole: requestedBridgeRole,
-        parentCommandLine,
-      },
-    });
-    bridgeRole = 'tools-only';
-  }
-  const watcherDisabled =
-    process.env.AGENT_BRIDGE_DISABLE_WATCHER === '1'
-    || bridgeRole === 'tools-only';
+  // watcher.ts:tryAcquireWatcherLease — multiple agent-bridge processes
+  // for the SAME persona can start, but only one holds the lease at any
+  // moment. Late starters go to standby and retry every 2 s. Distinct
+  // personas on the same machine (e.g. `default` vs `yolo`) keep
+  // separate lease files keyed by `claude-code/<persona>` so they never
+  // contend.
+  const bridgeRole = identity.mode; // 'channel-owner' | 'tools-only'
+  const watcherDisabled = bridgeRole === 'tools-only';
   let watcherStarted = false;
   // Track the timestamp of the most recent channel push so signal evidence
   // logging can report how recently the channel was active.
   let lastNotificationAtMs: number | null = null;
 
+  // Emit `watcher.role_demoted_non_channel_parent` for backward
+  // compatibility with existing log dashboards that grep for it. The
+  // condition is now: persona env unset AND cmdline-fallback negative.
+  if (
+    bridgeRole === 'tools-only'
+    && (identity.reason === 'tools_only_no_channel_flag'
+      || identity.reason === 'tools_only_no_parent_cmdline')
+  ) {
+    logWarn(
+      `${AGENT_BRIDGE_PERSONA_ENV} unset and parent process does not look channel-capable; `
+      + 'this MCP child runs in tools-only mode (no inbox lease, no channel watcher). '
+      + 'Set AGENT_BRIDGE_PERSONA=<persona> in your shell alias to enable channel mode.',
+    );
+    logEvent({
+      event: 'watcher.role_demoted_non_channel_parent',
+      level: 'warn',
+      msg: 'Tools-only mode: persona env unset and parent lacks Claude channel flags',
+      context: {
+        pid: process.pid,
+        parentPid: process.ppid,
+        requestedRole: 'channel-owner',
+        parentCommandLine: identity.parentCommandLine,
+        identity_reason: identity.reason,
+      },
+    });
+  }
+
   if (watcherDisabled) {
     logInfo(
-      'Watcher disabled via AGENT_BRIDGE_DISABLE_WATCHER / AGENT_BRIDGE_ROLE=tools-only '
+      `Watcher disabled (tools-only mode, reason=${identity.reason}) `
       + '— this process exposes outbound tools only (no inbox polling, no channel push, no markDelivered).',
     );
     logEvent({
       event: 'watcher.disabled',
       msg: 'Watcher disabled (tools-only mode)',
       context: {
-        reason: bridgeRole === 'tools-only' ? 'role=tools-only' : 'disable_watcher=1',
+        reason: identity.reason,
         pid: process.pid,
       },
     });
@@ -1789,7 +1795,14 @@ async function main(): Promise<void> {
       // current owner" and exit if the lease is now held by a different,
       // alive PID — that strictly proves a sibling has taken over.
       try {
-        const leasePath = join(LOCKS_DIR, `${CLAUDE_CODE_TARGET.replaceAll('/', '__')}.watcher-lock.json`);
+        // 4.0.0 — sibling-takeover detection only matters when WE are
+        // the lease owner; tools-only children skip this branch (they
+        // never set `watcherStarted=true` so the inner guard short-
+        // circuits anyway). Resolve the lease path against our own
+        // identity target so multi-persona installs key on the right
+        // file.
+        if (!identity.target) return;
+        const leasePath = join(LOCKS_DIR, leaseFileNameForTarget(identity.target));
         if (existsSync(leasePath)) {
           const leaseRaw = readFileSync(leasePath, 'utf8');
           const leaseMeta = JSON.parse(leaseRaw) as { pid?: number; updatedAt?: number };

@@ -37,7 +37,8 @@ const config = await import('../build/config.js');
 const inbox = await import('../build/inbox.js');
 const watcher = await import('../build/watcher.js');
 
-const inboxDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code');
+// 4.0.0 — persona-scoped subdir under claude-code/default/.
+const inboxDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default');
 mkdirSync(inboxDir, { recursive: true });
 
 inbox.ensureInboxDirs();

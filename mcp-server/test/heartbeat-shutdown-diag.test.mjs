@@ -37,7 +37,12 @@ function startServer(home, env = {}) {
       USERPROFILE: home,
       AGENT_BRIDGE_MACHINE_NAME: 'test-3-5-2',
       AGENT_BRIDGE_DISABLE_PARENT_CHECK: '1',
-      AGENT_BRIDGE_ROLE: 'tools-only',
+      // 4.0.0 — `AGENT_BRIDGE_ROLE` was removed. Tools-only mode is now
+      // the natural outcome when `AGENT_BRIDGE_PERSONA` is unset AND
+      // the parent cmdline (the test runner) lacks the channel flag.
+      // Explicitly clear `AGENT_BRIDGE_PERSONA` (the test runner may
+      // have it set) so the cmdline-fallback runs.
+      AGENT_BRIDGE_PERSONA: '',
       ...env,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -84,7 +89,7 @@ test('server.shutdown_diag dumps active handles and request counts on shutdown',
     const events = await readEvents(home);
     const starting = events.find((e) => e.event === 'server.starting');
     assert.ok(starting, 'expected server.starting event');
-    assert.equal(starting.context.version, '3.14.9', 'startup event should report version 3.14.9');
+    assert.equal(starting.context.version, '4.0.0', 'startup event should report version 4.0.0');
 
     const diag = events.find((e) => e.event === 'server.shutdown_diag');
     assert.ok(diag, 'expected server.shutdown_diag event on shutdown');
@@ -140,13 +145,21 @@ test('sibling detection wiring is present in shipped build', async () => {
   // If a future refactor moves the lock dir or renames the event, this test
   // will catch the drift before users do.
   const indexSrc = await readFile(indexPath, 'utf8');
+  const configSrc = await readFile(join(__dirname, '..', 'build', 'config.js'), 'utf8');
   assert.ok(
     indexSrc.includes("event: 'sibling.detected'"),
     'sibling detection event must be present in built index.js',
   );
+  // 4.0.0 — sibling detection now uses `leaseFileNameForTarget()` from
+  // config.js to compute the lease path. Assert the helper is wired
+  // and the filename it produces ends in `watcher-lock.json`.
   assert.ok(
-    indexSrc.includes('watcher-lock.json'),
-    'sibling detection must reference the watcher-lock.json filename',
+    indexSrc.includes('leaseFileNameForTarget'),
+    'sibling detection must use leaseFileNameForTarget() (4.0.0)',
+  );
+  assert.ok(
+    configSrc.includes('watcher-lock.json'),
+    'leaseFileNameForTarget must produce a *.watcher-lock.json filename',
   );
   assert.ok(
     indexSrc.includes('SIGKILL'),
@@ -167,14 +180,17 @@ test('3.6.1: channel-owner survives idle stdin and shuts down cleanly on SIGTERM
   // survival and clean SIGTERM-driven shutdown with lease release.
   const home = await mkdtemp(join(tmpdir(), 'agent-bridge-3-6-1-channel-owner-'));
   const server = startServer(home, {
-    AGENT_BRIDGE_ROLE: 'channel-owner',
-    AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT: '1',
+    // 4.0.0 — `AGENT_BRIDGE_ROLE` + `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT`
+    // were removed. Setting `AGENT_BRIDGE_PERSONA=default` puts this
+    // child into channel-owner mode regardless of parent cmdline.
+    AGENT_BRIDGE_PERSONA: 'default',
     // Patch G ignores SIGTERM when parent is alive; in unit tests the test
     // runner IS the parent, so SIGTERM would be ignored. Disable Patch G
     // so the SIGTERM-driven shutdown path can be exercised here.
     AGENT_BRIDGE_DISABLE_PATCH_G: '1',
   });
-  const lockPath = join(home, '.agent-bridge', 'locks', 'claude-code.watcher-lock.json');
+  // 4.0.0 — lease key is `claude-code__<persona>.watcher-lock.json`.
+  const lockPath = join(home, '.agent-bridge', 'locks', 'claude-code__default.watcher-lock.json');
   try {
     await sleep(800);
     assert.ok(await readFile(lockPath, 'utf8'), 'channel-owner should acquire watcher lease');

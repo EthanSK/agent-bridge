@@ -32,7 +32,10 @@ test('stderr tee creates a durable file with at least the startup banner', { tim
       AGENT_BRIDGE_MACHINE_NAME: 'test-3-5-5-stderr',
       AGENT_BRIDGE_DISABLE_PARENT_CHECK: '1',
       AGENT_BRIDGE_DISABLE_ORPHAN_WATCHDOG: '1',
-      AGENT_BRIDGE_ROLE: 'tools-only',
+      // 4.0.0 — `AGENT_BRIDGE_ROLE` was removed. Tools-only mode is
+      // the natural outcome when `AGENT_BRIDGE_PERSONA` is unset AND
+      // the parent cmdline (the test runner) lacks the channel flag.
+      AGENT_BRIDGE_PERSONA: '',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });

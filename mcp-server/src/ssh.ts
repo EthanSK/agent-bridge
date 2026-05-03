@@ -54,7 +54,7 @@ function openSshChildEnv(): NodeJS.ProcessEnv {
   if (process.platform === 'win32') {
     // Windows OpenSSH reads ProgramData very early while locating global SSH
     // config/host-key state. Some MCP hosts launch servers with an intentionally
-    // minimal env (for example only AGENT_BRIDGE_ROLE=tools-only); in that shape
+    // minimal env (for example only AGENT_BRIDGE_PERSONA=default); in that shape
     // ssh.exe/sftp.exe can exit 255 with empty stderr even though the network,
     // key, and command are fine. Supplying the standard Windows default makes
     // bridge_status / bridge_run_command / SFTP delivery independent of host env

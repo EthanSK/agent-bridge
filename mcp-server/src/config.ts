@@ -9,13 +9,50 @@ import { homedir, hostname } from 'os';
 import { basename, join } from 'path';
 
 /**
- * 3.7.1 — semver string for the agent-bridge MCP server build. Single source
+ * 4.0.0 — semver string for the agent-bridge MCP server build. Single source
  * of truth shared between `index.ts` (server.version + status tool) and
  * `watcher.ts` (lease file `version` field used by Patch F's stale-version
  * peer-kill path). Bump this in lockstep with `package.json`,
  * `.claude-plugin/plugin.json`, and the bash CLI's VERSION constant.
+ *
+ * 4.0.0 (breaking) — persona-based multi-session inbox routing. The
+ * `inbox/claude-code/` singleton is now `inbox/claude-code/<persona>/`.
+ * Senders that still address `target=claude-code` are routed to the
+ * `default` persona's subdir on the receiver side. Multiple Claude Code
+ * sessions on the same machine can now coexist via distinct
+ * `AGENT_BRIDGE_PERSONA` values without racing for one shared inbox.
+ * `AGENT_BRIDGE_ROLE`, `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT`, and
+ * `AGENT_BRIDGE_DISABLE_WATCHER` were removed in 4.0.0; persona +
+ * cmdline-fallback fully supersede them.
  */
-export const MCP_SERVER_VERSION = '3.14.9';
+export const MCP_SERVER_VERSION = '4.0.0';
+
+/**
+ * 4.0.0 — persona env var that identifies this Claude Code instance for
+ * inbox routing. Set this in your shell alias / `.zshrc` next to the
+ * `--channels plugin:agent-bridge` flag, e.g.:
+ *
+ *   alias claude='AGENT_BRIDGE_PERSONA=default claude'
+ *   alias claude-yolo='AGENT_BRIDGE_PERSONA=yolo claude'
+ *
+ * When unset and the parent process command line includes
+ * `--channels plugin:agent-bridge` (or
+ * `--dangerously-load-development-channels plugin:agent-bridge`), the
+ * MCP child falls back to persona `default`. When unset and no channel
+ * flag is present, the MCP child runs in tools-only mode (no inbox
+ * lease attempt, no watcher).
+ */
+export const AGENT_BRIDGE_PERSONA_ENV = 'AGENT_BRIDGE_PERSONA';
+
+/**
+ * Default persona used when:
+ *   - `AGENT_BRIDGE_PERSONA` is unset AND the cmdline-fallback positively
+ *     matches a Claude Code channel-capable parent, OR
+ *   - A sender addresses the legacy `target=claude-code` (no slash) and
+ *     the receiver routes to the default persona for backward
+ *     compatibility with pre-4.0.0 senders.
+ */
+export const DEFAULT_PERSONA = 'default';
 
 export const BRIDGE_DIR = join(homedir(), '.agent-bridge');
 export const CONFIG_FILE = join(BRIDGE_DIR, 'config');
@@ -44,17 +81,44 @@ export const DELIVERED_FILE = join(INBOX_DIR, '.delivered');
 
 /**
  * Per-harness/per-target subdir under INBOX_DIR. Example targets:
- *   "claude-code"            — Claude Code's built-in channel plugin watches this
+ *   "claude-code"            — legacy alias for the default persona's inbox
+ *                              (backward-compat for pre-4.0.0 senders;
+ *                              receiver routes it to claude-code/default/)
+ *   "claude-code/default"    — Claude Code's default persona inbox (4.0.0+)
+ *   "claude-code/yolo"       — Claude Code's "yolo" persona inbox
  *   "openclaw/default"       — OpenClaw @ClawdStationMiniBot
  *   "openclaw/clawdiboi2"    — OpenClaw @Clawdiboi2bot
  *   "openclaw/clordlethird"  — OpenClaw @ClordLeThirdBot
  *
- * The MCP server (this repo) is concerned only with the `claude-code` branch;
- * the openclaw-channel plugin owns the `openclaw/*` branch. The target field
- * on a BridgeMessage is free-form so third-party harnesses can register their
- * own subdirs without a code change here.
+ * The MCP server (this repo) is concerned only with the `claude-code/<persona>`
+ * branch; the openclaw-channel plugin owns the `openclaw/*` branch. The
+ * target field on a BridgeMessage is free-form so third-party harnesses can
+ * register their own subdirs without a code change here.
+ *
+ * 4.0.0 — `CLAUDE_CODE_TARGET` is the legacy *prefix* (still useful as the
+ * harness identifier in target strings). For inbox routing always use
+ * `claudeCodeTargetForPersona(persona)`.
  */
 export const CLAUDE_CODE_TARGET = 'claude-code';
+
+/**
+ * 4.0.0 — Compose the persona-scoped Claude Code target string used for
+ * inbox subdir routing and lease keying. e.g. persona="default" →
+ * "claude-code/default", persona="yolo" → "claude-code/yolo".
+ */
+export function claudeCodeTargetForPersona(persona: string): string {
+  return `${CLAUDE_CODE_TARGET}/${persona}`;
+}
+
+/**
+ * 4.0.0 — Lease key for a given target. Slashes are folded to `__` so the
+ * resulting filename is a single path segment under `LOCKS_DIR`. Keeping
+ * the function in `config.ts` so both `index.ts` (Patch F lease lookup)
+ * and `watcher.ts` (`tryAcquireWatcherLease`) compute the same path.
+ */
+export function leaseFileNameForTarget(target: string): string {
+  return `${target.replaceAll('/', '__')}.watcher-lock.json`;
+}
 
 /** Per-target inbox subdir. */
 export function inboxSubdir(target: string): string {
@@ -152,6 +216,12 @@ export interface MachineConfig {
  * Ensure all required directories exist.
  */
 export function ensureDirectories(): void {
+  // 4.0.0 — we no longer pre-create the persona-scoped Claude Code subdirs
+  // here. The watcher/inbox layers create `inbox/claude-code/<persona>/`
+  // (and the archive/failed/pending-ack siblings) lazily when they know
+  // their persona. Pre-creating `inbox/claude-code/` itself is still
+  // useful so the legacy-migration scan in `inbox.ts` finds an existing
+  // directory rather than ENOENT.
   for (const dir of [
     BRIDGE_DIR,
     INBOX_DIR,
@@ -164,9 +234,6 @@ export function ensureDirectories(): void {
     PENDING_ACK_DIR,
     EXHAUSTED_DIR,
     inboxSubdir(CLAUDE_CODE_TARGET),
-    archiveSubdir(CLAUDE_CODE_TARGET),
-    failedSubdir(CLAUDE_CODE_TARGET),
-    pendingAckSubdir(CLAUDE_CODE_TARGET),
   ]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true, mode: 0o700 });

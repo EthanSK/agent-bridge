@@ -32,6 +32,7 @@ import {
   peekInbox,
   clearInbox,
   getInboxStats,
+  getActiveClaudeCodeTargetOrDefault,
 } from './inbox.js';
 import { subscribeToInboxArrival } from './watcher.js';
 import { logInfo, logError } from './logger.js';
@@ -207,7 +208,8 @@ export function registerTools(server: McpServer): void {
       title: 'Send Message',
       description:
         'Send a message to a running agent on another machine, OR to a same-machine target. Cross-machine sends go via SSH; same-machine sends write directly to the local inbox (no SSH). The receiver picks up the message via their per-target inbox subdir:\n'
-        + '  • target="claude-code"                 — Claude Code channel plugin (default for cross-machine Claude ↔ Claude)\n'
+        + '  • target="claude-code/default"         — Claude Code channel plugin (default persona; pre-4.0.0 senders may still address "claude-code" and the receiver routes it to "claude-code/default")\n'
+        + '  • target="claude-code/<persona>"       — Claude Code channel plugin for a non-default persona (4.0.0+ multi-session support, e.g. "claude-code/yolo")\n'
         + '  • target="openclaw/default"            — example: an OpenClaw running Telegram session (the "default" account)\n'
         + '  • target="<harness>/<account-alias>"   — any other configured harness/per-account session, e.g. "openclaw/<your-account-alias>"\n\n'
         + 'Named-target routing rule: when the user names a specific target alias (a persona, a session, a per-account bot, etc.), match the alias LITERALLY — do NOT silently default to "<harness>/default" when a specific alias was named. Voice transcripts often mis-hear short proper-noun aliases; re-read the source twice if a specific name was mentioned. Canonical rule + rationale: docs/named-target-routing.md.\n\n'
@@ -215,7 +217,7 @@ export function registerTools(server: McpServer): void {
         + 'The `machine` parameter accepts either a paired remote machine name OR the local machine name (or one of the aliases "local", "self", "localhost"). Same-machine delivery is first-class (3.5.0+): the message JSON is written directly to ~/.agent-bridge/inbox/<target>/<id>.json with no SSH hop. Useful for routing to embedded agents (e.g. target="<harness>/<account-alias>") on the same host.\n\n'
         + 'The target field is REQUIRED as of agent-bridge 3.4.0 — there is intentionally no default delivery routing. '
         + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup. '
-        + '`from_target` / `fromTarget` defaults to `claude-code` for normal Claude Code sends so the remote agent can reply over agent-bridge. '
+        + '`from_target` / `fromTarget` defaults to `claude-code/<persona>` (the active persona of THIS Claude Code session) for normal Claude Code sends so the remote agent can reply back into THIS session\'s inbox subdir. Falls back to the legacy `claude-code` literal in tools-only mode (no persona resolved). '
         + 'Set `one_way=true` only when you intentionally do not want a bridge reply path.',
       inputSchema: {
         machine: z
@@ -227,13 +229,13 @@ export function registerTools(server: McpServer): void {
         target: z
           .string()
           .describe(
-            'Required. Slash-delimited routing target, e.g. "claude-code", "<harness>/<account-alias>" (such as "openclaw/default"). Determines which inbox subdir on the remote the message lands in, and which listener picks it up.',
+            'Required. Slash-delimited routing target, e.g. "claude-code/default", "claude-code/<persona>", "<harness>/<account-alias>" (such as "openclaw/default"). Determines which inbox subdir on the remote the message lands in, and which listener picks it up. Senders may still use the legacy "claude-code" literal — the receiver routes it to "claude-code/default" for backward compatibility.',
           ),
         from_target: z
           .string()
           .optional()
           .describe(
-            'Sender-side reply target for round-trip routing. Defaults to `claude-code` for Claude Code sends. Set explicitly when sending from another local target such as `<harness>/<account-alias>`.',
+            'Sender-side reply target for round-trip routing. Defaults to the active `claude-code/<persona>` for Claude Code sends (so replies land back in THIS session). Set explicitly when sending from another local target such as `<harness>/<account-alias>`.',
           ),
         fromTarget: z
           .string()
@@ -330,7 +332,16 @@ export function registerTools(server: McpServer): void {
         };
       }
       if (!resolvedFromTarget && !one_way) {
-        resolvedFromTarget = CLAUDE_CODE_TARGET;
+        // 4.0.0 — Default the sender's return-target to a persona-scoped
+        // target ("claude-code/<persona>") rather than the legacy
+        // `claude-code` literal. The reply lands back in the active
+        // persona's inbox subdir on the receiver. Tools-only children
+        // (no persona bound, `getActiveClaudeCodeTarget()` returns null)
+        // fall back to `claude-code/default` so the response we send to
+        // the caller MATCHES the on-disk `fromTarget` after `sendMessage`
+        // applies its CLAUDE_CODE_TARGET → claude-code/default rewrite —
+        // we apply the same rewrite up front to avoid disagreement.
+        resolvedFromTarget = getActiveClaudeCodeTargetOrDefault();
       }
       if (resolvedFromTarget && !isValidTarget(resolvedFromTarget)) {
         return {
