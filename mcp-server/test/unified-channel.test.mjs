@@ -102,10 +102,10 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant — 3.14.8, sourced from config.ts
+  // Version constant — 3.14.9, sourced from config.ts
   assert.ok(
-    /MCP_SERVER_VERSION\s*=\s*['"]3\.14\.8['"]/.test(configSrc),
-    'MCP_SERVER_VERSION must be 3.14.8 in config.ts',
+    /MCP_SERVER_VERSION\s*=\s*['"]3\.14\.9['"]/.test(configSrc),
+    'MCP_SERVER_VERSION must be 3.14.9 in config.ts',
   );
   assert.ok(
     indexSrc.includes('/claude\\.app\\/Contents\\/MacOS\\/claude'),
@@ -133,7 +133,7 @@ test('Patch F (3.7.1): server stays in standby when a same-version healthy peer 
     token: `${process.pid}-fake-${Math.random().toString(36).slice(2, 10)}`,
     startedAt: Date.now(),
     updatedAt: Date.now(),
-    version: '3.14.8', // same version as our build → no kill
+    version: '3.14.9', // same version as our build → no kill
   };
   await writeFile(lockPath, JSON.stringify(fakeLease, null, 2));
 
@@ -289,7 +289,7 @@ test('Patch F (3.7.1): SIGTERMs and replaces a peer with an older version', { ti
       const killEvent = events.find((e) => e.event === 'patch_f.peer_version_kill');
       assert.ok(killEvent, 'expected patch_f.peer_version_kill event for stale-version peer');
       assert.equal(killEvent.context.peer_version, '3.6.0', 'peer_version logged');
-      assert.equal(killEvent.context.our_version, '3.14.8', 'our_version logged');
+      assert.equal(killEvent.context.our_version, '3.14.9', 'our_version logged');
       assert.equal(killEvent.context.peer_pid, peer.pid, 'peer_pid logged');
     } finally {
       try { child.kill('SIGTERM'); } catch {}
@@ -343,7 +343,7 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
       token: `${peer.pid}-old-${Math.random().toString(36).slice(2, 10)}`,
       startedAt: Date.now(),
       updatedAt: Date.now(),
-      version: '3.6.0', // strictly older than our 3.14.8 build
+      version: '3.6.0', // strictly older than our 3.14.9 build
     };
     await writeFile(lockPath, JSON.stringify(peerLease, null, 2));
 
@@ -396,7 +396,7 @@ test('Patch F (3.14.8): refuses to evict older-version peer when our parent is n
       assert.equal(skipEvent.level, 'info', 'skip event is INFO level');
       assert.equal(skipEvent.context.target_pid, peer.pid, 'target_pid (older peer) logged');
       assert.equal(skipEvent.context.target_version, '3.6.0', 'target_version logged');
-      assert.equal(skipEvent.context.my_version, '3.14.8', 'my_version logged');
+      assert.equal(skipEvent.context.my_version, '3.14.9', 'my_version logged');
       assert.equal(typeof skipEvent.context.my_ppid, 'number', 'my_ppid logged');
       assert.equal(typeof skipEvent.context.my_parent_comm, 'string', 'my_parent_comm logged');
       assert.equal(typeof skipEvent.context.peer_heartbeat_age_ms, 'number', 'peer_heartbeat_age_ms logged');
@@ -614,7 +614,7 @@ test('Patch H: tools/list reports claude_code_channel_status; tools/call returns
     assert.equal(typeof parsed.pid, 'number', 'status.pid is a number');
     assert.equal(parsed.pid, child.pid, 'status.pid matches the plugin child pid');
     assert.equal(typeof parsed.uptime_s, 'number', 'status.uptime_s is a number');
-    assert.equal(parsed.version, '3.14.8', 'status.version is 3.14.8');
+    assert.equal(parsed.version, '3.14.9', 'status.version is 3.14.9');
     assert.equal(typeof parsed.machine, 'string', 'status.machine is a string');
     assert.equal(parsed.machine, 'test-patch-h', 'status.machine reflects env override');
     assert.equal(typeof parsed.watcher_active, 'boolean', 'status.watcher_active is boolean');
@@ -742,7 +742,7 @@ test('3.14.4: kill_will_evict_active_session fires before peer_version_kill', { 
       token: `${peer.pid}-old-${Math.random().toString(36).slice(2, 10)}`,
       startedAt: Date.now(),
       updatedAt: Date.now(), // fresh heartbeat — would_orphan_this_session=true
-      version: '3.6.0', // older than 3.14.8
+      version: '3.6.0', // older than 3.14.9
     };
     await writeFile(lockPath, JSON.stringify(peerLease, null, 2));
 
@@ -761,7 +761,7 @@ test('3.14.4: kill_will_evict_active_session fires before peer_version_kill', { 
       assert.ok(preKill, 'expected auto_update_runner.kill_will_evict_active_session event before peer kill');
       assert.equal(preKill.context.peer_pid, peer.pid, 'peer_pid logged in pre-kill warning');
       assert.equal(preKill.context.peer_version, '3.6.0', 'peer_version logged');
-      assert.equal(preKill.context.our_version, '3.14.8', 'our_version logged');
+      assert.equal(preKill.context.our_version, '3.14.9', 'our_version logged');
       assert.equal(preKill.context.would_orphan_this_session, true, 'fresh heartbeat → would_orphan_this_session=true');
       assert.ok(typeof preKill.context.human_summary === 'string', 'human_summary string present');
       assert.ok(preKill.context.human_summary.includes('disconnect'), 'human_summary mentions disconnect risk');
@@ -811,7 +811,7 @@ test('3.14.4: epitaph fires on SIGTERM-initiated shutdown', { timeout: 10_000 },
     const events = await readEvents(home);
     const epitaph = events.find((e) => e.event === 'auto_update_runner.epitaph');
     assert.ok(epitaph, 'expected auto_update_runner.epitaph event after SIGTERM-initiated shutdown');
-    assert.equal(epitaph.context.version, '3.14.8', 'epitaph carries our version');
+    assert.equal(epitaph.context.version, '3.14.9', 'epitaph carries our version');
     assert.ok(
       typeof epitaph.context.kill_reason === 'string' && epitaph.context.kill_reason.length > 0,
       'epitaph carries a kill_reason string',

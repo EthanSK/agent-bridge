@@ -1,5 +1,16 @@
 # Changelog
 
+## agent-bridge 3.14.9 — 2026-05-03
+
+### Trim docs/named-target-routing.md to single fuzzy-similarity principle
+
+Per upstream feedback that simpler is better here. The 3.14.7 generalized doc still carried multiple sub-principles (literal-match rule, voice-transcript guidance, format table, "why this matters" rationale, examples, where-this-rule-lives). Reduced to one principle: **fuzzy-similarity matching by target name** — substring containment, edit distance, phonetic similarity. Voice-transcript re-read note retained (one sentence). Default-fallback applies only when no reasonable similarity match exists.
+
+- **`docs/named-target-routing.md`** — rewritten from 70 lines to 17. Single principle, three illustrative routing examples, no harness-specific format table, no rationale section, no cross-surface bookkeeping list.
+- **No README / AGENTS.md / tools.ts edits** — the existing summary-blurbs in those surfaces describe the same principle and the link path didn't change.
+- **Version bumps** — `mcp-server/package.json` + `mcp-server/package-lock.json`, `MCP_SERVER_VERSION` in `config.ts`, `mcp-server/.claude-plugin/plugin.json`, the bash CLI VERSION, and in-test version-equality assertions all bump 3.14.8 → 3.14.9.
+- **No behavior change**, no code change beyond version constants — pure documentation editing.
+
 ## agent-bridge 3.14.8 — 2026-05-03
 
 ### Fix Patch F evict-by-version when MCP child's parent is non-Claude-channel (e.g. openclaw-gateway)
