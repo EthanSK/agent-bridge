@@ -1,7 +1,7 @@
 {
   "name": "@agent-bridge/openclaw-channel",
-  "version": "2.4.1",
-  "description": "First-class OpenClaw channel plugin for agent-bridge. Registers `agent-bridge` as a native channel (same tier as telegram) via the plugin-sdk registerChannel API, with per-target replyVia routing so replies can go back over Telegram (phone ping) or over the agent-bridge back-channel (silent peer-to-peer).",
+  "version": "3.0.0",
+  "description": "First-class OpenClaw channel plugin for agent-bridge. Registers `agent-bridge` as a native channel (same tier as telegram) via the plugin-sdk registerChannel API. v3.0+: agent-driven reply routing — inbound bridge messages are surfaced into the OC agent session with a BRIDGE-CONTEXT block, and the agent decides which reply tools to call (bridge_send_message for the implicit bridge leg, telegram_reply / etc. for user-facing legs). Unifies behavior with the Claude Code channel.",
   "type": "module",
   "main": "./src/index.js",
   "openclaw": {

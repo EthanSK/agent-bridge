@@ -7,6 +7,131 @@ built-in Telegram / Slack / iMessage channels — so cross-machine messages
 flow through OpenClaw's normal inbound/outbound pipelines instead of the
 v1.3.0 hack that shelled out to `openclaw agent --to ...` per message.
 
+## Reply routing in v3.0+
+
+**Architectural pivot (2026-05-04, voice 2096):** the plugin no longer
+auto-fans-out the agent's reply across multiple outbound channels. Instead
+it surfaces the inbound bridge message into the running OC agent's session
+and lets tool calls drive the actual reply legs. This unifies the OC
+behavior with the Claude Code channel: both surface inbound messages and
+trust the agent to pick the right tools.
+
+### Mental model
+
+When a bridge message lands at an OC target, the plugin:
+
+1. Picks ONE primary session to inject into (Telegram if the user wants the
+   reply to go to their phone, else the silent agent-bridge back-channel).
+2. Builds a synthetic inbound `ctxPayload` whose body is:
+   - the original message wrapped in `<channel source="agent-bridge" ...>`
+   - followed by a compact `[BRIDGE-CONTEXT]` block listing `from_target`,
+     `bridge_reply_target`, `primary_user_channel`, and
+     `additional_user_channels`.
+3. Runs ONE agent turn via `dispatchInboundReplyWithBase`. The agent's
+   natural turn output flows through the primary session-bound outbound
+   (e.g. straight into the Telegram chat the user reads).
+4. Trusts the agent to ALSO call `bridge_send_message` to reply over the
+   bridge to `from_target` (the implicit bridge leg, expected when
+   `from_target` is set).
+
+There is no `deliver` fan-out anymore. The agent is in control.
+
+### `additionalReplyChannels` config
+
+Configure which user-facing channel(s) the agent should be HINTED about in
+the `[BRIDGE-CONTEXT]` block. Default policy:
+
+- Target with `openclaw_channel: "telegram"` → `["telegram"]`.
+- Headless target (`openclaw_channel: "agent-bridge"`) → `[]`.
+
+Override at any of three levels (highest first):
+
+```jsonc
+// ~/.openclaw/openclaw.json
+{
+  "channels": {
+    "agent-bridge": {
+      "config": {
+        "additionalReplyChannels": ["telegram"],   // plugin-level
+        "targets": {
+          "default": {
+            "additionalReplyChannels": ["telegram"] // per-target
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Per-message override is also supported via the BridgeMessage JSON itself
+(`additionalReplyChannels` field on the wire).
+
+Special string sentinels accepted at any level:
+- `"none"` / `"silent"` / `"off"` — quiet mode (no user-facing leg suggested).
+- `"default"` — fall through to the next precedence level.
+
+The plugin does NOT mechanically fan out the reply. It only tells the agent
+in the prompt-context which user-facing channels are configured. The agent
+decides what to actually do with that hint.
+
+### Migrating from `replyVia` (≤ v2.4.x)
+
+The old per-target / plugin-level / per-message `replyVia` config field is
+no longer interpreted as of v3.0.0. The plugin emits a single deprecation
+warning at register-time listing every offending key, and proceeds without
+crashing.
+
+Migration is config-only:
+
+```jsonc
+// before (≤ v2.4.x)
+{
+  "replyVia": "telegram"            // or "agent-bridge", or an array
+}
+
+// after (v3.0+)
+{
+  "additionalReplyChannels": ["telegram"]   // or [] for quiet mode
+}
+```
+
+> ⚠️ **Bridge-only targets need an explicit `openclaw_channel`.** If a v2 target
+> was previously valid with `replyVia: "agent-bridge"` and NO `peer_id` (peer
+> derived from the sender at message time), you MUST also add
+> `"openclaw_channel": "agent-bridge"` to that target on upgrade. v3.0 ignores
+> `replyVia`, so the only signal that survives is `openclaw_channel`. Without
+> it, the upgrade defaults to `"telegram"` and the missing `peer_id` causes
+> the target to be skipped at startup. Targets that already had a `peer_id` are
+> not affected.
+
+Quick jq recipe — preserves bridge-only targets by stamping
+`openclaw_channel: "agent-bridge"` on any target that lacks both `peer_id`
+AND `openclaw_channel` (this is the v2 bridge-only shape) BEFORE deleting
+`replyVia`:
+
+```bash
+jq '
+  # 1. Promote bridge-only targets so they keep working after replyVia deletion.
+  (.channels["agent-bridge"].config.targets // {}) |= with_entries(
+    if (.value.peer_id // empty | not) and (.value.openclaw_channel // empty | not)
+    then .value.openclaw_channel = "agent-bridge"
+    else .
+    end
+  )
+  # 2. Drop the deprecated replyVia keys.
+  | del(.channels["agent-bridge"].config.replyVia)
+  | (.channels["agent-bridge"].config.targets // {}) |= with_entries(.value |= del(.replyVia))
+' ~/.openclaw/openclaw.json > /tmp/openclaw.json && mv /tmp/openclaw.json ~/.openclaw/openclaw.json
+```
+
+Then restart OpenClaw on the affected machine so the new code loads. Watch
+the openclaw log for the deprecation warning + any `target "..." missing
+peer_id` warnings — those flag bridge-only targets that need
+`openclaw_channel: "agent-bridge"` added (the recipe above handles them
+automatically; warnings would only fire if a target has a non-bridge-only
+shape without a peer_id).
+
 ## What's new in v2.4.1
 
 - **Telegram-visible Agent Bridge relay receipts.** Every inbound bridge message to an OpenClaw target now sends a short best-effort notice to the configured chat before the agent turn runs. The notice starts with `[Agent Bridge relay] 🛰️`, then shows `from/fromTarget → target`, reply path, message id, and a compact preview. This restores the old “I can see another harness messaged this OpenClaw” affordance even when the actual agent reply uses the silent `replyVia: "agent-bridge"` back-channel.

@@ -1,83 +1,79 @@
 /**
  * OpenClaw plugin entry point for @agent-bridge/openclaw-channel.
  *
- * Multi-channel replyVia + implicit bridge fallback (2026-05-04)
- * ---------------------------------------------------------------
- * `replyVia` may now be a STRING (single channel — backward-compatible)
- * or an ARRAY of strings (fan out to multiple reply channels per inbound).
- * Independently, any inbound carrying `msg.fromTarget` (i.e. arrived via
- * agent-bridge) implicitly appends `"agent-bridge"` to the resolved list,
- * deduplicated. Combined effect: agent-to-agent threads always reply over
- * the bridge regardless of how the target's replyVia is configured, and
- * explicit fan-out (e.g. `["telegram", "agent-bridge"]`) lets Ethan see
- * a Telegram echo while also keeping the silent peer-to-peer back-channel
- * alive. See `resolveReplyChannels` for full precedence + dedup rules.
+ * Agent-driven reply routing (v3.0 of openclaw-channel — 2026-05-04)
+ * -------------------------------------------------------------------
+ * **Architectural pivot:** the plugin no longer auto-fans-out the agent's
+ * reply across multiple OUTBOUND channels. Instead it:
  *
- * v2.3.1 — sender-derived replyVia default (2026-04-21)
- * ------------------------------------------------------
- * The replyVia fallback no longer hardcodes "telegram" when nothing else is
- * configured. Instead it mirrors the arrival channel: if `msg.fromTarget`
- * is present (stamped by agent-bridge outbound senders as e.g.
- * "claude-code" or "openclaw/<acct>") the message arrived via agent-bridge,
- * so the reply goes back via agent-bridge. Otherwise fall back to
- * "telegram". This gives "reply on the channel it came in on" semantics
- * with zero config. Explicit per-message / per-target / plugin-level
- * settings still win — see precedence block at the resolution site.
+ *   1. Surfaces the inbound bridge message to the OC agent inside the
+ *      session bound to the user-facing channel (typically Telegram). The
+ *      synthetic ctxPayload's body includes a structured BRIDGE-CONTEXT
+ *      block listing `from_target`, the recommended bridge-reply target,
+ *      the configured user-facing channel, and the additionalReplyChannels
+ *      hint.
+ *   2. Runs ONE agent turn via `dispatchInboundReplyWithBase`. The agent's
+ *      natural turn output flows through the primary session-bound outbound
+ *      adapter — i.e. straight into the configured Telegram chat the user
+ *      reads. No `deliver` fan-out anymore.
+ *   3. Trusts the agent to reply to the originating bridge peer EXPLICITLY
+ *      via the `bridge_send_message` MCP tool, using the `from_target` we
+ *      surfaced. The agent decides whether to also send a `telegram_reply`
+ *      (or whatever user-facing reply tool the harness exposes), based on
+ *      the `additionalReplyChannels` hint.
  *
- * v2.3.0 — replyVia mode (2026-04-20)
- * ------------------------------------
- * Inbound bridge messages can now be dispatched into EITHER of two session
- * topologies depending on `target.replyVia` (or the plugin-level default):
+ * This unifies the OC behavior with the Claude Code channel: both surface
+ * inbound messages to the running agent and let the agent's tool calls drive
+ * the actual reply legs. No more harness-specific auto-routing logic.
  *
- *   replyVia: "telegram" — the original v2.2.x behaviour. Inbound message
- *     injects into `agent:main:telegram:<account>:direct:<peerId>` with
- *     Provider/OriginatingChannel=telegram, so the agent's reply flows
- *     back through the live Telegram outbound and Ethan's phone pings.
+ * Config (per-target OR plugin-level):
  *
- *   replyVia: "agent-bridge" — peer-to-peer back-channel. Inbound message
- *     injects into an `agent-bridge` session whose peer id encodes both
- *     `<senderMachine>` and the sender's `<fromTarget>`
- *     with Provider/OriginatingChannel=agent-bridge, so the agent's reply
- *     flows back through the NATIVE agent-bridge channel (channel-plugin.js
- *     :: sendText), which SFTP-delivers a BridgeMessage to the sender machine. No
- *     Telegram traffic is generated. Use for agent-to-agent conversations
- *     that should be invisible to Ethan's phone.
+ *   `additionalReplyChannels: ["telegram"]`
+ *     Hint to the agent about which user-facing channel(s) it should ALSO
+ *     send a reply through, in addition to the implicit bridge reply to
+ *     `from_target`. Default: `["telegram"]` for any target whose
+ *     `openclaw_channel` is `"telegram"` (i.e. the user already has Telegram
+ *     wired up to that account); `[]` for headless targets. The plugin does
+ *     NOT mechanically fan out the reply — it ONLY tells the agent in the
+ *     prompt-context which user-facing channels are configured. The agent
+ *     remains in control.
  *
- *   Precedence: per-message `msg.replyVia` > per-target override >
- *   plugin-level `replyVia` > sender-derived (agent-bridge if fromTarget
- *   present, else telegram). Per-message override lets an inbound
- *   BridgeMessage flip the mode without reconfiguring the target — useful
- *   for quick back-channel probes.
+ *   `additionalReplyChannels: []`
+ *     Quiet mode. Inbound bridge turn surfaces fromTarget but no
+ *     user-facing channel is suggested.
  *
- * v2.2.0 — Architectural correction (2026-04-20)
- * ------------------------------------------------
- * STOP using `enqueueSystemEvent`. It's pure queueing: it prepends a
- * `System:` line to the NEXT naturally-scheduled turn's prompt but does NOT
- * trigger an agent turn. See full analysis in
- * `docs/ACTUAL-SESSION-INJECTION-RESEARCH-2026-04-20.md` §4. This means
- * every bridge message injected via the v2.1.x path was silently swallowed
- * unless Ethan happened to then DM the real Telegram bot (at which point
- * our queued text appeared as a `System: ...` line on THAT unrelated turn
- * — wrong semantic).
+ *   `additionalReplyChannels: ["telegram", "discord"]`
+ *     The agent sees both as suggested user-facing legs. It can call each
+ *     channel's reply tool independently if those tools are registered.
  *
- * v2.2.0 instead uses `dispatchInboundReplyWithBase` from
- * `openclaw/plugin-sdk/compat`, which is the SAME dispatch primitive the
- * native IRC and Nextcloud Talk channel plugins use, and which drives the
- * same `dispatchReplyFromConfig` path the native telegram bot drives.
- * This actually runs a synchronous agent turn for our synthetic
- * ctxPayload, and replies are routed back through the originating channel
- * because we set `Provider` + `OriginatingChannel` + `OriginatingTo` on
- * the ctxPayload (see `route-reply-CQe8rYFT.js:17-23` docstring re:
- * originating-channel priority).
+ * Bridge reply to `from_target` is IMPLICIT and ALWAYS expected when the
+ * inbound carries `from_target`. The agent is reminded of this in the
+ * prompt-context — and the `agent-bridge` channel-plugin outbound adapter
+ * (channel-plugin.js :: sendText) is still wired up so explicit
+ * `bridge_send_message` tool calls can SFTP-deliver replies back.
  *
- * References:
- * - Dispatch primitive source: `plugin-sdk/inbound-reply-dispatch-0KQ4b86b.js:29-65`
- * - IRC reference impl: `extensions/irc/src/inbound.ts:278-362`
- * - sessionKey shape (for dmScope=per-account-channel-peer):
- *   `agent:main:<channel>:<account>:direct:<peerId>`
- *   (built automatically by `runtime.channel.routing.resolveAgentRoute`
- *   via `plugin-sdk/session-key-CbP51u9x.js:175` — do NOT hand-build it;
- *   Ethan's live dmScope setting might change)
+ * Migration from `replyVia` (≤ v2.4.x):
+ *   - `replyVia: "agent-bridge"` configs trigger a deprecation warning at
+ *     load time. The plugin no longer interprets the field. Migrate by
+ *     deleting the `replyVia` key. The agent now decides at turn time
+ *     whether to reply over the bridge (via `bridge_send_message`) and/or
+ *     Telegram (natural turn output / `telegram_reply` tool).
+ *   - `replyVia: "telegram"` was the visible-on-phone default — that's
+ *     STILL the default behavior (the synthetic turn injects into the
+ *     Telegram session), so the only change is the deprecation warning.
+ *   - Per-target / plugin-level / per-message `replyVia` are all warned-on
+ *     and ignored. Clear the field at your convenience.
+ *
+ * For the architecture motivation see Ethan's spec voice 2096 (2026-05-04):
+ *   "I want them to behave identically. Agents should choose where the
+ *    reply goes, not the routing layer."
+ *
+ * Historical notes (kept for context):
+ *   v2.4.x — multi-channel `replyVia` array + implicit bridge fallback.
+ *   v2.3.x — `replyVia: "telegram" | "agent-bridge"` per-target/plugin/message.
+ *   v2.2.0 — switched to `dispatchInboundReplyWithBase` (the same dispatch
+ *            primitive native IRC and Nextcloud Talk channels use).
+ *   v2.1.0 — per-target inbox subdirs + auto-discovery from telegram accounts.
  */
 
 import { homedir } from "node:os";
@@ -95,15 +91,21 @@ import { formatRelayNotice, relayNoticeEnabled } from "./relay-notice.js";
 import { emitLifecycleEvent, ensureService as ensureChimeService } from "../../chime/emitter.mjs";
 
 const PLUGIN_ID = "agent-bridge";
-const PLUGIN_NAME = "Agent Bridge (Channel v2)";
+const PLUGIN_NAME = "Agent Bridge (Channel v3 — agent-driven routing)";
 const DEFAULT_AGENT_ID = "main";
 const PROCESS_STATE_KEY = Symbol.for("agent-bridge.openclaw-channel.process-state");
+
+// Channels we know how to surface as a user-facing reply hint. Extend this
+// list as new harness reply tools are added. The list is purely informational
+// for the prompt-context block — actually delivering on the reply is the
+// agent's job.
+const KNOWN_USER_FACING_CHANNELS = new Set(["telegram", "slack", "discord", "imessage"]);
 
 export default {
   id: PLUGIN_ID,
   name: PLUGIN_NAME,
   description:
-    "First-class OpenClaw channel for cross-machine agent-to-agent messaging over SSH. Per-target subdir routing + dispatchInboundReplyWithBase session injection so bridge replies land in the same Telegram chat.",
+    "First-class OpenClaw channel for cross-machine agent-to-agent messaging over SSH. v3.0 surfaces inbound bridge messages to the running OC agent and lets it decide which reply tools to call (bridge_send_message for the implicit bridge leg, telegram_reply / etc. for additional user-facing legs).",
 
   register(api) {
     const log = makeLogger(api?.logger);
@@ -113,6 +115,11 @@ export default {
       log.info("disabled via pluginConfig.enabled=false");
       return;
     }
+
+    // Surface a deprecation warning if any legacy `replyVia` config is still
+    // present. Don't abort — just log so existing deployments keep working
+    // through the migration window.
+    warnOnLegacyReplyVia(pluginCfg, log);
 
     // Short-lived CLI contexts (help, inspect, list, `gateway status`, etc.)
     // also load plugins. Only start the inbox watcher for the long-lived
@@ -143,12 +150,11 @@ export default {
     const processState = getProcessState();
 
     // Map of session-key-ish hint -> { fromMachine } so the outbound adapter
-    // knows which machine to SFTP-deliver a reply to when the agent replies in-turn
-    // via our NATIVE agent-bridge channel (cross-harness flows). This is
-    // irrelevant for the Telegram-injection path — replies there travel
-    // back through telegram automatically via OriginatingChannel routing.
-    // Keep it process-global so duplicate register() calls don't split
-    // routing hints across multiple short-lived maps.
+    // knows which machine to SFTP-deliver a reply to when the agent calls
+    // `bridge_send_message` to reply through the native agent-bridge channel
+    // (cross-harness flows). Even though we no longer auto-fan-out, we keep
+    // the registry primed so the channel-plugin's outbound can resolve the
+    // sender machine when the agent does call the tool.
     const replyTargets = processState.replyTargets;
 
     // Register the native channel FIRST — this is the primary v2 contract
@@ -265,6 +271,7 @@ export default {
           inboxRoot,
           pollIntervalMs,
           targets,
+          pluginCfg,
           log,
           start: () => startInboxWatcher({
           inboxRoot,
@@ -274,13 +281,12 @@ export default {
           async onMessage(msg, ctx) {
             const target = ctx.target;
             const fromMachine = msg.from ?? "unknown";
-            const body = formatInboundBody(msg);
             const rawContent = String(msg.content ?? "");
 
-            // Resolve the LIST of reply channels this inbound should fan out
-            // to. See `resolveReplyChannels` for full precedence semantics.
-            // Always returns at least one channel.
-            const replyChannels = resolveReplyChannels({
+            // Resolve which user-facing channels the agent should ALSO send
+            // a reply through. Returns a deduped, order-preserving array.
+            // Empty array == quiet mode (only suggest the bridge reply).
+            const additionalReplyChannels = resolveAdditionalReplyChannels({
               msg,
               target,
               pluginCfg,
@@ -290,9 +296,9 @@ export default {
             const account = target.config.account ?? target.name;
             const telegramPeerId = target.config.peer_id;
 
-            // ONE relay notice per inbound, listing all resolved reply paths
-            // (e.g. "reply path: telegram, agent-bridge"). Avoids per-channel
-            // duplicate Telegram pings for fan-out cases.
+            // Pre-flight relay receipt to the user's chat — independent of
+            // additionalReplyChannels. This is a glanceable "something
+            // landed" notice that fires BEFORE the agent turn runs.
             await sendBridgeRelayNotice({
               runtime,
               hostCfg,
@@ -300,15 +306,13 @@ export default {
               target,
               account,
               msg,
-              replyVia: replyChannels.length === 1 ? replyChannels[0] : replyChannels,
+              additionalReplyChannels,
               log,
             });
 
             // Legacy: targets flagged as legacy_session bypass session
             // injection and rely purely on the native agent-bridge channel.
-            // Register reply target and return early. Multi-channel fanout is
-            // a no-op here — legacy_session has no real dispatch path to
-            // begin with.
+            // Register reply target and return early.
             if (target.config.legacy_session) {
               const sessionKey = `${AGENT_BRIDGE_CHANNEL_ID}:${fromMachine}`;
               registerReplyTarget(replyTargets, {
@@ -325,57 +329,46 @@ export default {
               return;
             }
 
-            // Prepare each reply channel (resolve peer, route, session
-            // store path). Channels that throw during preparation — e.g.
-            // an agent-bridge channel without a return target, or a
-            // telegram channel without peer_id — are dropped from the
-            // fanout list with a logged error. The remaining "prepared"
-            // list is then dispatched as ONE agent turn whose reply is
-            // fanned out to every prepared channel via deliver().
+            // Pick the ONE primary session to inject the inbound message
+            // into. This determines which conversation the agent reads it
+            // in and which outbound the agent's natural turn output flows
+            // through. We do NOT fan out — the agent calls reply tools
+            // explicitly for any additional legs.
             //
-            // Critical: we do NOT call dispatchInboundReplyWithBase per
-            // channel. That would run the agent turn N times for one
-            // inbound, executing actionable instructions twice and
-            // doubling tool/command side effects.
-            const prepared = [];
-            const prepErrors = [];
-            for (const replyVia of replyChannels) {
-              try {
-                prepared.push(prepareReplyChannel({
-                  replyVia,
-                  msg,
-                  target,
-                  fromMachine,
-                  account,
-                  telegramPeerId,
-                  runtime,
-                  hostCfg,
-                }));
-              } catch (err) {
-                prepErrors.push({ replyVia, err });
-                log.error(
-                  `prepare failed for ${msg.id} via "${replyVia}" `
-                  + `target=${target.name}: ${err?.message ?? err}`,
-                );
-              }
-            }
-            if (prepared.length === 0) {
-              const summary = prepErrors
-                .map(({ replyVia, err }) => `${replyVia}: ${err?.message ?? err}`)
-                .join("; ");
-              throw new Error(
-                `no reply channel could be prepared for ${msg.id} target=${target.name}: ${summary}`,
+            // Selection logic:
+            //   - If "telegram" is in additionalReplyChannels AND the target
+            //     has a Telegram peer_id wired up → primary = Telegram (so
+            //     natural turn output goes to the user's phone).
+            //   - Otherwise → primary = agent-bridge (silent peer-to-peer
+            //     back-channel; agent's natural turn output SFTPs back to
+            //     the originating bridge peer).
+            let primary;
+            try {
+              primary = pickPrimaryChannel({
+                msg,
+                target,
+                additionalReplyChannels,
+                fromMachine,
+                account,
+                telegramPeerId,
+                runtime,
+                hostCfg,
+              });
+            } catch (err) {
+              log.error(
+                `pickPrimaryChannel failed for ${msg.id} target=${target.name}: ${err?.message ?? err}`,
               );
+              throw err;
             }
 
-            await dispatchFanout({
-              prepared,
+            await dispatchAgentTurn({
+              primary,
               msg,
-              body,
               rawContent,
               fromMachine,
               account,
               target,
+              additionalReplyChannels,
               runtime,
               hostCfg,
               replyTargets,
@@ -412,119 +405,168 @@ export default {
 };
 
 /**
- * Resolve the list of reply channels for an inbound message. Returns a
- * non-empty array of normalized channel names (e.g. ["telegram"],
- * ["agent-bridge"], or ["telegram", "agent-bridge"]).
+ * Resolve the user-facing reply channels the agent should consider as
+ * ADDITIONAL legs (on top of the implicit bridge reply to `from_target`).
  *
- * Precedence (each level may be a string OR an array of strings):
- *   1. Per-message `msg.replyVia` (sender-controlled override).
- *   2. Per-target `target.config.replyVia`.
- *   3. Plugin-level `pluginCfg.replyVia`.
- *   4. Sender-derived default: if `msg.fromTarget` is present the inbound
- *      hop was via agent-bridge, so reply via agent-bridge; otherwise
- *      reply via telegram. ("Reply on the channel it came in on.")
+ * Returns a non-empty-or-empty deduped array of normalized channel names.
+ * Empty array = "no user-facing leg suggested; agent only needs to bridge
+ * back". Default policy when nothing is configured:
  *
- * Implicit bridge fallback (B): regardless of which level produced the
- * channel list, if the inbound has `msg.fromTarget` set (i.e. the message
- * really came in over agent-bridge) we ALWAYS append `"agent-bridge"` to
- * the list (deduplicated). This guarantees the originating bridge peer
- * gets a reply even if Ethan configured the target to mirror replies into
- * Telegram only. Without this, agent-to-agent threads silently break the
- * moment a target opts out of bridge replies.
+ *   - Target has `openclaw_channel = "telegram"` → ["telegram"].
+ *   - Otherwise → [].
  *
- * Each value is normalized through `normalizeReplyVia`, which lowercases
- * and validates against the known modes ("telegram" | "agent-bridge").
- * Unknown values fall back to "telegram" with a warn log. Duplicates are
- * removed while preserving first-occurrence order.
+ * Precedence (highest first):
+ *   1. Per-message `msg.additionalReplyChannels` (sender override; rare —
+ *      think "this one debug message: no Telegram echo please").
+ *   2. Per-target `target.config.additionalReplyChannels`.
+ *   3. Plugin-level `pluginCfg.additionalReplyChannels`.
+ *   4. Default policy (above).
+ *
+ * Each value is normalized through `normalizeUserFacingChannel`, which
+ * lowercases / trims and validates against `KNOWN_USER_FACING_CHANNELS`.
+ * Unknown values fall back to "telegram" with a warn log so misconfigs
+ * don't silently silence the user-facing notification.
+ *
+ * Special string sentinels accepted at any precedence level:
+ *   - `"none"` / `"silent"` → return [].
+ *   - `"default"` → fall through to the next precedence level.
  */
-function resolveReplyChannels({ msg, target, pluginCfg, log }) {
-  const explicit = msg.replyVia
-    ?? target?.config?.replyVia
-    ?? pluginCfg?.replyVia
-    ?? null;
+function resolveAdditionalReplyChannels({ msg, target, pluginCfg, log }) {
+  const layered = [
+    msg?.additionalReplyChannels,
+    target?.config?.additionalReplyChannels,
+    pluginCfg?.additionalReplyChannels,
+  ];
 
-  let channels;
-  if (Array.isArray(explicit)) {
-    channels = explicit
-      .filter((v) => v != null)
-      .map((v) => normalizeReplyVia(v, log, target?.name));
-  } else if (explicit != null) {
-    channels = [normalizeReplyVia(explicit, log, target?.name)];
-  } else {
-    const senderDerived = msg.fromTarget ? "agent-bridge" : "telegram";
-    channels = [normalizeReplyVia(senderDerived, log, target?.name)];
+  for (const raw of layered) {
+    const resolved = coerceAdditionalReplyChannelsLevel(raw, log, target?.name);
+    if (resolved !== null) {
+      return resolved;
+    }
   }
 
-  // Implicit bridge fallback: any inbound that arrived over agent-bridge
-  // (signalled by msg.fromTarget) must always also reply via agent-bridge,
-  // unless the resolved list already includes it.
-  if (msg.fromTarget && !channels.includes("agent-bridge")) {
-    channels.push("agent-bridge");
+  // Default policy: if the target's underlying outbound is Telegram, suggest
+  // Telegram as the additional user-facing leg. Otherwise empty.
+  const outboundChannel = target?.config?.openclaw_channel;
+  if (outboundChannel === "telegram") {
+    return ["telegram"];
   }
-
-  // De-dup while preserving order. Empty list shouldn't be possible (each
-  // level above produces at least one entry), but guard anyway.
-  const seen = new Set();
-  const deduped = [];
-  for (const c of channels) {
-    if (!c || seen.has(c)) continue;
-    seen.add(c);
-    deduped.push(c);
-  }
-  if (deduped.length === 0) deduped.push("telegram");
-  return deduped;
+  return [];
 }
 
 /**
- * Resolve all the per-channel routing data needed to dispatch the inbound
- * via `replyVia`. Pure / no side effects — does NOT touch `replyTargets`
- * or run any agent turn. Throws if peer/return-target requirements are
- * unmet for the requested mode.
+ * Coerce a single precedence-level value into a deduped, normalized array
+ * (or null if "fall through to the next level"). Accepts:
  *
- * Returns: `{ replyVia, targetChannel, peerId, returnTarget, route, storePath }`.
+ *   - undefined / null  → null (fall through)
+ *   - "default"         → null (fall through)
+ *   - "none" / "silent" → [] (explicit quiet)
+ *   - string            → [normalized]
+ *   - array of strings  → normalized + deduped
  */
-function prepareReplyChannel({
-  replyVia,
+function coerceAdditionalReplyChannelsLevel(raw, log, targetName) {
+  if (raw == null) return null;
+  if (typeof raw === "string") {
+    const v = raw.trim().toLowerCase();
+    if (v === "" || v === "default") return null;
+    if (v === "none" || v === "silent" || v === "off") return [];
+    return dedupeChannels([normalizeUserFacingChannel(v, log, targetName)]);
+  }
+  if (Array.isArray(raw)) {
+    const cleaned = raw
+      .map((v) => (v == null ? null : String(v).trim().toLowerCase()))
+      .filter((v) => v != null && v !== "");
+    if (cleaned.length === 0) return [];
+    if (cleaned.some((v) => v === "default")) return null;
+    if (cleaned.every((v) => v === "none" || v === "silent" || v === "off")) {
+      return [];
+    }
+    return dedupeChannels(
+      cleaned
+        .filter((v) => v !== "none" && v !== "silent" && v !== "off")
+        .map((v) => normalizeUserFacingChannel(v, log, targetName)),
+    );
+  }
+  // Unknown shape — fall through to next level rather than crash.
+  log?.warn?.(
+    `additionalReplyChannels on target "${targetName}" has an unsupported shape `
+    + `(${typeof raw}); ignoring this level and falling through.`,
+  );
+  return null;
+}
+
+function dedupeChannels(channels) {
+  const seen = new Set();
+  const out = [];
+  for (const c of channels) {
+    if (!c || seen.has(c)) continue;
+    seen.add(c);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Pick the ONE primary session to inject the inbound message into. Returns
+ * `{ targetChannel, peerId, returnTarget, route, storePath }`.
+ *
+ * The primary determines: (a) the conversation/session memory the agent
+ * sees this message in, (b) where the agent's natural turn output flows.
+ * The agent ALSO calls `bridge_send_message` to reply over the bridge —
+ * that's the "implicit bridge reply" leg, independent of which session
+ * we inject into.
+ */
+function pickPrimaryChannel({
   msg,
   target,
+  additionalReplyChannels,
   fromMachine,
   account,
   telegramPeerId,
   runtime,
   hostCfg,
 }) {
-  let targetChannel;
-  let peerId;
   const returnTarget =
     typeof msg.fromTarget === "string" && msg.fromTarget.trim()
       ? msg.fromTarget.trim()
       : "";
-  if (replyVia === "agent-bridge") {
-    targetChannel = AGENT_BRIDGE_CHANNEL_ID; // "agent-bridge"
+
+  // Prefer the target's bound user-facing channel (Telegram, Slack, Discord,
+  // etc.) when:
+  //   (a) `additionalReplyChannels` includes it (i.e. the agent should reply
+  //       through it), AND
+  //   (b) the target has a peer_id wired up so the outbound knows where to
+  //       answer in.
+  // Fall back to the silent agent-bridge back-channel otherwise.
+  const targetUserChannel = target.config.openclaw_channel;
+  const wantUserChannel =
+    typeof targetUserChannel === "string" &&
+    targetUserChannel !== AGENT_BRIDGE_CHANNEL_ID &&
+    additionalReplyChannels.includes(targetUserChannel) &&
+    Boolean(telegramPeerId); // `telegramPeerId` here is the target's peer_id (named legacy-style; semantically it's the per-channel peer id)
+
+  let targetChannel;
+  let peerId;
+  if (wantUserChannel) {
+    targetChannel = targetUserChannel;
+    peerId = telegramPeerId;
+  } else {
+    targetChannel = AGENT_BRIDGE_CHANNEL_ID;
     if (!fromMachine || fromMachine === "unknown") {
       throw new Error(
-        `replyVia=agent-bridge target="${target.name}": cannot resolve sender machine from msg.from — refusing to dispatch`,
+        `cannot resolve primary channel for target="${target.name}": no user-facing leg `
+        + `available AND msg.from is missing (cannot fall back to agent-bridge).`,
       );
     }
     if (!returnTarget) {
       throw new Error(
-        `replyVia=agent-bridge target="${target.name}" requires msg.fromTarget so replies know which remote inbox target to use`,
+        `cannot resolve primary channel for target="${target.name}": no user-facing leg `
+        + `available AND msg.fromTarget is missing (cannot fall back to agent-bridge).`,
       );
     }
     peerId = encodeBridgePeerId(fromMachine, returnTarget);
-  } else {
-    targetChannel = target.config.openclaw_channel ?? "telegram";
-    peerId = telegramPeerId;
-    if (!peerId) {
-      throw new Error(
-        `target "${target.name}" has no peer_id — cannot resolve session`,
-      );
-    }
   }
 
-  // Resolve the canonical agent route. This uses the SDK's
-  // dmScope-aware session-key builder (session-key-CbP51u9x.js:175),
-  // so we don't need to hand-build the key.
   const route = runtime.channel.routing.resolveAgentRoute({
     cfg: hostCfg,
     channel: targetChannel,
@@ -541,7 +583,6 @@ function prepareReplyChannel({
   );
 
   return {
-    replyVia,
     targetChannel,
     peerId,
     returnTarget,
@@ -551,66 +592,67 @@ function prepareReplyChannel({
 }
 
 /**
- * Dispatch ONE inbound to ONE primary session, fanning the resulting
- * agent reply out to every prepared channel. The primary channel drives
- * session continuity (sessionKey, ctxPayload Provider/OriginatingChannel)
- * — this is the channel the agent's "next turn" memory will key off of.
- * Sibling channels in `prepared` receive a copy of the reply text via
- * their own peer routing inside the deliver callback, but do NOT trigger
- * additional agent turns.
+ * Run a single agent turn for the inbound bridge message. The agent reads
+ * the message in the primary session's context (Telegram if wired, else
+ * agent-bridge back-channel) and is reminded — via the BRIDGE-CONTEXT block
+ * appended to the message body — to:
  *
- * Why this matters: dispatchInboundReplyWithBase RUNS an agent turn
- * (executes commands, calls tools, mutates session state). If we called
- * it once per channel for a fanout, an actionable inbound would be
- * executed N times. Single-turn + N-way delivery preserves "one agent
- * thinking → many ways to hear it".
+ *   1. Reply to the originating bridge peer via `bridge_send_message`
+ *      (the implicit bridge leg, ALWAYS expected when from_target is set).
+ *   2. Optionally also reply via the additional user-facing channel(s) we
+ *      surface in the hint. (For Telegram this happens NATURALLY because we
+ *      injected into the Telegram session — the agent's normal turn output
+ *      flows there. For other channels, the agent must call the matching
+ *      reply tool.)
+ *
+ * No `deliver` fan-out happens here. The dispatch primitive's natural
+ * delivery (a single sendText to the primary channel's outbound) is all we
+ * need.
  */
-async function dispatchFanout({
-  prepared,
+async function dispatchAgentTurn({
+  primary,
   msg,
-  body,
   rawContent,
   fromMachine,
   account,
   target,
+  additionalReplyChannels,
   runtime,
   hostCfg,
   replyTargets,
   dispatchInboundReplyWithBase,
   log,
 }) {
-  if (prepared.length === 0) {
-    throw new Error(
-      `dispatchFanout: no prepared reply channels for ${msg.id} target=${target.name}`,
-    );
-  }
-
-  const primary = prepared[0];
-  const siblings = prepared.slice(1);
-
-  // Track reply target metadata for EVERY prepared channel so the outbound
-  // adapters can resolve fromMachine/return-target regardless of which
-  // sessionKey hint the host passes through. (Each channel registers its
-  // own sessionKey + peerId; siblings additionally cover the case where
-  // the agent replies "by hand" via our channel-plugin tool.)
-  for (const ch of prepared) {
-    registerReplyTarget(replyTargets, {
-      sessionKey: ch.route.sessionKey,
-      fromMachine,
-      incoming: msg,
-      target,
-      accountId: account,
-      ownTarget: `openclaw/${account}`,
-      peerId: String(ch.peerId),
-      returnTarget: ch.returnTarget,
-    });
-  }
-
-  // Build the synthetic inbound ctxPayload using the PRIMARY channel only.
-  // OriginatingChannel/OriginatingTo steers the dispatcher's intra-turn
-  // reply back through the primary outbound; siblings are delivered
-  // explicitly inside our deliver() callback below.
   const { targetChannel, peerId, route, storePath } = primary;
+
+  // Register reply-target hints so the channel-plugin outbound (used when the
+  // agent calls bridge_send_message in-turn) can resolve fromMachine + return
+  // target regardless of which sessionKey lookup the host emits.
+  //
+  // ownTarget mirrors the addressable target alias used in the BRIDGE-CONTEXT
+  // (target.name) — NOT the underlying channel account id. Explicit-target
+  // setups can have `targets.bot-alpha.account = "default"`, and the peer's
+  // follow-up must come back to `inbox/openclaw/bot-alpha`, not /default.
+  // (Codex review P2, 2026-05-04, rounds 5-6.)
+  const ownTargetAlias = `openclaw/${target?.name ?? account}`;
+  registerReplyTarget(replyTargets, {
+    sessionKey: route.sessionKey,
+    fromMachine,
+    incoming: msg,
+    target,
+    accountId: account,
+    ownTarget: ownTargetAlias,
+    peerId: String(peerId),
+    returnTarget: primary.returnTarget,
+  });
+
+  const body = formatInboundBody({
+    msg,
+    target,
+    additionalReplyChannels,
+    primaryChannel: targetChannel,
+  });
+
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
     Body: body,
     RawBody: rawContent,
@@ -633,14 +675,14 @@ async function dispatchFanout({
       : Date.now(),
     OriginatingChannel: targetChannel,
     OriginatingTo: `${targetChannel}:${peerId}`,
-    // CommandAuthorized defaults via finalizeInboundContext; bridge
-    // content is untrusted, so we don't flip it on.
+    // CommandAuthorized defaults via finalizeInboundContext; bridge content
+    // is untrusted, so we don't flip it on.
   });
 
   log.info(
     `about to dispatch ${msg.id} from ${fromMachine} target=${target.name} `
-    + `primary=${primary.replyVia} fanout=[${prepared.map((p) => p.replyVia).join(",")}] `
-    + `route.sessionKey=${route.sessionKey} channel=${targetChannel} accountId=${route.accountId}`,
+    + `primary=${targetChannel} additionalReplyChannels=[${additionalReplyChannels.join(",")}] `
+    + `route.sessionKey=${route.sessionKey} accountId=${route.accountId}`,
   );
 
   await dispatchInboundReplyWithBase({
@@ -652,51 +694,28 @@ async function dispatchFanout({
     ctxPayload,
     core: runtime,
     deliver: async (payload) => {
+      // Single-channel natural delivery via the primary outbound. No
+      // multi-channel fan-out — the agent's tool calls drive any additional
+      // legs (bridge_send_message for the implicit bridge reply,
+      // telegram_reply / etc. for non-primary user-facing channels).
       const text = payload?.text ?? "";
       if (!text.trim()) return;
-
-      // Fan out the same reply text to every prepared channel. We collect
-      // per-channel errors so a flaky outbound on one leg doesn't block
-      // delivery on the others; if EVERY leg fails we throw an aggregate.
-      const deliveryErrors = [];
-      for (const ch of prepared) {
-        try {
-          const deliverFn = resolveProviderDeliver({
-            runtime,
-            targetChannel: ch.targetChannel,
-          });
-          if (!deliverFn) {
-            throw new Error(
-              `no outbound delivery function for channel="${ch.targetChannel}" on this host`,
-            );
-          }
-          await deliverFn({
-            // For telegram, `peerId` is the numeric Telegram user id.
-            // For agent-bridge, `peerId` is an encoded machine +
-            // return-target tuple. channel-plugin.js decodes it before
-            // calling deliverReply().
-            to: String(ch.peerId),
-            text,
-            cfg: hostCfg,
-            accountId: ch.route.accountId,
-            replyToId: payload?.replyToId,
-          });
-        } catch (err) {
-          deliveryErrors.push({ replyVia: ch.replyVia, err });
-          log.error(
-            `fanout delivery failed for ${msg.id} via "${ch.replyVia}" `
-            + `target=${target.name}: ${err?.message ?? err}`,
-          );
-        }
-      }
-      if (deliveryErrors.length === prepared.length && deliveryErrors.length > 0) {
-        const summary = deliveryErrors
-          .map(({ replyVia, err }) => `${replyVia}: ${err?.message ?? err}`)
-          .join("; ");
+      const deliverFn = resolveProviderDeliver({
+        runtime,
+        targetChannel,
+      });
+      if (!deliverFn) {
         throw new Error(
-          `all reply legs failed for ${msg.id} target=${target.name}: ${summary}`,
+          `no outbound delivery function for primary channel="${targetChannel}" on this host`,
         );
       }
+      await deliverFn({
+        to: String(peerId),
+        text,
+        cfg: hostCfg,
+        accountId: route.accountId,
+        replyToId: payload?.replyToId,
+      });
     },
     onRecordError: (err) => {
       log.error(
@@ -714,8 +733,7 @@ async function dispatchFanout({
 
   log.info(
     `dispatched ${msg.id} from ${fromMachine} target=${target.name} `
-    + `primary=${primary.replyVia} fanout=[${prepared.map((p) => p.replyVia).join(",")}] `
-    + `sessionKey=${route.sessionKey}`,
+    + `primary=${targetChannel} sessionKey=${route.sessionKey}`,
   );
 }
 
@@ -732,7 +750,7 @@ function getProcessState() {
   return g[PROCESS_STATE_KEY];
 }
 
-function buildWatcherSignature({ agentId, inboxRoot, pollIntervalMs, targets }) {
+function buildWatcherSignature({ agentId, inboxRoot, pollIntervalMs, targets, pluginCfg }) {
   const normalizedTargets = Object.keys(targets)
     .sort()
     .map((name) => {
@@ -742,19 +760,39 @@ function buildWatcherSignature({ agentId, inboxRoot, pollIntervalMs, targets }) 
         cfg.openclaw_channel ?? null,
         cfg.account ?? null,
         cfg.peer_id ?? null,
-        cfg.replyVia ?? null,
+        normalizeArcKey(cfg.additionalReplyChannels),
         cfg.relayNotice ?? null,
         cfg.relayNoticeChannel ?? null,
         cfg.relayNoticePeerId ?? null,
         Boolean(cfg.legacy_session),
       ];
     });
+  // Plugin-level additionalReplyChannels feeds the resolution fallback for
+  // any target whose own config is null, so a hot-reload that ONLY changes
+  // the plugin-level value must invalidate the signature too — otherwise
+  // startOrReuseWatcher() reuses the stale closure with the old pluginCfg.
+  // Same logic for the plugin-level relayNotice* fields, which similarly
+  // back-fill per-target defaults.
+  const pluginLevel = pluginCfg
+    ? {
+        additionalReplyChannels: normalizeArcKey(pluginCfg.additionalReplyChannels),
+        relayNotice: pluginCfg.relayNotice ?? null,
+        relayNoticeChannel: pluginCfg.relayNoticeChannel ?? null,
+        relayNoticePeerId: pluginCfg.relayNoticePeerId ?? null,
+      }
+    : null;
   return JSON.stringify({
     agentId,
     inboxRoot,
     pollIntervalMs: pollIntervalMs ?? null,
     targets: normalizedTargets,
+    pluginLevel,
   });
+}
+
+function normalizeArcKey(arc) {
+  if (Array.isArray(arc)) return arc.slice().sort().join(",");
+  return arc ?? null;
 }
 
 function startOrReuseWatcher({
@@ -763,6 +801,7 @@ function startOrReuseWatcher({
   inboxRoot,
   pollIntervalMs,
   targets,
+  pluginCfg,
   log,
   start,
 }) {
@@ -771,6 +810,7 @@ function startOrReuseWatcher({
     inboxRoot,
     pollIntervalMs,
     targets,
+    pluginCfg,
   });
 
   if (
@@ -846,7 +886,7 @@ function registerReplyTarget(replyTargets, { sessionKey, fromMachine, incoming, 
  *
  * Args: `{ to, text, cfg, accountId, replyToId }`.
  */
-async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, account, msg, replyVia, log }) {
+async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, account, msg, additionalReplyChannels, log }) {
   if (!relayNoticeEnabled(pluginCfg, target.config)) return;
 
   const noticeChannel = target.config.relayNoticeChannel
@@ -870,10 +910,22 @@ async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, acco
     return;
   }
 
+  // The relay-notice helper still accepts a `replyVia` field for the human-
+  // readable "reply path" line. Map our new `additionalReplyChannels` model
+  // to that legacy shape: list "agent-bridge" first (always implicit when
+  // from_target is set) plus every additional user-facing channel.
+  const replyPathDisplay = formatReplyPathForNotice({
+    msg,
+    additionalReplyChannels,
+  });
+
   try {
     await deliverFn({
       to: String(noticePeerId),
-      text: formatRelayNotice(msg, { targetName: target.name, replyVia }),
+      text: formatRelayNotice(msg, {
+        targetName: target.name,
+        replyVia: replyPathDisplay,
+      }),
       cfg: hostCfg,
       accountId: account,
       replyToId: null,
@@ -885,6 +937,22 @@ async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, acco
       `bridge relay notice failed for ${target.name}/${msg.id}: ${err?.message ?? err}`,
     );
   }
+}
+
+/**
+ * Build the human-readable "reply path: ..." line for the relay notice.
+ * "agent-bridge" is implicit whenever the inbound carries from_target.
+ * Additional user-facing channels follow.
+ */
+function formatReplyPathForNotice({ msg, additionalReplyChannels }) {
+  const parts = [];
+  if (msg?.fromTarget) parts.push("agent-bridge");
+  for (const c of additionalReplyChannels) {
+    if (!parts.includes(c)) parts.push(c);
+  }
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0];
+  return parts;
 }
 
 function resolveProviderDeliver({ runtime, targetChannel }) {
@@ -939,6 +1007,7 @@ function resolveProviderDeliver({ runtime, targetChannel }) {
  *     agent_id: "main" | null,
  *     legacy_session?: boolean,       // true ⇒ use legacy agent-bridge sessionKey
  *     auto_discovered?: boolean       // true ⇒ came from channels.telegram.accounts
+ *     additionalReplyChannels?: string[] | string | null
  *   }
  */
 export const __testing = {
@@ -946,9 +1015,14 @@ export const __testing = {
   buildWatcherSignature,
   startOrReuseWatcher,
   normalizeExplicitTargets,
-  resolveReplyChannels,
-  normalizeReplyVia,
-  isBridgeOnlyReplyVia,
+  resolveAdditionalReplyChannels,
+  coerceAdditionalReplyChannelsLevel,
+  normalizeUserFacingChannel,
+  warnOnLegacyReplyVia,
+  isLegacyBridgeOnlyReplyVia,
+  pickPrimaryChannel,
+  formatInboundBody,
+  formatReplyPathForNotice,
 };
 
 function resolveTargets({ pluginCfg, openclawGlobalCfg, log }) {
@@ -1003,29 +1077,50 @@ function normalizeExplicitTargets(pluginCfg, log) {
       log.warn(`target "${name}" has no config object — skipping`);
       continue;
     }
-    // Allow agent-bridge-only replyVia to skip the peer_id requirement —
-    // peer identity comes from the sender machine at message time, not from
-    // config. Any non-agent-bridge channel in the resolved list (telegram,
-    // unknown values that coerce to telegram) still needs a peer_id so the
-    // outbound knows which chat to answer in. Arrays are supported here too:
-    // ["agent-bridge"] is bridge-only and gets the relaxation; ["telegram",
-    // "agent-bridge"] still requires peer_id for the telegram leg.
-    const targetReplyVia = cfg.replyVia ?? pluginCfg.replyVia ?? "telegram";
+    // Headless targets (openclaw_channel === "agent-bridge") don't need a
+    // Telegram peer_id — the peer is derived from the sender machine at
+    // message time. Any Telegram-bound target still needs peer_id so the
+    // outbound knows which chat to answer in.
     const peerId = cfg.peer_id ?? pluginPeerId ?? null;
-    if (!peerId && !isBridgeOnlyReplyVia(targetReplyVia)) {
+    // Backward-compat for v2.x bridge-only targets: a target that omitted
+    // peer_id AND inherited (or explicitly set) `replyVia: "agent-bridge"`
+    // (string OR an array containing only "agent-bridge") was a valid
+    // headless config in v2.x. v3.0 dropped `replyVia` interpretation,
+    // but to avoid silently dropping these targets on upgrade we treat
+    // that legacy shape as `openclaw_channel: "agent-bridge"` for the
+    // purpose of normalization.
+    //
+    // CRITICAL: this inference ONLY kicks in when there is NO peer_id.
+    // Targets that had `replyVia: "agent-bridge"` AND a peer_id were
+    // ALREADY routable (peer_id was just silenced); in v3 they should
+    // simply ignore the deprecated field and continue using their
+    // user-facing channel. (Codex review P2 round 7, 2026-05-04.)
+    //
+    // We check both the per-target replyVia AND the plugin-level
+    // fallback, since v2.x targets often inherited the mode from
+    // `pluginCfg.replyVia` rather than restating it. The deprecation
+    // warning emitted by `warnOnLegacyReplyVia()` is still the user's
+    // cue to migrate the field properly.
+    const inheritedReplyVia = cfg.replyVia ?? pluginCfg.replyVia;
+    const legacyBridgeOnly = !peerId && isLegacyBridgeOnlyReplyVia(inheritedReplyVia);
+    const outboundChannel = cfg.openclaw_channel
+      ?? (legacyBridgeOnly ? AGENT_BRIDGE_CHANNEL_ID : "telegram");
+    const isHeadless = outboundChannel === AGENT_BRIDGE_CHANNEL_ID;
+    if (!peerId && !isHeadless) {
       log.warn(
         `target "${name}" missing peer_id (and no plugin-level fallback `
-        + `pluginConfig.peer_id is set) — skipping. Either add peer_id or set replyVia="agent-bridge".`,
+        + `pluginConfig.peer_id is set) — skipping. Either add peer_id or set `
+        + `openclaw_channel="agent-bridge" for a headless target.`,
       );
       continue;
     }
     out[name] = {
-      openclaw_channel: cfg.openclaw_channel ?? "telegram",
+      openclaw_channel: outboundChannel,
       account: cfg.account ?? name,
       peer_id: peerId,
       agent_id: cfg.agent_id ?? null,
       legacy_session: Boolean(cfg.legacy_session),
-      replyVia: cfg.replyVia ?? null,
+      additionalReplyChannels: cfg.additionalReplyChannels ?? null,
       relayNotice: cfg.relayNotice ?? pluginCfg.relayNotice ?? null,
       relayNoticeChannel: cfg.relayNoticeChannel ?? pluginCfg.relayNoticeChannel ?? null,
       relayNoticePeerId: cfg.relayNoticePeerId ?? pluginCfg.relayNoticePeerId ?? null,
@@ -1089,13 +1184,10 @@ function autoDiscoverFromTelegram({ pluginCfg, openclawGlobalCfg, log }) {
       account: accountName,
       peer_id: String(peerId),
       agent_id: null,
-      // Auto-discovered targets inherit the plugin-level replyVia default
-      // (which falls back to "telegram" at the onMessage boundary). We
-      // don't attempt per-account replyVia discovery — OpenClaw's Telegram
-      // account config doesn't have a natural place for that, and if Ethan
-      // wants per-account back-channel routing he can switch to an
-      // explicit `targets` map.
-      replyVia: null,
+      // Auto-discovered targets default to the plugin-level
+      // additionalReplyChannels (which falls back to ["telegram"] at
+      // resolution time when the target's openclaw_channel === "telegram").
+      additionalReplyChannels: null,
       relayNotice: pluginCfg.relayNotice ?? null,
       relayNoticeChannel: pluginCfg.relayNoticeChannel ?? null,
       relayNoticePeerId: pluginCfg.relayNoticePeerId ?? null,
@@ -1106,38 +1198,87 @@ function autoDiscoverFromTelegram({ pluginCfg, openclawGlobalCfg, log }) {
 }
 
 /**
- * Coerce a replyVia value to a known mode. Unknown values fall back to
- * "telegram" with a warn log so misconfigurations don't silently reroute.
+ * Coerce a user-facing channel name to a known mode. Unknown values fall
+ * back to "telegram" with a warn log so misconfigurations don't silently
+ * silence the user-facing notification.
  */
-function normalizeReplyVia(raw, log, targetName) {
+function normalizeUserFacingChannel(raw, log, targetName) {
   if (raw == null) return "telegram";
   const v = String(raw).toLowerCase().trim();
-  if (v === "telegram" || v === "agent-bridge") return v;
+  if (KNOWN_USER_FACING_CHANNELS.has(v)) return v;
   log?.warn?.(
-    `replyVia="${raw}" on target "${targetName}" is not a known mode — `
-    + `falling back to "telegram". Valid values: "telegram", "agent-bridge".`,
+    `additionalReplyChannels entry "${raw}" on target "${targetName}" is not a `
+    + `known user-facing channel — falling back to "telegram". Valid values: `
+    + `${[...KNOWN_USER_FACING_CHANNELS].join(", ")}.`,
   );
   return "telegram";
 }
 
 /**
- * Return true if the supplied replyVia config (string OR array) ONLY
- * resolves to the agent-bridge channel. Used at target-config time to
- * decide whether peer_id is mandatory: bridge-only configs don't need it
- * because the peer is derived from the sender machine at message time.
+ * Detect the v2.x "bridge-only target without peer_id" shape so we can keep
+ * upgrading deployments running. The legacy shape was:
  *
- * Treats unknown values as "telegram" (matching normalizeReplyVia), so
- * `["agent-bridge", "discord"]` is NOT bridge-only.
+ *   { account: "...", replyVia: "agent-bridge" }   // peer_id omitted
+ *   { account: "...", replyVia: ["agent-bridge"] } // ditto, array form
+ *
+ * In v2.x this skipped the peer_id requirement because the peer was derived
+ * from `msg.fromTarget` at message time. v3.0 ignores `replyVia` entirely,
+ * but for one upgrade window we keep the relaxation alive: a legacy
+ * bridge-only `replyVia` value lets `normalizeExplicitTargets` infer
+ * `openclaw_channel: "agent-bridge"` instead of skipping the target.
+ *
+ * Treats unknown channel names as non-bridge-only (consistent with the v2.x
+ * `isBridgeOnlyReplyVia` semantics).
  */
-function isBridgeOnlyReplyVia(value) {
+function isLegacyBridgeOnlyReplyVia(value) {
+  if (value == null) return false;
   const list = Array.isArray(value) ? value : [value];
   if (list.length === 0) return false;
   for (const raw of list) {
-    if (raw == null) return false; // null in array means default = telegram
+    if (raw == null) return false;
     const v = String(raw).toLowerCase().trim();
-    if (v !== "agent-bridge") return false;
+    if (v !== AGENT_BRIDGE_CHANNEL_ID) return false;
   }
   return true;
+}
+
+/**
+ * Surface a deprecation warning if any legacy `replyVia` config is still
+ * present at plugin-level OR per-target. The plugin no longer interprets
+ * `replyVia` — agent-driven routing takes over (see module-level docstring).
+ *
+ * We only warn ONCE per process start to avoid log spam; that's
+ * accomplished by `warnOnLegacyReplyVia` being called from `register()`,
+ * which is called once per plugin load.
+ */
+function warnOnLegacyReplyVia(pluginCfg, log) {
+  const offenders = [];
+  if (pluginCfg && Object.prototype.hasOwnProperty.call(pluginCfg, "replyVia")) {
+    offenders.push("plugin-level config.replyVia");
+  }
+  const targetsCfg = pluginCfg?.targets;
+  if (targetsCfg && typeof targetsCfg === "object") {
+    for (const name of Object.keys(targetsCfg)) {
+      const t = targetsCfg[name];
+      if (t && typeof t === "object" && Object.prototype.hasOwnProperty.call(t, "replyVia")) {
+        offenders.push(`targets["${name}"].replyVia`);
+      }
+    }
+  }
+  if (offenders.length === 0) return;
+  log?.warn?.(
+    `[deprecation] \`replyVia\` is no longer interpreted as of openclaw-channel v3.0.0. `
+    + `The plugin now surfaces inbound bridge messages to the running agent and lets `
+    + `tool calls drive replies (bridge_send_message for the implicit bridge leg, `
+    + `telegram_reply / etc. for additional user-facing legs). Found stale config at: `
+    + `${offenders.join(", ")}. Replace with \`additionalReplyChannels: ["telegram"]\` `
+    + `(or \`[]\` for quiet mode) and delete the \`replyVia\` key. `
+    + `IMPORTANT: if a target was previously bridge-only (\`replyVia: "agent-bridge"\` `
+    + `with no \`peer_id\`), ALSO set \`openclaw_channel: "agent-bridge"\` on that target — `
+    + `otherwise the upgrade defaults it back to "telegram" and the missing peer_id `
+    + `causes the target to be skipped at startup. See openclaw-channel/README.md `
+    + `"Reply routing in v3.0+".`,
+  );
 }
 
 /**
@@ -1277,11 +1418,20 @@ async function loadDispatchRuntime(log) {
 }
 
 /**
- * Shape the inbound BridgeMessage as a <channel> block — parity with the
- * Claude Code channel plugin so the agent sees the same envelope on both
- * sides of the bridge.
+ * Format the inbound bridge message as a `<channel>` block (parity with the
+ * Claude Code channel plugin) followed by an optional BRIDGE-CONTEXT block
+ * that nudges the agent toward the correct reply pattern:
+ *
+ *   - When `from_target` is set: reply over the bridge via
+ *     `bridge_send_message` (the implicit bridge leg).
+ *   - When `additionalReplyChannels` is non-empty: reply ALSO via those
+ *     user-facing channels. The primary channel's natural turn output
+ *     handles its own leg automatically.
+ *
+ * The BRIDGE-CONTEXT block is intentionally compact and machine-readable
+ * (key: value lines) so the agent has unambiguous data to act on.
  */
-function formatInboundBody(msg) {
+function formatInboundBody({ msg, target, additionalReplyChannels, primaryChannel }) {
   const machine = localMachineName();
   const attrs = [
     `source="agent-bridge"`,
@@ -1295,7 +1445,45 @@ function formatInboundBody(msg) {
   ]
     .filter(Boolean)
     .join(" ");
-  return `<channel ${attrs}>${msg.content ?? ""}</channel>`;
+
+  const channelBlock = `<channel ${attrs}>${msg.content ?? ""}</channel>`;
+
+  // Build an agent-facing context block. Keep this short — the agent's
+  // existing system prompt covers tool semantics.
+  const ctxLines = ["[BRIDGE-CONTEXT]"];
+  ctxLines.push(`source: agent-bridge`);
+  ctxLines.push(`from_machine: ${msg.from ?? "unknown"}`);
+  if (msg.fromTarget) {
+    ctxLines.push(`from_target: ${msg.fromTarget}`);
+    // OPENCLAW PIVOT: when this OC session calls bridge_send_message to
+    // reply, it MUST pass `from_target` set to its OWN OC target id
+    // (`openclaw/<account>`). Otherwise the MCP server's default kicks in
+    // and stamps the outgoing message with `claude-code/default`, which
+    // means any follow-up from the remote peer routes back to the local
+    // Claude Code inbox instead of THIS OC session.
+    // The return target is the ADDRESSABLE target alias (the inbox subdir
+    // name), NOT the underlying channel account id. Explicit-target setups
+    // can have `targets.bot-alpha.account = "default"` where `bot-alpha`
+    // is what peers address; replies must come back to `openclaw/bot-alpha`,
+    // not `openclaw/default`. Falls back to the account id only if the
+    // target lacks a name, then to "default" as a last resort.
+    const ownReturnTarget = `openclaw/${target?.name ?? target?.config?.account ?? "default"}`;
+    ctxLines.push(
+      `bridge_reply_target: ${msg.fromTarget}  # call bridge_send_message with target=${msg.fromTarget}, machine=${msg.from ?? "<sender>"}, from_target=${ownReturnTarget} to reply over the bridge`,
+    );
+    ctxLines.push(`own_return_target: ${ownReturnTarget}  # always set this on bridge_send_message so the peer's reply lands back here, not in claude-code/default`);
+  } else {
+    ctxLines.push(`bridge_reply_target: <none — sender did not include from_target; bridge reply not routable>`);
+  }
+  ctxLines.push(`primary_user_channel: ${primaryChannel}  # your natural turn output flows here`);
+  if (additionalReplyChannels.length === 0) {
+    ctxLines.push(`additional_user_channels: none`);
+  } else {
+    ctxLines.push(`additional_user_channels: ${additionalReplyChannels.join(", ")}`);
+  }
+  ctxLines.push(`local_target: ${target?.name ?? "?"}`);
+
+  return `${channelBlock}\n\n${ctxLines.join("\n")}`;
 }
 
 function escapeAttr(v) {

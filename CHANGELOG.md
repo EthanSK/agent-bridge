@@ -1,5 +1,33 @@
 # Changelog
 
+## openclaw-channel 3.0.0 — 2026-05-04
+
+### Agent-driven reply routing — full rewrite of openclaw-channel routing model
+
+> ⚠️ **BREAKING**
+> - `replyVia` config field is removed from the OpenClaw plugin's `agent-bridge` channel entry (plugin-level and per-target).
+> - Bridge replies to `fromTarget` are now **implicit** — they always fire when `fromTarget` is present on an inbound message. No config knob is needed (or accepted) for the bridge leg.
+> - **Migration:** replace `"replyVia": "telegram"` with `"additionalReplyChannels": ["telegram"]` per target (or at the plugin level). Replace `"replyVia": "agent-bridge"` with `"additionalReplyChannels": []` AND set `"openclaw_channel": "agent-bridge"` on bridge-only targets that lack `peer_id`. See [Migration steps](#migration-steps-for-existing-oc-deployments) below for the jq one-liner.
+> - **Compatibility:** legacy `replyVia` fields are detected at config load and produce a single one-shot deprecation warning listing every offending key — they are NOT errored, the plugin continues with `replyVia` ignored. Removal of the warning is scheduled for the next minor (3.1.0).
+
+Removes the auto-fanout `replyVia` routing layer. Inbound bridge messages now surface into the OC agent's primary session with a `[BRIDGE-CONTEXT]` block listing `from_target` + suggested user-facing channels, and the agent decides which reply tools to call. This unifies OC's behavior with the Claude Code channel: both surface inbound messages and trust agent tool calls to drive replies.
+
+Motivation (Ethan voice 2096, 2026-05-04): "I want them to behave identically. Agents should choose where the reply goes, not the routing layer."
+
+- **`openclaw-channel/src/index.js`** — full rewrite of the `onMessage` path. Replaced `resolveReplyChannels` + multi-channel fanout (`dispatchFanout`, `prepareReplyChannel`) with `resolveAdditionalReplyChannels` + `pickPrimaryChannel` + single-channel `dispatchAgentTurn`. The synthetic ctxPayload's body now carries an explicit `[BRIDGE-CONTEXT]` block listing `from_target`, `bridge_reply_target`, `primary_user_channel`, and `additional_user_channels`. The `deliver` callback is now a single sendText to the primary channel — no more fan-out.
+- **`additionalReplyChannels` config replaces `replyVia`.** Default policy: telegram-bound targets get `["telegram"]`, headless targets get `[]`. Override per-target / plugin-level / per-message. Special string sentinels `"none"` / `"silent"` / `"off"` for quiet mode and `"default"` for fall-through. Unknown channel names normalize to `"telegram"` with a warn log.
+- **Legacy `replyVia` is no longer interpreted** — emits a single deprecation warning at register-time listing every offending key (plugin-level + per-target). Plugin proceeds without crashing. Migration is config-only: replace `replyVia` with `additionalReplyChannels`.
+- **`mcp-server/src/index.ts`** — Claude Code MCP server's instructions block gets a new "AGENT-DRIVEN REPLY ROUTING" section explaining the unified model (bridge leg via `bridge_send_message`, additional user-facing legs via the harness's reply tool).
+- **Tests** — `openclaw-channel/test/reply-channels.test.js` replaced with `openclaw-channel/test/additional-reply-channels.test.js` (32 cases): default policy, per-target / plugin-level / per-message overrides, string sentinels, unknown-channel normalization, deprecation warning, `pickPrimaryChannel` selection (telegram vs agent-bridge), `formatInboundBody` BRIDGE-CONTEXT shape, `formatReplyPathForNotice`, and `normalizeExplicitTargets` headless-target relaxation. `watcher-singleton.test.js` updated to use `additionalReplyChannels: null` instead of `replyVia: null` in target shapes.
+- **README** — top-level `README.md` and `openclaw-channel/README.md` get a new "Reply routing in v3.0+" section with config examples, default policy, migration recipe (jq one-liner), and the conceptual model. Troubleshooting section #8 updated to point at `additionalReplyChannels` instead of `replyVia`. AGENTS.md target-routing section updated.
+- **Version bump** — `openclaw-channel/package.json` 2.4.1 → 3.0.0 (semver major because the config field is renamed and the auto-fanout behavior is removed). agent-bridge top-level CLI version is unchanged.
+
+#### Migration steps for existing OC deployments
+
+1. After installing the new version, restart OpenClaw on each affected machine. The plugin emits a one-time deprecation warning if `replyVia` is still in the config.
+2. Replace `replyVia` with `additionalReplyChannels` (or delete it if you want the default policy). **Caveat for bridge-only targets:** if a v2 target had `replyVia: "agent-bridge"` AND no `peer_id`, it relied on `replyVia` to mark itself headless. On upgrade, also set `openclaw_channel: "agent-bridge"` on those targets — otherwise the default `"telegram"` channel kicks in and the missing peer_id causes the target to be skipped at startup. The README recipe (`openclaw-channel/README.md`) handles both steps automatically: it stamps `openclaw_channel: "agent-bridge"` on any peerless target lacking the field, then deletes `replyVia`.
+3. Restart OpenClaw once more so the new config is loaded.
+
 ## agent-bridge 3.14.9 — 2026-05-03
 
 ### Trim docs/named-target-routing.md to single fuzzy-similarity principle

@@ -40,10 +40,22 @@
         "type": "string",
         "description": "Plugin-level default peer id (e.g. Ethan's Telegram user id '6164541473'). Used as a fallback when a target's own peer_id is missing OR when auto-discovery can't resolve one from the OpenClaw config / allowFrom list. Optional."
       },
+      "additionalReplyChannels": {
+        "description": "Plugin-level default for which user-facing channel(s) the agent should be HINTED about in the [BRIDGE-CONTEXT] block. The plugin does NOT mechanically fan out the reply — it tells the agent which user-facing channels are configured, and the agent calls the matching reply tool(s). Default policy: telegram-bound targets get ['telegram']; headless targets get []. Special string sentinels: 'none'/'silent'/'off' = quiet mode; 'default' = fall through to the next precedence level. `null` and absent both fall through. Per-target overrides win over this plugin-level default. Per-message override is also supported via the BridgeMessage JSON itself.",
+        "oneOf": [
+          { "type": "null" },
+          { "type": "string" },
+          { "type": "array", "items": { "type": "string" } }
+        ]
+      },
       "replyVia": {
-        "type": "string",
-        "enum": ["telegram", "agent-bridge"],
-        "description": "Plugin-level default reply routing for inbound bridge messages. 'telegram' routes the agent's reply back through the same Telegram chat that injected the session (visible to Ethan's phone). 'agent-bridge' routes the reply back to the SENDER machine via agent-bridge SFTP delivery (invisible to Telegram). If unset, routing mirrors the sender: messages with fromTarget reply over agent-bridge; messages without it reply through Telegram. Per-target overrides win over this default."
+        "deprecated": true,
+        "description": "DEPRECATED as of openclaw-channel v3.0.0. The plugin no longer interprets `replyVia` — agent-driven routing replaces it. Use `additionalReplyChannels` instead. The plugin emits a single deprecation warning at register-time if this field is present.",
+        "oneOf": [
+          { "type": "null" },
+          { "type": "string" },
+          { "type": "array", "items": { "type": "string" } }
+        ]
       },
       "relayNotice": {
         "description": "Telegram-visible receipt/update for inbound Agent Bridge messages before the agent turn runs. Defaults to enabled; set false (or {\"enabled\": false}) to silence. The notice starts with '[Agent Bridge relay] 🛰️' so Ethan can identify it at a glance.",
@@ -89,10 +101,22 @@
               "type": "string",
               "description": "Optional per-target override of the top-level `agentId`."
             },
+            "additionalReplyChannels": {
+              "description": "Per-target override for the user-facing reply hint surfaced to the agent. Same shape + sentinels as the plugin-level field. `null` and absent both fall through to the plugin-level default, then to the policy default (['telegram'] for telegram-bound targets, [] for headless).",
+              "oneOf": [
+                { "type": "null" },
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+              ]
+            },
             "replyVia": {
-              "type": "string",
-              "enum": ["telegram", "agent-bridge"],
-              "description": "Override plugin-level `replyVia` for this target. 'telegram' = reply goes out through Telegram (Ethan's phone pings). 'agent-bridge' = reply is SFTP-delivered back to the sender machine as a BridgeMessage (no Telegram traffic). Default: inherits plugin-level, then mirrors the sender (agent-bridge when fromTarget is present, otherwise telegram)."
+              "deprecated": true,
+              "description": "DEPRECATED as of openclaw-channel v3.0.0. Use `additionalReplyChannels` instead. The plugin emits a single deprecation warning if this field is present and otherwise ignores it.",
+              "oneOf": [
+                { "type": "null" },
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } }
+              ]
             },
             "relayNotice": {
               "description": "Per-target override for Telegram-visible Agent Bridge relay receipts. Defaults to enabled; set false (or {\"enabled\": false}) to silence.",
@@ -145,7 +169,7 @@
         }
       },
       "label": "Agent Bridge",
-      "description": "Routes Agent Bridge messages into OpenClaw sessions and sends replies back over Telegram or Agent Bridge."
+      "description": "Surfaces Agent Bridge messages into the running OC agent's session with a [BRIDGE-CONTEXT] block, and lets the agent's tool calls drive replies (bridge_send_message for the implicit bridge leg, telegram_reply / etc. for additional user-facing legs)."
     }
   }
 }
