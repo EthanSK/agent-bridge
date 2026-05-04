@@ -148,9 +148,22 @@ test('source-level wiring is present in shipped build', async () => {
   // late parentPid capture inside main() — otherwise an MCP host that
   // dies during async startup would set parentPid=1 by the time the
   // gate runs and erroneously skip suicide on a true orphan.
+  // Codex P2 round 3: STARTUP_PPID lives in its own dependency-free
+  // bootstrap-ppid module imported FIRST in index.ts, so its body
+  // executes before any other import (zod, MCP SDK) — the very
+  // earliest user-code in the entrypoint graph.
+  const bootstrapPath = join(__dirname, '..', 'build', 'bootstrap-ppid.js');
+  const bootstrapSrc = await readFile(bootstrapPath, 'utf8');
   assert.ok(
-    /STARTUP_PPID\s*=\s*process\.ppid/.test(indexSrc),
-    'STARTUP_PPID must be captured at module load (top-level synchronous)',
+    /STARTUP_PPID[^\n]*=\s*process\.ppid/.test(bootstrapSrc),
+    'bootstrap-ppid.js must capture STARTUP_PPID = process.ppid at module body',
+  );
+  // It must be the FIRST import in index.ts so its body runs before any
+  // other import body in the dependency graph.
+  const firstImportLine = indexSrc.split('\n').find((l) => /^import\s+/.test(l));
+  assert.ok(
+    firstImportLine && /bootstrap-ppid/.test(firstImportLine),
+    `first static import must be ./bootstrap-ppid for earliest-possible ppid capture — got: ${firstImportLine}`,
   );
   assert.ok(
     /STARTUP_PPID\s*===\s*1/.test(indexSrc),

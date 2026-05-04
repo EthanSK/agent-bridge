@@ -65,6 +65,16 @@
  *   - fatalTransportExit on stdout EPIPE
  */
 
+// MUST be the first import in this file. `bootstrap-ppid` snapshots
+// `process.ppid` at the very first opportunity — before any other import
+// (zod, MCP SDK, our own modules) gets a chance to execute. ESM resolves
+// imports depth-first, so this dependency-free module runs its body
+// before any sibling import body. Critical for the orphan-suicide skip
+// gate: if the parent dies during a slow dependency load, the snapshot
+// MUST already exist with the real parent PID — taking it later would
+// see process.ppid===1 and erroneously skip suicide on a true orphan.
+// See ./bootstrap-ppid.ts for the full rationale (Codex P2 2026-05-04).
+import { STARTUP_PPID } from './bootstrap-ppid.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { spawn } from 'node:child_process';
@@ -84,7 +94,7 @@ import { initInbox, setActivePersona, shutdownInbox } from './inbox.js';
 import type { BridgeMessage } from './inbox.js';
 import { resolveIdentity } from './persona.js';
 import { registerTools } from './tools.js';
-import { startWatcher, stopWatcher, replayUndeliveredMessages, registerAliveSignals, subscribeToPromotion, recordHarnessAck } from './watcher.js';
+import { startWatcher, stopWatcher, replayUndeliveredMessages, registerAliveSignals, subscribeToPromotion, recordHarnessAck, getChannelHealthSnapshot } from './watcher.js';
 import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 
@@ -93,16 +103,11 @@ import { logEvent } from './log.js';
 // stale-version peer-kill path).
 const VERSION = MCP_SERVER_VERSION;
 
-// 4.0.x — orphan-suicide skip-gate must use the EARLIEST possible parent
-// PID snapshot, not the one captured later in main() after multiple async
-// awaits. If the MCP host dies during startup the child can be reparented
-// before main() runs — and main()-time `process.ppid` would already be 1
-// in that case, which would erroneously activate the
-// init-parent-from-boot skip path and leave a true orphan immortal. By
-// snapshotting at module load (top-level synchronous code, runs before
-// any await), `STARTUP_PPID` reflects the genuine launch-time parent;
-// any later transition to 1 is real reparenting.
-const STARTUP_PPID = process.ppid;
+// 4.0.x — STARTUP_PPID is imported from ./bootstrap-ppid above. We keep
+// it pinned to module-evaluation order rather than re-snapshotting here,
+// because by this point in the file other static imports (zod, MCP SDK)
+// have already evaluated and could have given a dying parent time to
+// reparent us. The bootstrap-ppid module body runs before all of them.
 
 // 3.5.5 — Patch B (mirror of Telegram plugin server.ts:31-51): persistent
 // stderr tee. Claude Code can close diagnostic stderr between tool turns; once
@@ -572,23 +577,49 @@ let epitaphWritten = false;
 function writeEpitaph(triggerEvent: string): void {
   if (epitaphWritten) return;
   epitaphWritten = true;
+  // Snapshot live channel health at epitaph time. Best-effort — if the
+  // watcher module is partially torn down we still want the rest of the
+  // epitaph to make it to disk. Today's "dead Dell mcp-server" debug
+  // wished it could see "was the channel dead at the moment this child
+  // died?" without a separate cross-file correlation.
+  let channelHealth: ReturnType<typeof getChannelHealthSnapshot> | null = null;
+  try { channelHealth = getChannelHealthSnapshot(); } catch { /* ignore */ }
+  const epitaphContext = {
+    pid: process.pid,
+    parent_pid: process.ppid,
+    version: MCP_SERVER_VERSION,
+    kill_reason: epitaphKillReason,
+    kill_initiator_pid: epitaphKillInitiatorPid,
+    last_tool_call_ts: epitaphLastToolCallTs,
+    lease_state: epitaphLeaseState,
+    watcher_started: epitaphWatcherStarted,
+    uptime_s: Math.floor(process.uptime()),
+    trigger: triggerEvent,
+    channel_dead_at_death: channelHealth?.channel_dead ?? false,
+    channel_dead_age_ms_at_death: channelHealth?.channel_dead_age_ms ?? 0,
+    pending_count_at_death: channelHealth?.pending_count ?? 0,
+  };
   try {
     logEvent({
       event: 'auto_update_runner.epitaph',
       level: 'info',
       msg: `agent-bridge MCP child epitaph: pid=${process.pid} v=${MCP_SERVER_VERSION} reason=${epitaphKillReason}`,
-      context: {
-        pid: process.pid,
-        parent_pid: process.ppid,
-        version: MCP_SERVER_VERSION,
-        kill_reason: epitaphKillReason,
-        kill_initiator_pid: epitaphKillInitiatorPid,
-        last_tool_call_ts: epitaphLastToolCallTs,
-        lease_state: epitaphLeaseState,
-        watcher_started: epitaphWatcherStarted,
-        uptime_s: Math.floor(process.uptime()),
-        trigger: triggerEvent,
-      },
+      context: epitaphContext,
+    });
+  } catch { /* best-effort — epitaph must never throw */ }
+  // 4.0.x — also emit a clean `process.epitaph` semantic event. The
+  // historical name (`auto_update_runner.epitaph`) is preserved above
+  // for back-compat with grep/jq tooling pinned to that string, but the
+  // event applies to ANY child death (orphan-suicide, SIGTERM, SIGKILL
+  // backstop, fatal_transport_exit, panic), not just auto-update runs.
+  // A query for `process.epitaph` is the canonical way to find "when
+  // did this MCP child die and why?" going forward.
+  try {
+    logEvent({
+      event: 'process.epitaph',
+      level: 'info',
+      msg: `agent-bridge MCP child died: pid=${process.pid} v=${MCP_SERVER_VERSION} reason=${epitaphKillReason}`,
+      context: epitaphContext,
     });
   } catch { /* best-effort — epitaph must never throw */ }
   // Also breadcrumb-log so post-mortem tooling has it on disk even if
@@ -1661,9 +1692,19 @@ async function main(): Promise<void> {
     try {
       const rssMB = Math.floor(process.memoryUsage().rss / 1024 / 1024);
       const lease = watcherStarted ? 'held' : (bridgeRole === 'tools-only' ? 'tools-only' : 'standby');
+      // 4.0.x — embed the channel-health snapshot so a `tail -F` of the
+      // unified log instantly answers "is the channel currently dead?".
+      // Today's 12+ h dead-channel debug had to grep across multiple
+      // event names to reconstruct state; the heartbeat is the natural
+      // place to surface the live snapshot. Failures fall through with
+      // safe defaults — the heartbeat must never crash the server.
+      let channelHealth: ReturnType<typeof getChannelHealthSnapshot> | null = null;
+      try {
+        channelHealth = getChannelHealthSnapshot();
+      } catch { /* swallow — heartbeat must never crash */ }
       logEvent({
         event: 'server.heartbeat',
-        msg: `heartbeat uptime=${Math.floor(process.uptime())}s ppid=${process.ppid} rss=${rssMB}MB lease=${lease}`,
+        msg: `heartbeat uptime=${Math.floor(process.uptime())}s ppid=${process.ppid} rss=${rssMB}MB lease=${lease}${channelHealth?.channel_dead ? ` channel=DEAD(${Math.floor(channelHealth.channel_dead_age_ms / 1000)}s)` : ''}`,
         context: {
           uptime_s: Math.floor(process.uptime()),
           ppid: process.ppid,
@@ -1671,6 +1712,11 @@ async function main(): Promise<void> {
           rss_mb: rssMB,
           lease,
           role: bridgeRole || 'auto',
+          channel_dead: channelHealth?.channel_dead ?? false,
+          channel_dead_age_ms: channelHealth?.channel_dead_age_ms ?? 0,
+          pending_count: channelHealth?.pending_count ?? 0,
+          pending_escape_hatch_count: channelHealth?.pending_escape_hatch_count ?? 0,
+          recent_pushes_in_window: channelHealth?.recent_pushes_in_window ?? 0,
         },
       });
     } catch { /* never let a heartbeat take us down */ }
