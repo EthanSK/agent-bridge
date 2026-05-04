@@ -28,47 +28,51 @@ import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 
-test("pathToFileURL converts a Windows drive-letter path to a valid file:// URL", () => {
-  // Simulate the path shape `createRequire(pkgPath).resolve('openclaw/...')`
-  // returns on Windows, exactly as observed in the Dell-OC failure log.
-  const winPath = "C:\\Users\\ethan\\.openclaw\\workspace\\agent-bridge\\openclaw-channel\\node_modules\\openclaw\\plugin-sdk\\inbound-reply-dispatch.js";
+test("pathToFileURL converts the host's absolute path to a valid file:// URL", () => {
+  // Run with whatever platform the test host happens to be. On POSIX hosts
+  // we exercise the POSIX branch; on Windows hosts we exercise the Windows
+  // branch (same code path the runtime hits on Dell). Both must produce a
+  // valid `file://` URL because that's the only thing Node's ESM loader
+  // will accept for filesystem-path imports.
+  //
+  // Note: `pathToFileURL`'s `{ windows: true }` opt-in is Node 20+; this
+  // package documents Node >=18 support, so we deliberately call the helper
+  // without the cross-platform option and rely on the host's natural
+  // behavior.
+  const hostPath = process.platform === "win32"
+    ? "C:\\Users\\ethan\\openclaw\\plugin-sdk\\inbound-reply-dispatch.js"
+    : "/Users/ethan/Projects/agent-bridge/openclaw-channel/node_modules/openclaw/plugin-sdk/inbound-reply-dispatch.js";
 
-  // Use the win32 helper directly so the assertion is valid even when the
-  // test runs on POSIX (where the default `path` would treat backslashes
-  // as literal characters, not separators).
-  const url = pathToFileURL(winPath, { windows: true }).href;
-
-  // The default ESM loader only accepts file:, data:, node: — assert we
-  // emit a file: URL with a forward-slash drive prefix.
-  assert.ok(
-    url.startsWith("file:///"),
-    `expected file:/// URL, got: ${url}`,
-  );
-  assert.match(url, /^file:\/\/\/C:\//, `expected drive-letter form, got: ${url}`);
-  // Backslashes must be normalized to forward slashes in URL form.
-  assert.ok(!url.includes("\\"), `URL must not contain backslashes: ${url}`);
-});
-
-test("pathToFileURL converts a POSIX absolute path to a valid file:// URL", () => {
-  const posixPath = "/Users/ethan/Projects/agent-bridge/openclaw-channel/node_modules/openclaw/plugin-sdk/inbound-reply-dispatch.js";
-  const url = pathToFileURL(posixPath, { windows: false }).href;
+  const url = pathToFileURL(hostPath).href;
 
   assert.ok(url.startsWith("file:///"), `expected file:/// URL, got: ${url}`);
-  assert.ok(url.endsWith("inbound-reply-dispatch.js"), `tail should match: ${url}`);
+  // Round-trip through the WHATWG URL parser — same parser the ESM loader
+  // uses. If pathToFileURL ever regressed to producing a raw `c:` scheme,
+  // this would throw or report a non-`file:` protocol.
+  const parsed = new URL(url);
+  assert.equal(
+    parsed.protocol,
+    "file:",
+    `parsed protocol should be file:, got ${parsed.protocol}`,
+  );
 });
 
-test("URL.href produced by pathToFileURL round-trips through new URL() without ERR_UNSUPPORTED_ESM_URL_SCHEME", () => {
-  // The actual error Node throws for a raw Windows path passed to import()
-  // surfaces from URL parsing inside the ESM loader. Verify the converted
-  // URL parses cleanly via the public URL constructor (same code path the
-  // ESM loader uses).
-  const winPath = "C:\\Users\\ethan\\.openclaw\\workspace\\agent-bridge\\openclaw-channel\\node_modules\\openclaw\\plugin-sdk\\inbound-reply-dispatch.js";
-  const url = pathToFileURL(winPath, { windows: true }).href;
+test("pathToFileURL produces a valid file:// URL for a synthetic POSIX path", () => {
+  // Cross-platform sanity check: regardless of host platform, an absolute
+  // POSIX-shaped string must serialize to file:///… because the leading
+  // slash is unambiguous. This guards against any future regression that
+  // strips the `pathToFileURL` call entirely on the assumption that "POSIX
+  // already works without it" — it doesn't, `import()` requires the
+  // file:// prefix.
+  const posixPath = "/var/tmp/openclaw/plugin-sdk/inbound-reply-dispatch.js";
+  const url = pathToFileURL(posixPath).href;
 
-  // Should not throw. If `pathToFileURL` ever regressed and produced a raw
-  // Windows path or a `c:` scheme, this would throw `ERR_INVALID_URL`.
-  const parsed = new URL(url);
-  assert.equal(parsed.protocol, "file:", `parsed protocol should be file:, got ${parsed.protocol}`);
+  assert.ok(url.startsWith("file:///"), `expected file:/// URL, got: ${url}`);
+  assert.ok(
+    url.endsWith("/inbound-reply-dispatch.js"),
+    `tail should match: ${url}`,
+  );
+  assert.ok(!url.includes("\\"), `URL must not contain backslashes: ${url}`);
 });
 
 test("raw Windows-style path passed to import() reproduces the original ESM bug", async () => {
