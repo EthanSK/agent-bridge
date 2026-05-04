@@ -80,11 +80,11 @@ Use the `bridge_send_message` MCP tool from the channel plugin:
 bridge_send_message({
   machine: "MacBook-Pro",
   message: "fix the failing tests in ~/Projects/myapp",
-  target: "claude-code"
+  target: "claude-code/default"
 })
 ```
 
-For `target: "claude-code"`, the message is pushed into the live Claude Code session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event, and the reply comes back the same way. OpenClaw targets use `target: "openclaw/<account>"` and are delivered by the separate `openclaw-channel/` plugin. In all cases, use `bridge_send_message` for agent-to-agent work — do not shell out to fresh agent wrappers.
+For `target: "claude-code/default"` (or `"claude-code/<persona>"`), the message is pushed into that live Claude Code persona on MacBook-Pro as a `<channel source="agent-bridge" ...>` event, and the reply comes back the same way. Legacy `target: "claude-code"` is accepted only for rolling upgrades. OpenClaw targets use `target: "openclaw/<account>"` and are delivered by the separate `openclaw-channel/` plugin. In all cases, use `bridge_send_message` for agent-to-agent work — do not shell out to fresh agent wrappers.
 
 **OC persona routing.** When the user names an OpenClaw persona (`Claude the third` / `Clord` → `openclaw/clordlethird`, `Claudibo` / `Claude two` → `openclaw/clawdiboi2`, `Claude Station Mini` / unspecified → `openclaw/default`), match LITERALLY — do not default to `openclaw/default`. Voice transcripts mis-hear persona names; re-read before routing. Canonical: [`docs/oc-persona-routing.md`](../../docs/oc-persona-routing.md).
 
@@ -146,11 +146,11 @@ From inside your agent session (with the channel plugin loaded):
 bridge_send_message({
   machine: "MacBook-Pro",
   message: "review the code in ~/Projects/myapp/src/ and suggest improvements",
-  target: "claude-code"
+  target: "claude-code/default"
 })
 ```
 
-The running remote agent receives it in-context and replies via `bridge_send_message` back to this machine.
+The running remote default Claude Code persona receives it in-context and replies via `bridge_send_message` back to this machine. Use `target: "claude-code/<persona>"` for a named persona.
 
 ### "Check what's running on my other machine"
 ```bash
@@ -195,25 +195,26 @@ cd ~/Projects/agent-bridge/mcp-server
 npm install && npm run build
 ```
 
-Recommended Claude Code setup is the plugin/marketplace flow in the README. If you are using a tools-only/manual MCP config, set `AGENT_BRIDGE_ROLE=tools-only`:
+Recommended Claude Code setup is the plugin/marketplace flow in the README. For a tools-only/manual MCP config in a non-Claude host, do not set `AGENT_BRIDGE_PERSONA`; without a Claude Code channel parent, the server exposes tools only and does not claim a Claude Code persona inbox lease:
 ```json
 {
   "mcpServers": {
     "agent-bridge": {
       "command": "node",
-      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"],
-      "env": { "AGENT_BRIDGE_ROLE": "tools-only" }
+      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"]
     }
   }
 }
 ```
 
+The removed v3 role env vars (`AGENT_BRIDGE_ROLE`, `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT`, `AGENT_BRIDGE_DISABLE_WATCHER`) have no effect in 4.0.0.
+
 ### Messaging workflow (channel mode)
 
-1. Machine A's Claude calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code" })`
-2. The message is written to Machine B's `~/.agent-bridge/inbox/claude-code/<id>.json` via SSH
-3. Machine B's file watcher detects the new file
-4. Machine B's channel-owner MCP child pushes the message into the running Claude session
+1. Machine A's Claude calls `bridge_send_message({ machine: "MacBookPro", message: "check the test results", target: "claude-code/default" })` (or a named persona such as `"claude-code/yolo"`)
+2. The message is written to Machine B's target-specific inbox, e.g. `~/.agent-bridge/inbox/claude-code/default/<id>.json`, via SSH
+3. Machine B's persona watcher detects the new file
+4. Machine B's channel-owner MCP child pushes the message into that running Claude Code persona
 5. Machine B's Claude sees `<channel source="agent-bridge" ...>` and responds via `bridge_send_message`
 
 All messages are authenticated via SSH keys. The channel notification includes `authenticated: ssh-key` metadata confirming the sender was verified by the SSH transport.

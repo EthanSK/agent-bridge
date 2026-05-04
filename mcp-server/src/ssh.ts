@@ -423,8 +423,8 @@ export async function sshPing(
  * home directory being the SFTP session's starting cwd on every platform.
  *
  * Examples:
- *   `~/.agent-bridge/inbox/claude-code/m.json`
- *     → `.agent-bridge/inbox/claude-code/m.json`
+ *   `~/.agent-bridge/inbox/claude-code/default/m.json`
+ *     → `.agent-bridge/inbox/claude-code/default/m.json`
  *   `/Users/foo/.agent-bridge/inbox/...`
  *     → `/Users/foo/.agent-bridge/inbox/...`  (left alone — absolute)
  */

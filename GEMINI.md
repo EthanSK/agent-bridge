@@ -32,7 +32,7 @@ This enables SSH, generates an ED25519 key pair, and displays a pairing screen. 
 | `agent-bridge pair` | Pair with another machine (interactive or flags) |
 | `agent-bridge unpair <machine>` | Remove a pairing |
 
-> To communicate with the **running agent** on another machine, use the `bridge_send_message` MCP tool with an explicit `target` (for example `claude-code` or `openclaw/default`). `agent-bridge run` does not spawn or invoke an agent. The `--claude` / `--codex` / `--agent` flags were removed in 3.0.0.
+> To communicate with the **running agent** on another machine, use the `bridge_send_message` MCP tool with an explicit `target` (for example `claude-code/default`, `claude-code/<persona>`, or `openclaw/default`). `agent-bridge run` does not spawn or invoke an agent. The `--claude` / `--codex` / `--agent` flags were removed in 3.0.0.
 
 ## Pairing from a photo
 
@@ -51,7 +51,7 @@ agent-bridge run MacBook-Pro "ls -la ~/Projects"
 agent-bridge run MacBook-Pro "cd ~/Projects/myapp && git pull && npm install && npm run build"
 
 # Ask remote agent to review code — use the MCP tool, NOT a shell wrapper
-#   bridge_send_message({ machine: "MacBook-Pro", message: "review the code in ~/Projects/myapp", target: "claude-code" })
+#   bridge_send_message({ machine: "MacBook-Pro", message: "review the code in ~/Projects/myapp", target: "claude-code/default" })
 
 # Check system status
 agent-bridge run MacBook-Pro "uptime && df -h"

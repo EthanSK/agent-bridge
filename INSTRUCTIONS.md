@@ -54,13 +54,14 @@ agent-bridge pair --name "<name>" --host "<ip>" --port <port> --user "<user>" --
 Use `bridge_send_message` from the MCP server. **As of mcp-server 3.4.0 the `target` parameter is REQUIRED** — there is no default routing:
 
 ```
-bridge_send_message({ machine: "MacBook", message: "fix the failing tests", target: "claude-code" })
+bridge_send_message({ machine: "MacBook", message: "fix the failing tests", target: "claude-code/default" })
 bridge_send_message({ machine: "MacBook", message: "what's up?",            target: "openclaw/<account-alias>" })
 ```
 
-Each target maps to a subdir under `~/.agent-bridge/inbox/` on the remote (`inbox/claude-code/`, `inbox/openclaw/<account-alias>/`, …) and a specific listener picks it up:
+Each target maps to a subdir under `~/.agent-bridge/inbox/` on the remote (`inbox/claude-code/default/`, `inbox/claude-code/<persona>/`, `inbox/openclaw/<account-alias>/`, …) and a specific listener picks it up:
 
-- `target: "claude-code"` → Claude Code channel plugin pushes the message into the running Claude session as a `<channel source="agent-bridge" ...>` event.
+- `target: "claude-code/default"` → default Claude Code persona; the plugin pushes the message into the running Claude session as a `<channel source="agent-bridge" ...>` event. Legacy `target: "claude-code"` remains accepted for rolling upgrades and v4 receivers route it to the default persona.
+- `target: "claude-code/<persona>"` → named Claude Code persona on the receiving machine, e.g. `claude-code/yolo`.
 - `target: "<harness>/<account-alias>"` (e.g. `openclaw/<account-alias>`) → the harness's channel plugin dispatches the message into the per-account session for `<account-alias>`. For OpenClaw specifically, this is `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` — a synchronous agent turn runs and the reply is sent through the live Telegram outbound for the registered bot account because the synthetic ctxPayload pins `OriginatingChannel: "telegram"`.
 
 Calls without `target` are rejected. Legacy flat-file messages that land at the root of `inbox/` are moved to `inbox/.failed/_unrouted/` on next startup.
@@ -73,10 +74,10 @@ There is no fresh-spawn / `--print` equivalent. The old `agent-bridge run ... --
 
 ```
 bridge_send_message({ machine: "local",     message: "...", target: "openclaw/<account-alias>" })
-bridge_send_message({ machine: "Mac-Mini",  message: "...", target: "claude-code" })
+bridge_send_message({ machine: "Mac-Mini",  message: "...", target: "claude-code/default" })
 ```
 
-Use it when one MCP host on a machine needs to fan a message out to another agent harness on the **same** machine — the canonical case is a Claude Code session sending to OpenClaw embedded Telegram sessions running in the same OpenClaw gateway. The receiver still needs a watcher running on its own per-target subdir: the Claude Code channel plugin watches `inbox/claude-code/`, `openclaw-channel` watches `inbox/openclaw/<account>/`. agent-bridge does not push the message into the receiver itself; it just lands the file atomically.
+Use it when one MCP host on a machine needs to fan a message out to another agent harness on the **same** machine — the canonical case is a Claude Code session sending to OpenClaw embedded Telegram sessions running in the same OpenClaw gateway. The receiver still needs a watcher running on its own per-target subdir: Claude Code persona watchers watch `inbox/claude-code/<persona>/`, and `openclaw-channel` watches `inbox/openclaw/<account>/`. agent-bridge does not push the message into the receiver itself; it just lands the file atomically.
 
 Design notes:
 
@@ -91,11 +92,13 @@ Design notes:
 - Config directory: `~/.agent-bridge/`
 - Config file: `~/.agent-bridge/config` (INI-style, one `[section]` per machine)
 - Keys: `~/.agent-bridge/keys/` (ED25519, mode 600)
-- Inbox: `~/.agent-bridge/inbox/` — per-harness/per-target subdirs (3.4.0+):
-  - `inbox/claude-code/` — watched by the Claude Code channel plugin
+- Inbox: `~/.agent-bridge/inbox/` — per-harness/per-target subdirs (3.4.0+; Claude Code personas in 4.0.0+):
+  - `inbox/claude-code/default/` — watched by the default Claude Code persona
+  - `inbox/claude-code/<persona>/` — watched by a named Claude Code persona
+  - `inbox/claude-code/<id>.json` — legacy flat file from `target: "claude-code"`; v4 receivers migrate it to `default/`
   - `inbox/openclaw/<target>/` — watched by the openclaw-channel plugin
-  - `inbox/.archive/claude-code/` — delivered Claude Code messages retained for debug
-  - `inbox/.failed/claude-code/` — malformed/misrouted Claude Code-target files
+  - `inbox/.archive/claude-code/<persona>/` — delivered Claude Code messages retained for debug
+  - `inbox/.failed/claude-code/<persona>/` — malformed/misrouted Claude Code-target files
   - `inbox/.failed/_unrouted/` — legacy flat messages with no routable target, quarantined
   - `archive/openclaw/<target>/` — delivered OpenClaw messages retained for debug
   - `.openclaw-v2-delivered` — OpenClaw delivered-ID ledger
@@ -124,7 +127,7 @@ The MCP server provides the shared `bridge_*` tools for EXISTING running agent s
 When used with Claude Code, agent-bridge ships **one unified plugin** at [`mcp-server/`](mcp-server/). It hosts both:
 
 1. The 7 user-facing `bridge_*` tools (and the diagnostic `claude_code_channel_status` no-op tool).
-2. The long-lived inbox watcher that owns the `~/.agent-bridge/locks/claude-code.watcher-lock.json` lease, polls `~/.agent-bridge/inbox/claude-code/` at 2 s, and emits `notifications/claude/channel` back to the running session as:
+2. The long-lived inbox watcher that owns a persona-scoped lease such as `~/.agent-bridge/locks/claude-code__default.watcher-lock.json`, polls `~/.agent-bridge/inbox/claude-code/<persona>/` at 2 s, and emits `notifications/claude/channel` back to the running session as:
 
 ```
 <channel source="agent-bridge" from="MachineName" message_id="msg-xxx" ts="2026-01-01T00:00:00Z">
@@ -132,7 +135,7 @@ Message content here
 </channel>
 ```
 
-The agent responds using the `bridge_send_message` tool. By default the MCP server starts in `channel-owner` role (acquires the inbox lease + pushes channel notifications). Set `AGENT_BRIDGE_ROLE=tools-only` for non-Claude hosts that just want the outbound `bridge_*` tools without contending for the lease.
+The agent responds using the `bridge_send_message` tool. In 4.0.0, `AGENT_BRIDGE_PERSONA=<persona>` is the explicit Claude Code identity. If it is unset, a channel-capable Claude Code parent falls back to `default`; a non-Claude/tool-only parent does not claim any Claude inbox lease. The old role env vars (`AGENT_BRIDGE_ROLE`, `AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT`, `AGENT_BRIDGE_DISABLE_WATCHER`) were removed and have no effect.
 
 **Why one plugin?** The 3.6.0 split into a separate `claude-code-channel` plugin was based on the assumption that "channel-only plugins survive longer in Claude Code's plugin host." Production evidence (Mac Mini, 2026-04-26) showed that was wrong — the host actually gates idle reaping on **MCP tool-call frequency on stdio JSON-RPC**. Telegram (also a channel plugin) survives indefinitely because its 4 tools (`reply`, `react`, `download_attachment`, `edit_message`) get called constantly during normal use. A channel-only plugin with no tool calls gets reaped after every notification delivery, regardless of Patches G/H (SIGTERM ignore + no-op tool registered). 3.7.0 re-merges everything into one plugin so every `bridge_send_message` call resets the host's idle counter — same lifetime guarantees as Telegram. See `CHANGELOG.md` 3.7.0 entry for the full rationale.
 
@@ -142,7 +145,7 @@ OpenClaw push delivery is **not** Claude's `claude/channel` protocol. Keep the M
 
 ### Manual/polling fallback (unverified MCP hosts)
 
-`bridge_receive_messages` currently inspects/consumes the local Claude Code-target inbox (`inbox/claude-code/`). Use it for diagnostics, tools-only/manual setups, future harness-specific polling experiments, or — most importantly as of 3.8.0 — **subagent receive**.
+`bridge_receive_messages` currently inspects/consumes the active local Claude Code persona inbox (for example `inbox/claude-code/default/`). Use it for diagnostics, tools-only/manual setups, future harness-specific polling experiments, or — most importantly as of 3.8.0 — **subagent receive**.
 
 **Long-poll mode (3.8.0+).** Channel-push notifications (`<channel source="agent-bridge" ...>`) only reach the parent session. A subagent that needs to wait for a bridge reply should call:
 
@@ -179,14 +182,15 @@ Verify with `claude plugin list`. The plugin manifests live at `.claude-plugin/m
 > The flag is required **until the plugin is published through an official GitHub marketplace** Claude Code's allowlist trusts. Add it to your launch alias, e.g.:
 >
 > ```bash
-> alias claude-tel='claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official --dangerously-load-development-channels plugin:agent-bridge@agent-bridge'
+> alias claude-tel='AGENT_BRIDGE_PERSONA=default claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official --dangerously-load-development-channels plugin:agent-bridge@agent-bridge'
+> alias claude-yolo='AGENT_BRIDGE_PERSONA=yolo claude --dangerously-skip-permissions --channels plugin:telegram@claude-plugins-official --dangerously-load-development-channels plugin:agent-bridge@agent-bridge'
 > ```
 >
 > **Note:** `--dangerously-load-development-channels` takes a **tagged argument** (`plugin:<name>@<marketplace>` for an installed plugin's channel, or `server:<name>` for a raw MCP server) and does **both jobs in one entry**: activates the channel AND marks it as allowlist-exempt. Do NOT also add `--channels plugin:agent-bridge@agent-bridge` — that creates a second entry with `dev:false` that fails the allowlist check. Running the flag bare (no tag) also fails: `--dangerously-load-development-channels entries must be tagged: --channels plugin:<name>@<marketplace> | server:<name>`.
 
-**OpenClaw MCP tools:** add the MCP server as tools-only, then load the native channel plugin separately through OpenClaw config:
+**OpenClaw MCP tools:** add the MCP server for tools without `AGENT_BRIDGE_PERSONA`, then load the native channel plugin separately through OpenClaw config:
 ```bash
-openclaw mcp set agent-bridge '{"command":"node","args":["/absolute/path/to/agent-bridge/mcp-server/build/index.js"],"env":{"AGENT_BRIDGE_ROLE":"tools-only"}}'
+openclaw mcp set agent-bridge '{"command":"node","args":["/absolute/path/to/agent-bridge/mcp-server/build/index.js"]}'
 ```
 
 **Other MCP hosts (Codex, Gemini CLI, Aider):** add the server to the harness's MCP config for tools. Inbound receive/reply remains scaffolded until tested:
@@ -195,8 +199,7 @@ openclaw mcp set agent-bridge '{"command":"node","args":["/absolute/path/to/agen
   "mcpServers": {
     "agent-bridge": {
       "command": "node",
-      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"],
-      "env": { "AGENT_BRIDGE_ROLE": "tools-only" }
+      "args": ["/path/to/agent-bridge/mcp-server/build/index.js"]
     }
   }
 }
@@ -214,8 +217,8 @@ Prefer the plugin install path above for normal use, but a local-directory marke
 
 ### Message flow
 
-1. Machine A's agent calls `bridge_send_message({ machine: "MacBook", message: "check the test results", target: "claude-code" })` or an OpenClaw target like `target: "openclaw/default"`.
-2. The message is written to Machine B's target-specific inbox subdir via SSH, e.g. `~/.agent-bridge/inbox/claude-code/<id>.json` or `~/.agent-bridge/inbox/openclaw/default/<id>.json`.
+1. Machine A's agent calls `bridge_send_message({ machine: "MacBook", message: "check the test results", target: "claude-code/default" })`, a named persona target like `target: "claude-code/yolo"`, or an OpenClaw target like `target: "openclaw/default"`.
+2. The message is written to Machine B's target-specific inbox subdir via SSH, e.g. `~/.agent-bridge/inbox/claude-code/default/<id>.json`, `~/.agent-bridge/inbox/claude-code/yolo/<id>.json`, or `~/.agent-bridge/inbox/openclaw/default/<id>.json`.
 3. The target's listener detects the new file.
 4. **Claude Code push:** the channel-owner MCP child emits `notifications/claude/channel` into the running Claude session.
 5. **OpenClaw push:** the native OpenClaw plugin dispatches via `dispatchInboundReplyWithBase` into the resolved OpenClaw session.
@@ -224,7 +227,7 @@ Prefer the plugin install path above for normal use, but a local-directory marke
 
 ### Offline recovery
 
-Pending messages persist in their per-target inbox subdir until delivered, consumed, expired, or quarantined (default TTL: 1 day). On MCP server startup, undelivered Claude Code messages in `inbox/claude-code/` are replayed as channel notifications in chronological order; successfully delivered files are archived to `inbox/.archive/claude-code/`. A `.delivered` tracker prevents duplicate Claude Code notifications across restarts. This is replay-on-spawn durability, not a separate always-on Claude daemon. OpenClaw uses `~/.agent-bridge/.openclaw-v2-delivered` and archives under `~/.agent-bridge/archive/openclaw/<target>/`.
+Pending messages persist in their per-target inbox subdir until delivered, consumed, expired, or quarantined (default TTL: 1 day). On MCP server startup, undelivered Claude Code messages in the active persona inbox (for example `inbox/claude-code/default/`) are replayed as channel notifications in chronological order; successfully delivered files are archived to `inbox/.archive/claude-code/<persona>/`. Legacy `inbox/claude-code/*.json` files from `target: "claude-code"` are migrated into `default/` by v4 receivers. A `.delivered` tracker prevents duplicate Claude Code notifications across restarts. This is replay-on-spawn durability, not a separate always-on Claude daemon. OpenClaw uses `~/.agent-bridge/.openclaw-v2-delivered` and archives under `~/.agent-bridge/archive/openclaw/<target>/`.
 
 ### Authentication
 
@@ -242,13 +245,9 @@ All messages are delivered via SSH with key-based authentication. The `authentic
   "timestamp": "2026-04-13T01:15:00Z",
   "replyTo": null,
   "ttl": 86400,
-  "target": "claude-code",
-  "fromTarget": "claude-code"
+  "target": "claude-code/default",
+  "fromTarget": "claude-code/yolo"
 }
 ```
 
-The `target` field (added in 3.4.0) decides which inbox subdir on the receiver the message lands in, and therefore which listener consumes it. `fromTarget` is the sender's return target for bridge replies; Claude Code sends default it to `claude-code`, while OpenClaw senders should pass their own target such as `openclaw/default`.
-
-### Claude Code per-session targets (future work)
-
-Ideally each Claude Code session would identify itself with a flag (e.g. `claude --agent-bridge-target laptop-main`) so its channel plugin could watch a tighter subdir like `inbox/claude-code/laptop-main/`. That requires upstream support in `anthropics/claude-plugins-official/telegram` and is tracked as future work — for now all Claude Code sessions on a given machine share the `inbox/claude-code/` subdir.
+The `target` field (added in 3.4.0) decides which inbox subdir on the receiver the message lands in, and therefore which listener consumes it. For Claude Code, prefer `claude-code/default` or `claude-code/<persona>`; legacy `claude-code` is accepted for rolling upgrades and routes to the default persona on v4 receivers. `fromTarget` is the sender's return target for bridge replies; Claude Code defaults it to the active `claude-code/<persona>` (usually `claude-code/default`), while OpenClaw senders should pass their own target such as `openclaw/default`.

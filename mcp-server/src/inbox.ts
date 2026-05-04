@@ -67,9 +67,12 @@ export interface BridgeMessage {
   /**
    * Slash-delimited routing target. Added in mcp-server 3.4.0 to support the
    * per-harness/per-session inbox subdir layout. Examples:
-   *   "claude-code"
+   *   "claude-code/default"
+   *   "claude-code/yolo"
    *   "openclaw/default"
    *   "openclaw/clawdiboi2"
+   * Legacy "claude-code" is still accepted for rolling upgrades and routed
+   * to the receiver's default persona on v4 receivers.
    * Messages arriving without a target are moved to `.failed/_unrouted/` —
    * there is intentionally no default routing.
    */
@@ -81,15 +84,16 @@ export interface BridgeMessage {
    * one-way injection). Refinement 3 — 2026-04-20.
    *
    * Example: a message sent from Claude Code arrives with
-   * `fromTarget: "claude-code"`. When OpenClaw's agent calls
-   * `bridge_send_message`, `buildReply` copies `incoming.fromTarget` into
-   * `reply.target` so the reply lands back in Claude Code's inbox subdir.
+   * `fromTarget: "claude-code/default"` (or another active persona target).
+   * When OpenClaw's agent calls `bridge_send_message`, `buildReply` copies
+   * `incoming.fromTarget` into `reply.target` so the reply lands back in
+   * that Claude Code persona's inbox subdir.
    */
   fromTarget?: string;
 }
 
 export interface InboxStats {
-  /** Pending files in the claude-code target inbox only. */
+  /** Pending files in the active Claude Code persona inbox only. */
   pendingCount: number;
   oldestMessageAge: number | null; // seconds, or null if empty
   totalSizeBytes: number;
@@ -368,7 +372,7 @@ export function migrateLegacyFlatFiles(): number {
         moved += 1;
         logWarn(
           `Legacy flat-file inbox message moved to .failed/_unrouted/: ${entry.name}. `
-          + `Senders must now set BridgeMessage.target (e.g. "claude-code", "openclaw/clawdiboi2").`,
+          + `Senders must now set BridgeMessage.target (e.g. "claude-code/default", "openclaw/clawdiboi2").`,
         );
       } catch (err) {
         logError(`Failed to migrate legacy inbox file ${entry.name}: ${err}`);

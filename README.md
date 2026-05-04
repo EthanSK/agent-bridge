@@ -1476,7 +1476,7 @@ Messages are JSON files stored in the receiver's target-specific inbox subdir, e
 | `replyTo` | string or null | Message ID this is a reply to (for threading) |
 | `ttl` | number | Time-to-live in seconds. `0` = no expiry. Default: `86400` (1 day) |
 | `target` | string | Receiver target. For Claude Code use `claude-code/default` or `claude-code/<persona>`; legacy `claude-code` is accepted for rolling upgrades. |
-| `fromTarget` | string, optional | Sender return target. Claude Code sends default this to the active `claude-code/<persona>` so replies can route back. |
+| `fromTarget` | string, optional | Sender return target. Claude Code defaults this to the active `claude-code/<persona>` so replies can route back. |
 
 ---
 

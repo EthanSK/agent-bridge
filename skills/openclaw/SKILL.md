@@ -96,7 +96,7 @@ To ask the running remote agent to do work, use `bridge_send_message` (MCP), NOT
 bridge_send_message({
   machine: "MacBook-Pro",
   message: "review the code in ~/Projects/myapp",
-  target: "claude-code"
+  target: "claude-code/default"
 })
 ```
 

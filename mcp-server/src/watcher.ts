@@ -1,5 +1,6 @@
 /**
- * File watcher for incoming Claude Code messages in ~/.agent-bridge/inbox/claude-code/.
+ * File watcher for incoming Claude Code messages in the active persona inbox
+ * (for example ~/.agent-bridge/inbox/claude-code/default/).
  *
  * Polling-only (2s interval). No external dependencies.
  *

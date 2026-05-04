@@ -413,13 +413,14 @@ export function registerTools(server: McpServer): void {
   // 3.8.0 — long-poll/blocking receive support.
   //
   // Default behaviour (`wait=false`) is unchanged: a single snapshot of the
-  // claude-code inbox, peek or consume per the existing flag.
+  // active Claude Code persona inbox, peek or consume per the existing flag.
   //
   // When `wait=true`, the tool blocks until either:
   //   1. The inbox already contains messages at call time (returns
   //      immediately, no `timed_out` flag), OR
-  //   2. A new file arrives in `~/.agent-bridge/inbox/claude-code/` and
-  //      the watcher fires the in-process arrival listener (returns the
+  //   2. A new file arrives in the active persona inbox (for example
+  //      `~/.agent-bridge/inbox/claude-code/default/`) and the watcher
+  //      fires the in-process arrival listener (returns the
   //      now-pending messages, no `timed_out` flag), OR
   //   3. `timeout_seconds` elapses without an arrival (returns `[]` plus
   //      `timed_out: true` in the structured response so the caller can
@@ -439,8 +440,8 @@ export function registerTools(server: McpServer): void {
     {
       title: 'Receive Messages',
       description:
-        'Manual claude-code inbox inspection / long-poll receive. In normal Claude Code channel-owner mode, incoming messages are pushed automatically into the running parent session; channel pushes do NOT reach subagents. Subagents that need to receive a bridge reply should call this tool with `wait: true, timeout_seconds: 30` and loop on `timed_out: true` until the expected message arrives (or use `peek: true` so the parent and other subagents still see the same content). '
-        + 'Messages are removed from ~/.agent-bridge/inbox/claude-code/ after reading unless peek=true. Results are chronological, deduplicated, and TTL-expired messages are auto-pruned. '
+        'Manual active Claude Code persona inbox inspection / long-poll receive. In normal Claude Code channel-owner mode, incoming messages are pushed automatically into the running parent session; channel pushes do NOT reach subagents. Subagents that need to receive a bridge reply should call this tool with `wait: true, timeout_seconds: 30` and loop on `timed_out: true` until the expected message arrives (or use `peek: true` so the parent and other subagents still see the same content). '
+        + 'Messages are removed from the active persona inbox (for example ~/.agent-bridge/inbox/claude-code/default/) after reading unless peek=true. Results are chronological, deduplicated, and TTL-expired messages are auto-pruned. '
         + 'When `wait: true` and no message is in the inbox, the tool blocks until either an arrival is detected via the in-process watcher hook or `timeout_seconds` elapses. On timeout the response includes `timed_out: true` (additive flag — pre-3.8.0 callers ignoring it still see the empty result). Server-side cap on `timeout_seconds` is 60.',
       inputSchema: {
         peek: z
@@ -731,7 +732,7 @@ export function registerTools(server: McpServer): void {
     'bridge_clear_inbox',
     {
       title: 'Clear Inbox',
-      description: 'Remove all messages from the local claude-code inbox subdir.',
+      description: 'Remove all messages from the local active Claude Code persona inbox subdir.',
     },
     async () => {
       const count = clearInbox();
@@ -741,7 +742,7 @@ export function registerTools(server: McpServer): void {
             type: 'text' as const,
             text:
               count > 0
-                ? `Cleared ${count} message(s) from claude-code inbox.`
+                ? `Cleared ${count} message(s) from active Claude Code persona inbox.`
                 : 'Inbox was already empty.',
           },
         ],
@@ -755,13 +756,13 @@ export function registerTools(server: McpServer): void {
     {
       title: 'Inbox Stats',
       description:
-        'Get claude-code inbox statistics: pending message count, oldest message age, total size, watcher health, processed ID count, and failed/quarantined count.',
+        'Get active Claude Code persona inbox statistics: pending message count, oldest message age, total size, watcher health, processed ID count, and failed/quarantined count.',
     },
     async () => {
       const stats = getInboxStats();
       const lines = [
         'Claude Code Inbox Statistics:',
-        `  Pending claude-code messages: ${stats.pendingCount}`,
+        `  Pending active Claude Code persona messages: ${stats.pendingCount}`,
         `  Oldest message age: ${stats.oldestMessageAge !== null ? `${stats.oldestMessageAge}s` : 'n/a'}`,
         `  Total inbox size: ${formatBytes(stats.totalSizeBytes)}`,
         `  Watcher backend: ${stats.watcherBackend}`,

@@ -12,9 +12,9 @@
  *   2. The diagnostic no-op tool `claude_code_channel_status` originally
  *      added by 3.6.3 Patch H. Retained because it doubles as a useful
  *      health probe.
- *   3. The channel watcher itself: lease acquisition for
- *      `~/.agent-bridge/inbox/claude-code/`, the 2 s polling loop, and
- *      `notifications/claude/channel` push of incoming BridgeMessages back
+ *   3. The channel watcher itself: persona-scoped lease acquisition for
+ *      `~/.agent-bridge/inbox/claude-code/<persona>/`, the 2 s polling loop,
+ *      and `notifications/claude/channel` push of incoming BridgeMessages back
  *      into the running Claude Code session.
  *
  * Why we re-merged: the 3.6.0 split assumed Claude Code's plugin host would
@@ -744,7 +744,7 @@ async function main(): Promise<void> {
         '',
         'HOW TO TALK TO THE OTHER AGENT:',
         'bridge_send_message is the ONLY supported way to communicate with the running agent on another machine. When your user says "ask Claude on <machine>", "talk to <machine>", "check in with the other agent", "have a conversation", or anything in that spirit — they mean send a NATURAL-LANGUAGE message via bridge_send_message, as if you were speaking to a colleague. NOT a structured ping, status probe, or machine-readable payload. Write the message in English (or whatever language the conversation is in) the same way you would answer the user directly.',
-        'As of agent-bridge 3.4.0, bridge_send_message requires target. For round-trip conversations, from_target names the sender\'s local return target. Claude Code sends default this to the active claude-code/<persona> (usually claude-code/default); pass one_way=true only when no bridge reply should be possible.',
+        'As of agent-bridge 3.4.0, bridge_send_message requires target. For round-trip conversations, from_target names the sender\'s local return target. Claude Code defaults this to the active claude-code/<persona> (usually claude-code/default); pass one_way=true only when no bridge reply should be possible.',
         'There is NO other mechanism for agent-to-agent communication in this system. Do not attempt to shell out to `claude --print`, `codex exec`, `agent-bridge run <machine> "..." --claude`, or any other command that spawns a fresh non-interactive agent session on the remote machine. Those fresh-spawn wrappers were intentionally removed in agent-bridge 3.0.0 — they defeat the entire purpose of this plugin, which is to connect EXISTING, already-running agent sessions.',
         'Use bridge_run_command ONLY for plain shell diagnostics (check a process, read a file, look at a log, run `git status`) — never as a substitute for asking the remote agent a question, and never to invoke an agent CLI like `claude`, `codex`, or `aider` on the remote machine.',
         'Use bridge_status / bridge_inbox_stats ONLY when the user is asking about connectivity or queue health — never instead of actually asking the other agent how things are going.',
