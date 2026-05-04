@@ -31,7 +31,7 @@ export function formatRelayNotice(msg, opts = {}) {
   const fromTarget = clean(msg?.fromTarget);
   const target = clean(msg?.target) || (opts.targetName ? `openclaw/${opts.targetName}` : "openclaw/?");
   const id = clean(msg?.id);
-  const replyVia = clean(opts.replyVia);
+  const replyVia = formatReplyViaList(opts.replyVia);
   const preview = relayNoticePreview(msg?.content, opts.previewChars);
 
   const from = fromTarget ? `${fromMachine}/${fromTarget}` : fromMachine;
@@ -43,6 +43,19 @@ export function formatRelayNotice(msg, opts = {}) {
   if (id) lines.push(`id: ${id}`);
   if (preview) lines.push(`preview: “${preview}”`);
   return lines.join("\n");
+}
+
+/**
+ * Render a `replyVia` value (string OR array) for inclusion in the relay
+ * notice. Arrays are comma-joined so multi-channel fan-outs read cleanly
+ * ("reply path: telegram, agent-bridge"). Empty / unknown input yields "".
+ */
+function formatReplyViaList(value) {
+  if (Array.isArray(value)) {
+    const cleaned = value.map((v) => clean(v)).filter(Boolean);
+    return cleaned.join(", ");
+  }
+  return clean(value);
 }
 
 function clean(value) {

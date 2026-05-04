@@ -1,6 +1,18 @@
 /**
  * OpenClaw plugin entry point for @agent-bridge/openclaw-channel.
  *
+ * Multi-channel replyVia + implicit bridge fallback (2026-05-04)
+ * ---------------------------------------------------------------
+ * `replyVia` may now be a STRING (single channel — backward-compatible)
+ * or an ARRAY of strings (fan out to multiple reply channels per inbound).
+ * Independently, any inbound carrying `msg.fromTarget` (i.e. arrived via
+ * agent-bridge) implicitly appends `"agent-bridge"` to the resolved list,
+ * deduplicated. Combined effect: agent-to-agent threads always reply over
+ * the bridge regardless of how the target's replyVia is configured, and
+ * explicit fan-out (e.g. `["telegram", "agent-bridge"]`) lets Ethan see
+ * a Telegram echo while also keeping the silent peer-to-peer back-channel
+ * alive. See `resolveReplyChannels` for full precedence + dedup rules.
+ *
  * v2.3.1 — sender-derived replyVia default (2026-04-21)
  * ------------------------------------------------------
  * The replyVia fallback no longer hardcodes "telegram" when nothing else is
@@ -265,34 +277,22 @@ export default {
             const body = formatInboundBody(msg);
             const rawContent = String(msg.content ?? "");
 
-            // Resolve replyVia mode. Precedence:
-            //   1. Per-message `msg.replyVia` (sender-controlled override).
-            //   2. Per-target `target.config.replyVia`.
-            //   3. Plugin-level `pluginCfg.replyVia`.
-            //   4. Sender-derived default: if `msg.fromTarget` is present the
-            //      inbound hop was via agent-bridge (outbound senders stamp
-            //      it as e.g. "claude-code" or "openclaw/<acct>"), so mirror
-            //      the arrival channel and reply back over agent-bridge.
-            //      Otherwise assume the message arrived via Telegram (or
-            //      platform default) and reply via Telegram. This gives
-            //      "reply on the channel it came in on" semantics with no
-            //      config required.
-            //   5. Absolute fallback: "telegram" (unreachable as a literal —
-            //      senderDerived already covers both branches — but kept
-            //      inside normalizeReplyVia for unknown-value coercion).
-            const senderDerived = msg.fromTarget ? "agent-bridge" : "telegram";
-            const replyVia = normalizeReplyVia(
-              msg.replyVia
-                ?? target.config.replyVia
-                ?? pluginCfg.replyVia
-                ?? senderDerived,
+            // Resolve the LIST of reply channels this inbound should fan out
+            // to. See `resolveReplyChannels` for full precedence semantics.
+            // Always returns at least one channel.
+            const replyChannels = resolveReplyChannels({
+              msg,
+              target,
+              pluginCfg,
               log,
-              target.name,
-            );
+            });
 
             const account = target.config.account ?? target.name;
             const telegramPeerId = target.config.peer_id;
 
+            // ONE relay notice per inbound, listing all resolved reply paths
+            // (e.g. "reply path: telegram, agent-bridge"). Avoids per-channel
+            // duplicate Telegram pings for fan-out cases.
             await sendBridgeRelayNotice({
               runtime,
               hostCfg,
@@ -300,13 +300,15 @@ export default {
               target,
               account,
               msg,
-              replyVia,
+              replyVia: replyChannels.length === 1 ? replyChannels[0] : replyChannels,
               log,
             });
 
             // Legacy: targets flagged as legacy_session bypass session
             // injection and rely purely on the native agent-bridge channel.
-            // Register reply target and return early.
+            // Register reply target and return early. Multi-channel fanout is
+            // a no-op here — legacy_session has no real dispatch path to
+            // begin with.
             if (target.config.legacy_session) {
               const sessionKey = `${AGENT_BRIDGE_CHANNEL_ID}:${fromMachine}`;
               registerReplyTarget(replyTargets, {
@@ -323,184 +325,47 @@ export default {
               return;
             }
 
-            // Figure out the targetChannel + peer identity to inject as.
-            //   telegram mode:     channel=telegram, peer=<Ethan's telegram id>
-            //   agent-bridge mode: channel=agent-bridge, peer=<encoded sender machine + return target>
-            let targetChannel;
-            let peerId;
-            const returnTarget =
-              typeof msg.fromTarget === "string" && msg.fromTarget.trim()
-                ? msg.fromTarget.trim()
-                : "";
-            if (replyVia === "agent-bridge") {
-              targetChannel = AGENT_BRIDGE_CHANNEL_ID; // "agent-bridge"
-              if (!fromMachine || fromMachine === "unknown") {
-                throw new Error(
-                  `replyVia=agent-bridge target="${target.name}": cannot resolve sender machine from msg.from — refusing to dispatch`,
-                );
-              }
-              if (!returnTarget) {
-                throw new Error(
-                  `replyVia=agent-bridge target="${target.name}" requires msg.fromTarget so replies know which remote inbox target to use`,
-                );
-              }
-              peerId = encodeBridgePeerId(fromMachine, returnTarget);
-            } else {
-              targetChannel = target.config.openclaw_channel ?? "telegram";
-              peerId = telegramPeerId;
-              if (!peerId) {
-                throw new Error(
-                  `target "${target.name}" has no peer_id — cannot resolve session`,
+            // Fan out: dispatch the inbound through every resolved reply
+            // channel. Each channel gets its own session/route — telegram
+            // injects into Ethan's Telegram session, agent-bridge injects
+            // into the sender-machine peer session. Errors per-channel are
+            // captured so a single bad channel doesn't kill the others; if
+            // ALL channels fail we throw an aggregate at the end.
+            const errors = [];
+            for (const replyVia of replyChannels) {
+              try {
+                await dispatchOneReplyChannel({
+                  replyVia,
+                  msg,
+                  target,
+                  body,
+                  rawContent,
+                  fromMachine,
+                  account,
+                  telegramPeerId,
+                  runtime,
+                  hostCfg,
+                  replyTargets,
+                  dispatchInboundReplyWithBase,
+                  log,
+                });
+              } catch (err) {
+                errors.push({ replyVia, err });
+                log.error(
+                  `dispatch failed for ${msg.id} via "${replyVia}" `
+                  + `target=${target.name}: ${err?.message ?? err} — `
+                  + `stack: ${err?.stack ?? "(no stack)"}`,
                 );
               }
             }
-
-            // Resolve the canonical agent route. This uses the SDK's
-            // dmScope-aware session-key builder (session-key-CbP51u9x.js:175),
-            // so we don't need to hand-build the key.
-            //
-            // In agent-bridge mode we keep the originating OpenClaw account id
-            // AND encode the sender's return target in the peer id. The return
-            // target is part of the conversation identity; otherwise
-            // MacBookPro/claude-code and MacBookPro/openclaw/default would
-            // collapse onto one session and replies could land in the wrong
-            // remote inbox target after a later message overwrote the hint.
-            const routeAccountId = account;
-            const route = runtime.channel.routing.resolveAgentRoute({
-              cfg: hostCfg,
-              channel: targetChannel,
-              accountId: routeAccountId,
-              peer: {
-                kind: "direct",
-                id: String(peerId),
-              },
-            });
-
-            const storePath = runtime.channel.session.resolveStorePath(
-              hostCfg?.session?.store,
-              { agentId: route.agentId },
-            );
-
-            // Build the synthetic inbound ctxPayload. Provider/Surface and
-            // OriginatingChannel/OriginatingTo steer the reply back through
-            // the chosen outbound (Telegram's or our native agent-bridge
-            // channel's) — same mechanism either way, just different
-            // targetChannel.
-            const ctxPayload = runtime.channel.reply.finalizeInboundContext({
-              Body: body,
-              RawBody: rawContent,
-              CommandBody: rawContent,
-              From: `${targetChannel}:${peerId}`,
-              To: `${targetChannel}:${peerId}`,
-              SessionKey: route.sessionKey,
-              AccountId: route.accountId,
-              ChatType: "direct",
-              ConversationLabel: String(fromMachine ?? "agent-bridge"),
-              SenderId: String(peerId),
-              SenderName: String(fromMachine ?? "agent-bridge"),
-              Provider: targetChannel,
-              Surface: targetChannel,
-              MessageSid: msg.id,
-              Timestamp: msg.timestamp
-                ? (Number.isFinite(Number(msg.timestamp))
-                  ? Number(msg.timestamp)
-                  : Date.parse(msg.timestamp) || Date.now())
-                : Date.now(),
-              OriginatingChannel: targetChannel,
-              OriginatingTo: `${targetChannel}:${peerId}`,
-              // CommandAuthorized defaults via finalizeInboundContext; bridge
-              // content is untrusted, so we don't flip it on.
-            });
-
-            // Track reply target so the outbound adapters can route correctly:
-            //  - In telegram mode, our native agent-bridge channel is NOT on
-            //    the outbound path; this map entry is a belt-and-braces hint
-            //    in case the agent replies via our channel tool by hand.
-            //  - In agent-bridge mode, our channel-plugin.js :: sendText
-            //    consults this map (via ctx.threadId/accountId/to hints) to
-            //    resolve `fromMachine` for the SFTP destination. The key
-            //    MUST include the sessionKey AND the sender machine, which
-            //    registerReplyTarget already does.
-            registerReplyTarget(replyTargets, {
-              sessionKey: route.sessionKey,
-              fromMachine,
-              incoming: msg,
-              target,
-              accountId: account,
-              ownTarget: `openclaw/${account}`,
-              peerId: String(peerId),
-              returnTarget,
-            });
-
-            log.info(
-              `about to dispatch ${msg.id} from ${fromMachine} target=${target.name} replyVia=${replyVia} `
-              + `route.sessionKey=${route.sessionKey} channel=${targetChannel} accountId=${route.accountId}`,
-            );
-
-            try {
-              await dispatchInboundReplyWithBase({
-                cfg: hostCfg,
-                channel: targetChannel,
-                accountId: route.accountId,
-                route,
-                storePath,
-                ctxPayload,
-                core: runtime,
-                deliver: async (payload) => {
-                  // For targetChannel="telegram" we delegate to the live
-                  // telegram outbound registered on the host. For
-                  // targetChannel="agent-bridge" we delegate to our own
-                  // registered channel's sendText (channel-plugin.js), which
-                  // SFTP-delivers a BridgeMessage back to the sender machine. Either
-                  // way it goes through runtime.channel.outbound.loadAdapter.
-                  const deliverFn = resolveProviderDeliver({
-                    runtime,
-                    targetChannel,
-                  });
-                  if (!deliverFn) {
-                    throw new Error(
-                      `no outbound delivery function for channel="${targetChannel}" on this host`,
-                    );
-                  }
-                  const text = payload?.text ?? "";
-                  if (!text.trim()) return;
-                  await deliverFn({
-                    // For telegram, `peerId` is the numeric Telegram user id.
-                    // For agent-bridge, `peerId` is an encoded machine +
-                    // return-target tuple. channel-plugin.js decodes it before
-                    // calling deliverReply().
-                    to: String(peerId),
-                    text,
-                    cfg: hostCfg,
-                    accountId: route.accountId,
-                    replyToId: payload?.replyToId,
-                  });
-                },
-                onRecordError: (err) => {
-                  log.error(
-                    `dispatch ${msg.id}: recordInboundSession failed sessionKey=${route.sessionKey}: `
-                    + `${err?.message ?? err} — stack: ${err?.stack ?? "(no stack)"}`,
-                  );
-                },
-                onDispatchError: (err, info) => {
-                  log.error(
-                    `dispatch ${msg.id}: ${info?.kind ?? "reply"} failed sessionKey=${route.sessionKey}: `
-                    + `${err?.message ?? err} — stack: ${err?.stack ?? "(no stack)"}`,
-                  );
-                },
-              });
-            } catch (err) {
-              log.error(
-                `dispatchInboundReplyWithBase threw for ${msg.id} sessionKey=${route.sessionKey} `
-                + `target=${target.name}: ${err?.message ?? err} — `
-                + `stack: ${err?.stack ?? "(no stack)"}`,
+            if (errors.length === replyChannels.length && errors.length > 0) {
+              const summary = errors
+                .map(({ replyVia, err }) => `${replyVia}: ${err?.message ?? err}`)
+                .join("; ");
+              throw new Error(
+                `all reply channels failed for ${msg.id} target=${target.name}: ${summary}`,
               );
-              throw err;
             }
-
-            log.info(
-              `dispatched ${msg.id} from ${fromMachine} target=${target.name} sessionKey=${route.sessionKey}`,
-            );
           },
           }),
         });
@@ -529,6 +394,263 @@ export default {
     }
   },
 };
+
+/**
+ * Resolve the list of reply channels for an inbound message. Returns a
+ * non-empty array of normalized channel names (e.g. ["telegram"],
+ * ["agent-bridge"], or ["telegram", "agent-bridge"]).
+ *
+ * Precedence (each level may be a string OR an array of strings):
+ *   1. Per-message `msg.replyVia` (sender-controlled override).
+ *   2. Per-target `target.config.replyVia`.
+ *   3. Plugin-level `pluginCfg.replyVia`.
+ *   4. Sender-derived default: if `msg.fromTarget` is present the inbound
+ *      hop was via agent-bridge, so reply via agent-bridge; otherwise
+ *      reply via telegram. ("Reply on the channel it came in on.")
+ *
+ * Implicit bridge fallback (B): regardless of which level produced the
+ * channel list, if the inbound has `msg.fromTarget` set (i.e. the message
+ * really came in over agent-bridge) we ALWAYS append `"agent-bridge"` to
+ * the list (deduplicated). This guarantees the originating bridge peer
+ * gets a reply even if Ethan configured the target to mirror replies into
+ * Telegram only. Without this, agent-to-agent threads silently break the
+ * moment a target opts out of bridge replies.
+ *
+ * Each value is normalized through `normalizeReplyVia`, which lowercases
+ * and validates against the known modes ("telegram" | "agent-bridge").
+ * Unknown values fall back to "telegram" with a warn log. Duplicates are
+ * removed while preserving first-occurrence order.
+ */
+function resolveReplyChannels({ msg, target, pluginCfg, log }) {
+  const explicit = msg.replyVia
+    ?? target?.config?.replyVia
+    ?? pluginCfg?.replyVia
+    ?? null;
+
+  let channels;
+  if (Array.isArray(explicit)) {
+    channels = explicit
+      .filter((v) => v != null)
+      .map((v) => normalizeReplyVia(v, log, target?.name));
+  } else if (explicit != null) {
+    channels = [normalizeReplyVia(explicit, log, target?.name)];
+  } else {
+    const senderDerived = msg.fromTarget ? "agent-bridge" : "telegram";
+    channels = [normalizeReplyVia(senderDerived, log, target?.name)];
+  }
+
+  // Implicit bridge fallback: any inbound that arrived over agent-bridge
+  // (signalled by msg.fromTarget) must always also reply via agent-bridge,
+  // unless the resolved list already includes it.
+  if (msg.fromTarget && !channels.includes("agent-bridge")) {
+    channels.push("agent-bridge");
+  }
+
+  // De-dup while preserving order. Empty list shouldn't be possible (each
+  // level above produces at least one entry), but guard anyway.
+  const seen = new Set();
+  const deduped = [];
+  for (const c of channels) {
+    if (!c || seen.has(c)) continue;
+    seen.add(c);
+    deduped.push(c);
+  }
+  if (deduped.length === 0) deduped.push("telegram");
+  return deduped;
+}
+
+/**
+ * Dispatch the inbound message through ONE reply channel. Extracted from
+ * the onMessage hook so we can fan out the same inbound to multiple reply
+ * paths (see `resolveReplyChannels`) without duplicating the per-channel
+ * peer/route/session-injection bookkeeping. Throws on dispatch failure so
+ * the caller can decide whether to continue with remaining channels.
+ */
+async function dispatchOneReplyChannel({
+  replyVia,
+  msg,
+  target,
+  body,
+  rawContent,
+  fromMachine,
+  account,
+  telegramPeerId,
+  runtime,
+  hostCfg,
+  replyTargets,
+  dispatchInboundReplyWithBase,
+  log,
+}) {
+  // Figure out the targetChannel + peer identity to inject as.
+  //   telegram mode:     channel=telegram, peer=<Ethan's telegram id>
+  //   agent-bridge mode: channel=agent-bridge, peer=<encoded sender machine + return target>
+  let targetChannel;
+  let peerId;
+  const returnTarget =
+    typeof msg.fromTarget === "string" && msg.fromTarget.trim()
+      ? msg.fromTarget.trim()
+      : "";
+  if (replyVia === "agent-bridge") {
+    targetChannel = AGENT_BRIDGE_CHANNEL_ID; // "agent-bridge"
+    if (!fromMachine || fromMachine === "unknown") {
+      throw new Error(
+        `replyVia=agent-bridge target="${target.name}": cannot resolve sender machine from msg.from — refusing to dispatch`,
+      );
+    }
+    if (!returnTarget) {
+      throw new Error(
+        `replyVia=agent-bridge target="${target.name}" requires msg.fromTarget so replies know which remote inbox target to use`,
+      );
+    }
+    peerId = encodeBridgePeerId(fromMachine, returnTarget);
+  } else {
+    targetChannel = target.config.openclaw_channel ?? "telegram";
+    peerId = telegramPeerId;
+    if (!peerId) {
+      throw new Error(
+        `target "${target.name}" has no peer_id — cannot resolve session`,
+      );
+    }
+  }
+
+  // Resolve the canonical agent route. This uses the SDK's
+  // dmScope-aware session-key builder (session-key-CbP51u9x.js:175),
+  // so we don't need to hand-build the key.
+  //
+  // In agent-bridge mode we keep the originating OpenClaw account id
+  // AND encode the sender's return target in the peer id. The return
+  // target is part of the conversation identity; otherwise
+  // MacBookPro/claude-code and MacBookPro/openclaw/default would
+  // collapse onto one session and replies could land in the wrong
+  // remote inbox target after a later message overwrote the hint.
+  const routeAccountId = account;
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg: hostCfg,
+    channel: targetChannel,
+    accountId: routeAccountId,
+    peer: {
+      kind: "direct",
+      id: String(peerId),
+    },
+  });
+
+  const storePath = runtime.channel.session.resolveStorePath(
+    hostCfg?.session?.store,
+    { agentId: route.agentId },
+  );
+
+  // Build the synthetic inbound ctxPayload. Provider/Surface and
+  // OriginatingChannel/OriginatingTo steer the reply back through
+  // the chosen outbound (Telegram's or our native agent-bridge
+  // channel's) — same mechanism either way, just different
+  // targetChannel.
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
+    Body: body,
+    RawBody: rawContent,
+    CommandBody: rawContent,
+    From: `${targetChannel}:${peerId}`,
+    To: `${targetChannel}:${peerId}`,
+    SessionKey: route.sessionKey,
+    AccountId: route.accountId,
+    ChatType: "direct",
+    ConversationLabel: String(fromMachine ?? "agent-bridge"),
+    SenderId: String(peerId),
+    SenderName: String(fromMachine ?? "agent-bridge"),
+    Provider: targetChannel,
+    Surface: targetChannel,
+    MessageSid: msg.id,
+    Timestamp: msg.timestamp
+      ? (Number.isFinite(Number(msg.timestamp))
+        ? Number(msg.timestamp)
+        : Date.parse(msg.timestamp) || Date.now())
+      : Date.now(),
+    OriginatingChannel: targetChannel,
+    OriginatingTo: `${targetChannel}:${peerId}`,
+    // CommandAuthorized defaults via finalizeInboundContext; bridge
+    // content is untrusted, so we don't flip it on.
+  });
+
+  // Track reply target so the outbound adapters can route correctly:
+  //  - In telegram mode, our native agent-bridge channel is NOT on
+  //    the outbound path; this map entry is a belt-and-braces hint
+  //    in case the agent replies via our channel tool by hand.
+  //  - In agent-bridge mode, our channel-plugin.js :: sendText
+  //    consults this map (via ctx.threadId/accountId/to hints) to
+  //    resolve `fromMachine` for the SFTP destination. The key
+  //    MUST include the sessionKey AND the sender machine, which
+  //    registerReplyTarget already does.
+  registerReplyTarget(replyTargets, {
+    sessionKey: route.sessionKey,
+    fromMachine,
+    incoming: msg,
+    target,
+    accountId: account,
+    ownTarget: `openclaw/${account}`,
+    peerId: String(peerId),
+    returnTarget,
+  });
+
+  log.info(
+    `about to dispatch ${msg.id} from ${fromMachine} target=${target.name} replyVia=${replyVia} `
+    + `route.sessionKey=${route.sessionKey} channel=${targetChannel} accountId=${route.accountId}`,
+  );
+
+  await dispatchInboundReplyWithBase({
+    cfg: hostCfg,
+    channel: targetChannel,
+    accountId: route.accountId,
+    route,
+    storePath,
+    ctxPayload,
+    core: runtime,
+    deliver: async (payload) => {
+      // For targetChannel="telegram" we delegate to the live
+      // telegram outbound registered on the host. For
+      // targetChannel="agent-bridge" we delegate to our own
+      // registered channel's sendText (channel-plugin.js), which
+      // SFTP-delivers a BridgeMessage back to the sender machine. Either
+      // way it goes through runtime.channel.outbound.loadAdapter.
+      const deliverFn = resolveProviderDeliver({
+        runtime,
+        targetChannel,
+      });
+      if (!deliverFn) {
+        throw new Error(
+          `no outbound delivery function for channel="${targetChannel}" on this host`,
+        );
+      }
+      const text = payload?.text ?? "";
+      if (!text.trim()) return;
+      await deliverFn({
+        // For telegram, `peerId` is the numeric Telegram user id.
+        // For agent-bridge, `peerId` is an encoded machine +
+        // return-target tuple. channel-plugin.js decodes it before
+        // calling deliverReply().
+        to: String(peerId),
+        text,
+        cfg: hostCfg,
+        accountId: route.accountId,
+        replyToId: payload?.replyToId,
+      });
+    },
+    onRecordError: (err) => {
+      log.error(
+        `dispatch ${msg.id}: recordInboundSession failed sessionKey=${route.sessionKey}: `
+        + `${err?.message ?? err} — stack: ${err?.stack ?? "(no stack)"}`,
+      );
+    },
+    onDispatchError: (err, info) => {
+      log.error(
+        `dispatch ${msg.id}: ${info?.kind ?? "reply"} failed sessionKey=${route.sessionKey}: `
+        + `${err?.message ?? err} — stack: ${err?.stack ?? "(no stack)"}`,
+      );
+    },
+  });
+
+  log.info(
+    `dispatched ${msg.id} from ${fromMachine} target=${target.name} replyVia=${replyVia} sessionKey=${route.sessionKey}`,
+  );
+}
 
 function getProcessState() {
   const g = globalThis;
@@ -757,6 +879,8 @@ export const __testing = {
   buildWatcherSignature,
   startOrReuseWatcher,
   normalizeExplicitTargets,
+  resolveReplyChannels,
+  normalizeReplyVia,
 };
 
 function resolveTargets({ pluginCfg, openclawGlobalCfg, log }) {
