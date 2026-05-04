@@ -292,18 +292,29 @@ async function runSendLocalInSandbox(home, target, fromTarget) {
   });
 }
 
-test('Sender addresses target=claude-code (legacy): receiver-side routes to inbox/claude-code/default/', { timeout: 8_000 }, async () => {
+test('Sender addresses target=claude-code (legacy): file lands at flat inbox/claude-code/<id>.json with target preserved (rolling-upgrade compat)', { timeout: 8_000 }, async () => {
+  // Rolling-upgrade compatibility (codex review pass 3): when a v4 sender
+  // addresses the legacy `claude-code` literal, the file MUST land at the
+  // un-scoped legacy path with `target` and `fromTarget` left untouched.
+  // This is the ONLY shape a still-running v3 channel-owner can read
+  // (v3 watchers scan flat `inbox/claude-code/*.json` and assert
+  // `target === "claude-code"`). v4 receivers handle the same file via
+  // `migrateLegacyClaudeCodeInboxFiles()` which drains it into
+  // `inbox/claude-code/default/` on init AND periodically via the watcher
+  // tick. The same rule applies to local sends because v4 tools-only
+  // siblings can coexist with a v3 channel-owner on the same host (no
+  // lease-based eviction for tools-only children).
   const home = await mkdtemp(join(tmpdir(), 'ab-persona-legacy-target-'));
   try {
     const msgId = await runSendLocalInSandbox(home, 'claude-code', 'claude-code');
-    const expected = join(home, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msgId}.json`);
-    assert.ok(existsSync(expected), `expected file at ${expected}`);
+    const expected = join(home, '.agent-bridge', 'inbox', 'claude-code', `${msgId}.json`);
+    assert.ok(existsSync(expected), `expected file at flat legacy path ${expected}`);
     const parsed = JSON.parse(await readFile(expected, 'utf8'));
-    assert.equal(parsed.target, 'claude-code/default', 'legacy `claude-code` target rewritten');
-    assert.equal(parsed.fromTarget, 'claude-code/default', 'legacy fromTarget also rewritten');
+    assert.equal(parsed.target, 'claude-code', 'legacy `claude-code` target preserved on the wire');
+    assert.equal(parsed.fromTarget, 'claude-code', 'legacy fromTarget preserved on the wire');
 
-    const legacyPath = join(home, '.agent-bridge', 'inbox', 'claude-code', `${msgId}.json`);
-    assert.equal(existsSync(legacyPath), false, 'no file at the un-scoped legacy path');
+    const personaPath = join(home, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msgId}.json`);
+    assert.equal(existsSync(personaPath), false, 'file must NOT be pre-routed into `default/` subdir');
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -614,16 +625,39 @@ test('source-level: AGENT_BRIDGE_PERSONA is the only identity env var read in sh
   );
 });
 
-test('source-level: .mcp.json no longer carries an env block', async () => {
+test('source-level: .mcp.json pins AGENT_BRIDGE_PERSONA=default for cross-platform channel-mode default', async () => {
+  // 4.0.0 (codex review pass 3): the bundled .mcp.json must default the
+  // persona to `default` so channel mode works on hosts where the
+  // cmdline-fallback path can't resolve channel-capability — notably
+  // Windows (no `ps` binary) and any host that hides parent argv. Without
+  // this default, those installs would resolve to
+  // `tools_only_no_parent_cmdline` and silently lose inbound channel
+  // delivery. User shell env overrides this default for non-default
+  // personas (env-var precedence is enforced in resolveIdentity).
   const mcpJsonPath = join(__dirname, '..', '.mcp.json');
   const raw = await readFile(mcpJsonPath, 'utf8');
   const parsed = JSON.parse(raw);
   const server = parsed?.mcpServers?.['agent-bridge'];
   assert.ok(server, '.mcp.json must declare the agent-bridge server');
+  assert.ok(server.env, '.mcp.json env block must be present');
   assert.equal(
-    server.env,
+    server.env.AGENT_BRIDGE_PERSONA,
+    'default',
+    '.mcp.json must pin AGENT_BRIDGE_PERSONA=default for cross-platform channel mode',
+  );
+  // 4.0.0 — only AGENT_BRIDGE_PERSONA may live here. The legacy v3 triad
+  // (AGENT_BRIDGE_ROLE / ALLOW_NON_CHANNEL_PARENT / DISABLE_WATCHER) MUST
+  // stay removed.
+  assert.equal(server.env.AGENT_BRIDGE_ROLE, undefined, 'legacy AGENT_BRIDGE_ROLE must not be in .mcp.json');
+  assert.equal(
+    server.env.AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT,
     undefined,
-    '4.0.0: .mcp.json env block must be removed (PERSONA comes from the parent shell)',
+    'legacy AGENT_BRIDGE_ALLOW_NON_CHANNEL_PARENT must not be in .mcp.json',
+  );
+  assert.equal(
+    server.env.AGENT_BRIDGE_DISABLE_WATCHER,
+    undefined,
+    'legacy AGENT_BRIDGE_DISABLE_WATCHER must not be in .mcp.json',
   );
 });
 

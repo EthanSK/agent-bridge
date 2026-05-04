@@ -669,26 +669,19 @@ export function sendLocalMessage(message: BridgeMessage): void {
 
   ensureInboxDirs();
 
-  // 4.0.0 — backward-compat: a sender that addresses the legacy
-  // `target=claude-code` (no slash) lands at the default persona's subdir
-  // on the receiver. We rewrite the in-memory message AND its `target`
-  // field in the JSON-on-disk so the watcher's persona-scoped target
-  // check accepts it. The outbox copy carries the rewritten target too,
-  // matching the canonical inbox file.
-  //
-  // Local-only — same machine means same agent-bridge version (a v3.x
-  // process and a v4.0+ process never coexist on the same host because
-  // a single channel-owner lease coordinates them). The rolling-upgrade
-  // concern that suppresses the rewrite in `sendMessage` (SSH path)
-  // does NOT apply here.
-  if (message.target === CLAUDE_CODE_TARGET) {
-    message.target = claudeCodeTargetForPersona(DEFAULT_PERSONA);
-  }
-  if (message.fromTarget === CLAUDE_CODE_TARGET) {
-    // Reply round-trip: rewrite the sender's own return-target so the
-    // receiver's eventual reply lands on the default persona.
-    message.fromTarget = claudeCodeTargetForPersona(DEFAULT_PERSONA);
-  }
+  // 4.0.0 — rolling-upgrade compatibility: when the caller addresses the
+  // legacy `claude-code` literal (no persona segment), DO NOT rewrite the
+  // wire `target` or the on-disk path. The rolling-upgrade case applies
+  // locally too: a v4 tools-only sibling MCP child can coexist with a
+  // still-running v3 channel-owner on the same host because tools-only
+  // siblings do NOT participate in the channel-owner lease (no eviction).
+  // A pre-4.0 receiver only watches `inbox/claude-code/*.json` (flat) and
+  // only accepts `target === "claude-code"`; rewriting either field would
+  // silently drop the message until the v3 channel-owner is replaced.
+  // 4.0+ receivers handle the legacy form natively:
+  // `migrateLegacyClaudeCodeInboxFiles` runs on init AND periodically via
+  // the watcher tick, and `isTargetForActivePersona` accepts
+  // `target === "claude-code"` directly.
 
   const targetDir = inboxSubdir(message.target);
   if (!existsSync(targetDir)) {

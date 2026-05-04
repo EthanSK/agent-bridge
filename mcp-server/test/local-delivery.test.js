@@ -8,7 +8,7 @@
 // Run with `npm test` (after `npm run build`).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, readdirSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, readdirSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -59,7 +59,15 @@ test('getMachine returns undefined for the local name and aliases (no SSH route 
   assert.equal(config.getMachine('self'), undefined);
 });
 
-test('sendLocalMessage rewrites legacy claude-code target to persona-scoped claude-code/default (4.0.0 backward compat)', () => {
+test('sendLocalMessage with legacy claude-code target lands at flat inbox/claude-code/<id>.json (rolling-upgrade compat)', () => {
+  // 4.0.0 (codex review pass 3): legacy `claude-code` addressing is
+  // preserved on the wire AND on disk. A v4 tools-only sibling MCP child
+  // can coexist with a v3 channel-owner on the same host (tools-only
+  // children don't participate in the lease, so eviction doesn't apply).
+  // Pre-4.0 receivers only watch flat `inbox/claude-code/*.json` and only
+  // accept `target === "claude-code"`. v4 receivers handle the same file
+  // via `migrateLegacyClaudeCodeInboxFiles()` (init + periodic watcher
+  // tick) which drains it into `inbox/claude-code/default/`.
   const msg = inbox.createMessage(
     'TestMachine',
     'TestMachine',
@@ -73,25 +81,31 @@ test('sendLocalMessage rewrites legacy claude-code target to persona-scoped clau
 
   inbox.sendLocalMessage(msg);
 
-  // 4.0.0 — Sender-side normalization rewrites the legacy literal
-  // `claude-code` to `claude-code/default` so the file lands in the
-  // default persona's persona-scoped subdir, where a 4.0.0+ receiver
-  // looks for inbound messages.
-  const expectedPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msg.id}.json`);
+  const expectedPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', `${msg.id}.json`);
   const raw = readFileSync(expectedPath, 'utf8');
   const parsed = JSON.parse(raw);
 
   assert.equal(parsed.id, msg.id);
-  assert.equal(parsed.target, 'claude-code/default');
-  assert.equal(parsed.fromTarget, 'claude-code/default');
+  assert.equal(parsed.target, 'claude-code', 'legacy `claude-code` target preserved on the wire');
+  assert.equal(parsed.fromTarget, 'claude-code', 'legacy fromTarget preserved on the wire');
   assert.equal(parsed.content, 'hello local world');
   assert.equal(parsed.from, 'TestMachine');
   assert.equal(parsed.to, 'TestMachine');
 
-  // The outbox copy should also exist.
+  // File must NOT be pre-routed into the persona subdir.
+  const personaPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msg.id}.json`);
+  assert.equal(
+    existsSync(personaPath),
+    false,
+    'file must NOT be pre-routed into `default/` subdir on the sender side',
+  );
+
+  // The outbox copy should also exist (with legacy target preserved).
   const outboxPath = join(sandbox, '.agent-bridge', 'outbox', `${msg.id}.json`);
   const outboxRaw = readFileSync(outboxPath, 'utf8');
-  assert.equal(JSON.parse(outboxRaw).id, msg.id);
+  const outboxParsed = JSON.parse(outboxRaw);
+  assert.equal(outboxParsed.id, msg.id);
+  assert.equal(outboxParsed.target, 'claude-code', 'outbox copy mirrors the wire target');
 });
 
 test('sendLocalMessage with explicit claude-code/foo target writes to claude-code/foo/ (no rewrite for already-scoped target)', () => {
@@ -167,9 +181,9 @@ test('sendLocalMessage atomic write: no .tmp files left behind on success', () =
   );
   inbox.sendLocalMessage(msg);
 
-  // 4.0.0 — `claude-code` is rewritten to `claude-code/default` so the
-  // file lands in the persona-scoped subdir.
-  const targetDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default');
+  // 4.0.0 (codex review pass 3): legacy `claude-code` lands at the flat
+  // legacy path on disk. Verify the same dir has no orphan tmp files.
+  const targetDir = join(sandbox, '.agent-bridge', 'inbox', 'claude-code');
   const tmpFiles = readdirSync(targetDir).filter(f => f.startsWith('.agent-bridge-') && f.endsWith('.tmp'));
   assert.equal(tmpFiles.length, 0, `unexpected tmp files: ${tmpFiles.join(',')}`);
 });
@@ -202,12 +216,13 @@ test('mixed scenario: local send lands in local inbox even when paired remotes e
   assert.equal(config.isLocalMachineName('TestMachine'), true);
 
   // A local-targeted send goes to the local inbox without touching SSH.
-  // 4.0.0 — legacy `claude-code` is rewritten to `claude-code/default`.
+  // 4.0.0 (codex review pass 3): legacy `claude-code` lands at the flat
+  // legacy path on disk for rolling-upgrade compat.
   const msg = inbox.createMessage(
     'TestMachine', 'TestMachine', 'message', 'mixed', null, 60, 'claude-code', undefined,
   );
   inbox.sendLocalMessage(msg);
-  const localPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', 'default', `${msg.id}.json`);
+  const localPath = join(sandbox, '.agent-bridge', 'inbox', 'claude-code', `${msg.id}.json`);
   assert.equal(JSON.parse(readFileSync(localPath, 'utf8')).id, msg.id);
 });
 
