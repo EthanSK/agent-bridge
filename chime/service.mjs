@@ -1,5 +1,18 @@
 #!/usr/bin/env node
 
+// HARD KILL SWITCH — if `~/.agent-bridge/chime/.kill-switch` exists,
+// exit immediately. Bypasses any --ensure auto-spawn from sibling
+// CLIs/subagents. Established 2026-05-04 (Ethan voice 6328 + 6332 + 6335:
+// "Just disable the agent chime fucking thing. ... I just heard another
+// agent chime"). Remove the file (`rm ~/.agent-bridge/chime/.kill-switch`)
+// to re-enable spawn.
+import { existsSync as _ksExistsSync } from "node:fs";
+import { homedir as _ksHomedir } from "node:os";
+import { join as _ksJoin } from "node:path";
+if (_ksExistsSync(_ksJoin(_ksHomedir(), ".agent-bridge/chime/.kill-switch"))) {
+  process.exit(0);
+}
+
 // =============================================================================
 // agent-bridge chime service — Mini-as-master architecture (2026-05-04)
 // =============================================================================
