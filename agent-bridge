@@ -2018,6 +2018,64 @@ cmd_plugin_registry_rewire() {
   exec node "$rewire_script" "$@"
 }
 
+cmd_install_periodic_update() {
+  # [PERIODIC-UPDATE 2026-05-04] Provision the harness-INDEPENDENT periodic
+  # auto-updater. macOS = launchd LaunchAgent (10min); Windows = Scheduled
+  # Task (10min). Idempotent: re-runs cleanly tear down and re-create.
+  #
+  # Usage:
+  #   agent-bridge install-periodic-update [--with-openclaw-mcp-repair]
+  #
+  # Forwards --with-openclaw-mcp-repair to the provisioner so each periodic
+  # run also re-asserts the OpenClaw MCP server entry against the dev clone's
+  # mcp-server/build/index.js (preserves MBP behaviour where a single OS-level
+  # job both updates the bridge AND keeps OC's MCP wiring fresh).
+  local resolved script_dir repo_root provisioner candidate
+  resolved="$0"
+  while [ -h "$resolved" ]; do
+    script_dir="$(cd -P "$(dirname "$resolved")" && pwd)"
+    resolved="$(readlink "$resolved")"
+    [[ "$resolved" != /* ]] && resolved="$script_dir/$resolved"
+  done
+  repo_root="$(cd -P "$(dirname "$resolved")" && pwd)"
+
+  local os_name
+  os_name="$(uname -s 2>/dev/null || printf 'unknown')"
+  local provisioner_name="install-periodic-update.sh"
+  case "$os_name" in
+    MINGW*|MSYS*|CYGWIN*) provisioner_name="install-periodic-update.ps1" ;;
+  esac
+
+  provisioner=""
+  for candidate in \
+    "$repo_root/scripts/$provisioner_name" \
+    "$HOME/Projects/agent-bridge/scripts/$provisioner_name" \
+    "$HOME/.openclaw/workspace/agent-bridge/scripts/$provisioner_name" \
+    "${USERPROFILE:-$HOME}/Projects/agent-bridge/scripts/$provisioner_name" \
+    "${USERPROFILE:-$HOME}/.openclaw/workspace/agent-bridge/scripts/$provisioner_name"; do
+    if [ -f "$candidate" ]; then
+      provisioner="$candidate"
+      break
+    fi
+  done
+
+  [ -n "$provisioner" ] || die "$provisioner_name not found in any known location. Re-run install.sh / install.ps1, or invoke from a workspace clone."
+
+  case "$provisioner_name" in
+    *.ps1)
+      local ps_bin=""
+      if command -v powershell.exe >/dev/null 2>&1; then ps_bin=powershell.exe
+      elif command -v powershell >/dev/null 2>&1; then ps_bin=powershell
+      fi
+      [ -n "$ps_bin" ] || die "powershell.exe required to install the Windows Scheduled Task"
+      exec "$ps_bin" -NoProfile -ExecutionPolicy Bypass -File "$provisioner" "$@"
+      ;;
+    *)
+      exec /bin/bash "$provisioner" "$@"
+      ;;
+  esac
+}
+
 cmd_mcp_incident_report() {
   # 3.14.4 — Human-readable post-mortem report for an MCP-disconnect window.
   # Greps ~/.agent-bridge/logs/agent-bridge.log for the relevant Patch F /
@@ -2189,6 +2247,7 @@ cmd_help() {
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
   printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
   printf '  plugin-registry-rewire  Self-heal stale plugin-registry entries (Claude Code + OpenClaw)\n'
+  printf '  install-periodic-update Install harness-independent 10min auto-updater (LaunchAgent / Scheduled Task)\n'
   printf '  mcp-incident-report     Post-mortem report of MCP disconnect events around a timestamp\n'
   printf '  connect <machine>  Open an interactive SSH session\n'
   printf '  run <machine> "cmd"  Run a plain shell command on a paired machine (diagnostics only)\n'
@@ -2238,6 +2297,7 @@ main() {
     config)   cmd_config "$@" ;;
     chime)    cmd_chime "$@" ;;
     plugin-registry-rewire) cmd_plugin_registry_rewire "$@" ;;
+    install-periodic-update) cmd_install_periodic_update "$@" ;;
     mcp-incident-report) cmd_mcp_incident_report "$@" ;;
     connect)  cmd_connect "$@" ;;
     run)      cmd_run "$@" ;;

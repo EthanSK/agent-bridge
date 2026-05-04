@@ -142,6 +142,39 @@ if (Test-Path $ClaudeDir) {
     }
 }
 
+# --------------------------------------------------------------------------
+# [PERIODIC-UPDATE 2026-05-04] Install the harness-INDEPENDENT periodic
+# auto-updater (Windows Scheduled Task every 10 min). Default ON for fresh
+# installs. Opt-out via $env:AGENT_BRIDGE_NO_PERIODIC_UPDATE = '1'.
+# --------------------------------------------------------------------------
+if ($env:AGENT_BRIDGE_NO_PERIODIC_UPDATE -eq '1') {
+    Write-Host '  [skip] AGENT_BRIDGE_NO_PERIODIC_UPDATE=1 — skipping periodic-update Scheduled Task.' -ForegroundColor DarkGray
+} else {
+    $Provisioner = $null
+    if ($ScriptDirCandidate -and (Test-Path (Join-Path $ScriptDirCandidate 'scripts\install-periodic-update.ps1'))) {
+        $Provisioner = Join-Path $ScriptDirCandidate 'scripts\install-periodic-update.ps1'
+    } elseif (Test-Path (Join-Path $env:USERPROFILE 'Projects\agent-bridge\scripts\install-periodic-update.ps1')) {
+        $Provisioner = Join-Path $env:USERPROFILE 'Projects\agent-bridge\scripts\install-periodic-update.ps1'
+    } elseif (Test-Path (Join-Path $env:USERPROFILE '.openclaw\workspace\agent-bridge\scripts\install-periodic-update.ps1')) {
+        $Provisioner = Join-Path $env:USERPROFILE '.openclaw\workspace\agent-bridge\scripts\install-periodic-update.ps1'
+    }
+
+    if ($Provisioner) {
+        Write-Host '  Installing periodic-update Scheduled Task (10 min interval)...' -ForegroundColor DarkGray
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Provisioner
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "  [warn] Periodic-update provisioner exited with code $LASTEXITCODE. Run 'agent-bridge install-periodic-update' manually to retry." -ForegroundColor Yellow
+            }
+        } catch {
+            Write-Host "  [warn] Periodic-update provisioner failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host '  [skip] No local clone with scripts\install-periodic-update.ps1 found — skipping periodic-update Scheduled Task.' -ForegroundColor DarkGray
+        Write-Host "         Clone the repo and run 'agent-bridge install-periodic-update' to enable harness-independent auto-update." -ForegroundColor DarkGray
+    }
+}
+
 Write-Host ''
 Write-Host '  Get started:'
 Write-Host '    agent-bridge setup'

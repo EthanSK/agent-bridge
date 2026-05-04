@@ -148,6 +148,39 @@ PYEOF
   fi
 fi
 
+# --------------------------------------------------------------------------
+# [PERIODIC-UPDATE 2026-05-04] Install the harness-INDEPENDENT periodic
+# auto-updater (launchd LaunchAgent every 10 min). Default ON for fresh
+# installs. Opt-out via AGENT_BRIDGE_NO_PERIODIC_UPDATE=1.
+#
+# Skipped if no local clone with scripts/install-periodic-update.sh is
+# reachable (e.g. when this installer was piped via curl|bash and the user
+# hasn't cloned the repo yet — they can re-run after cloning, or run
+# `agent-bridge install-periodic-update` manually).
+# --------------------------------------------------------------------------
+if [ "${AGENT_BRIDGE_NO_PERIODIC_UPDATE:-0}" = "1" ]; then
+  printf "${DIM}  [skip] AGENT_BRIDGE_NO_PERIODIC_UPDATE=1 — skipping periodic-update LaunchAgent.${RESET}\n"
+else
+  PROVISIONER=""
+  if [ -n "${SCRIPT_DIR:-}" ] && [ -f "$SCRIPT_DIR/scripts/install-periodic-update.sh" ]; then
+    PROVISIONER="$SCRIPT_DIR/scripts/install-periodic-update.sh"
+  elif [ -f "$HOME/Projects/agent-bridge/scripts/install-periodic-update.sh" ]; then
+    PROVISIONER="$HOME/Projects/agent-bridge/scripts/install-periodic-update.sh"
+  fi
+
+  if [ -n "$PROVISIONER" ]; then
+    printf "${DIM}  Installing periodic-update LaunchAgent (10 min interval)...${RESET}\n"
+    if /bin/bash "$PROVISIONER"; then
+      :
+    else
+      printf "${DIM}  [warn] Periodic-update provisioner failed (rc=%s). Run 'agent-bridge install-periodic-update' manually to retry.${RESET}\n" "$?"
+    fi
+  else
+    printf "${DIM}  [skip] No local clone with scripts/install-periodic-update.sh found — skipping periodic-update LaunchAgent.${RESET}\n"
+    printf "${DIM}         Clone the repo and run 'agent-bridge install-periodic-update' to enable harness-independent auto-update.${RESET}\n"
+  fi
+fi
+
 printf '\n'
 printf "  Get started:\n"
 printf "${DIM}    agent-bridge setup${RESET}\n"

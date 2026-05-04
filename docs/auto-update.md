@@ -1,6 +1,6 @@
 # agent-bridge auto-update flow
 
-[AUTO-UPDATE-CHECK 2026-04-29] · [PLUGIN-REGISTRY-REWIRE 2026-05-01]
+[AUTO-UPDATE-CHECK 2026-04-29] · [PLUGIN-REGISTRY-REWIRE 2026-05-01] · [PERIODIC-UPDATE 2026-05-04]
 
 This doc describes the full auto-update sequence — from the periodic origin
 probe down to the post-build self-healing of harness-side plugin registry
@@ -8,7 +8,19 @@ entries — and the operator levers for tuning, debugging, and forcing it.
 
 ## Overview
 
-Auto-update has two halves:
+Auto-update has **two independent layers**:
+
+- **Layer 1 — In-process probe + receiver-driven runner** (harness-DEPENDENT).
+  Runs every 3 hours from inside the running mcp-server process. Notifies all
+  local harnesses via `[BRIDGE-UPDATE-AVAILABLE]` bridge messages; one of
+  them runs the build under a same-host coord lock.
+- **Layer 2 — OS-level periodic updater** (harness-INDEPENDENT). Runs every
+  10 minutes via launchd LaunchAgent (macOS) or Scheduled Task (Windows).
+  Fires whether or not any Claude Code / OpenClaw harness is alive, so
+  unattended Macs and freshly-booted machines still pick up new code.
+  See [Periodic update LaunchAgent / Scheduled Task](#periodic-update-launchagent--scheduled-task) below.
+
+Within Layer 1, auto-update has two halves:
 
 1. **Probe** (`scripts/check-update.sh`)
    - Runs every 3 hours from `armAutoUpdateProbe()` in
@@ -153,6 +165,114 @@ agent-bridge plugin-registry-rewire --verbose # log to stderr
 ```
 
 This is the same code path as the auto-update flow's Step 3.
+
+## Periodic update LaunchAgent / Scheduled Task
+
+[PERIODIC-UPDATE 2026-05-04]
+
+### Why this exists
+
+Layer 1's in-process probe only runs while a harness is alive. If Ethan logs
+out, kills Claude Code, or boots a Mac that's been off for 12 hours, no
+auto-update fires until he relaunches the harness — and at that point the
+harness boots from stale code. The historical mitigation was an ad-hoc
+LaunchAgent dropped onto MBP and Dell from a 2026-04-29 OpenClaw session,
+but Mini was never targeted in that session, leaving Mini's auto-update
+strictly harness-dependent.
+
+Layer 2 fixes that by bundling the LaunchAgent / Scheduled Task definitions
+INTO the agent-bridge repo. `install.sh` and `install.ps1` provision them on
+fresh installs; the `agent-bridge install-periodic-update` CLI verb is the
+self-heal lever for retro-fixing existing fleet machines.
+
+### What it does
+
+`scripts/agent-bridge-periodic-update.sh` (macOS / Linux) and
+`scripts/agent-bridge-periodic-update.ps1` (Windows) run every 10 minutes
+under a per-checkout lock. Each invocation:
+
+1. `git fetch origin --prune`.
+2. If origin/main is ahead of HEAD AND working tree is clean →
+   `git pull --ff-only origin main`.
+3. If pulled OR `mcp-server/build/index.js` is missing OR HEAD changed since
+   the last recorded build → `npm install && npm run build` inside
+   `mcp-server/`.
+4. `agent-bridge plugin-registry-rewire` to self-heal harness-side registry
+   drift (idempotent no-op on clean state).
+5. **(Optional, when invoked with `--with-openclaw-mcp-repair`)** re-assert
+   the OpenClaw `agent-bridge` MCP server entry against the dev clone's
+   `mcp-server/build/index.js`. Preserves MBP's pre-2026-05-04 behaviour
+   where one OS-level job both updates the bridge and keeps OC's MCP wiring
+   fresh.
+
+The body deliberately does NOT restart the OpenClaw gateway and does NOT
+type `/reload-plugins` into the user's Claude Code terminal. Both are
+interactive / runtime actions outside the scope of a 10-min background job.
+Ethan's CLAUDE.md `/reload-plugins is NOT a hot-reload` rule still applies:
+to actually load a new mcp-server build, fully restart Claude Code at the
+user's own cadence.
+
+### Files
+
+- `scripts/agent-bridge-periodic-update.sh` — macOS / Linux body.
+- `scripts/agent-bridge-periodic-update.ps1` — Windows body.
+- `scripts/install-periodic-update.sh` — macOS provisioner. Generates
+  `~/Library/LaunchAgents/com.ethansk.agent-bridge.periodic-update.plist`,
+  bootouts any prior agent under that label, then `launchctl bootstrap
+  gui/$UID`. Idempotent.
+- `scripts/install-periodic-update.ps1` — Windows provisioner. Registers the
+  `AgentBridge Periodic Update` Scheduled Task with a 10-min repeating
+  trigger plus a logon trigger. Idempotent.
+
+The launchd Label is `com.ethansk.agent-bridge.periodic-update` (NEW
+namespace as of 2026-05-04, renamed from the historical
+`ai.openclaw.agentbridge-self-update` since the job now lives in the bridge
+repo and is no longer OC-coupled).
+
+### CLI verb
+
+```bash
+agent-bridge install-periodic-update                          # plain provision
+agent-bridge install-periodic-update --with-openclaw-mcp-repair  # MBP-style: also keep OC MCP wiring fresh
+```
+
+Same code path as the `install.sh` / `install.ps1` step. Run this on any
+existing fleet machine that was installed before 2026-05-04 to lay down the
+new LaunchAgent / Scheduled Task without re-running the full installer.
+
+### Opt-out
+
+Set `AGENT_BRIDGE_NO_PERIODIC_UPDATE=1` in the environment when running
+`install.sh` / `install.ps1` to skip the provisioner. The CLI verb itself
+ignores the env var — Ethan's explicit invocation always wins.
+
+### Logs
+
+- `~/.agent-bridge/logs/periodic-update.log` — per-run human-readable log
+  (also captures launchd's stdout/stderr).
+- `~/.claude/logs/skills.log` — NDJSON events under
+  `skill: "agent-bridge-periodic-update"` when the
+  `~/.claude/scripts/skill-log.sh` helper exists. Same convention as every
+  other unified-log skill.
+
+### Migration from the legacy `ai.openclaw.agentbridge-self-update` job
+
+On MBP and Dell the legacy LaunchAgent (`ai.openclaw.agentbridge-self-update`)
+remains active alongside the new `com.ethansk.agent-bridge.periodic-update`.
+Both run every 10 min so updates happen twice as often during the migration
+window — harmless, just slightly noisier in the log. To clean up:
+
+```bash
+# macOS
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.openclaw.agentbridge-self-update.plist
+rm -i ~/Library/LaunchAgents/ai.openclaw.agentbridge-self-update.plist
+```
+
+On Windows the legacy job (if any) is `AgentBridge Self-Update`:
+
+```powershell
+Unregister-ScheduledTask -TaskName 'AgentBridge Self-Update' -Confirm:$false
+```
 
 ## Operator levers
 
