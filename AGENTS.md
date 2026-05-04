@@ -321,6 +321,44 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /usr/sbin/sshd
 ### Using Tailscale
 If both machines are on Tailscale, use the Tailscale hostname or IP instead of the local IP. This works across networks.
 
+### Stale chime daemon — kill all but the most recent
+
+The fleet-aware chime service (`chime/service.mjs`) is a long-running daemon that holds a lease at `~/.agent-bridge/locks/agent-bridge-chime.lock.json`. **Only one instance should ever be running per machine.** When debugging chime issues — sounds firing twice, sounds not firing, "where is the chime even coming from?" — the first thing to check is whether multiple `service.mjs` processes are alive.
+
+```bash
+ps -axww -o pid,etime,command | grep 'agent-bridge/chime/service.mjs' | grep -v grep
+```
+
+If you see more than one PID, you have a stale duplicate. The daemon has a lease/heartbeat coordination mechanism (`acquireLease()` in `service.mjs`), but a daemon that lost the race for the lease can sit alive in a zombie state — internal Node handles keep the process from exiting cleanly even after `runService()` returns. Symptoms:
+
+- `~/.agent-bridge/chime/chime.log` and `state.json` mtimes lag far behind real time even though `ps` says the process exists
+- The unified `~/.agent-bridge/logs/agent-bridge.log` shows `chime.snapshot_sent` events from a different PID than the one currently in `ps`
+- `~/.agent-bridge/locks/agent-bridge-chime.lock.json` is missing or holds a different PID than the running process
+
+**Recovery:** kill all chime daemons but the one currently holding the lease (or kill them all and let `--ensure` respawn cleanly):
+
+```bash
+# 1. Identify the lease-holder (if any)
+cat ~/.agent-bridge/locks/agent-bridge-chime.lock.json 2>/dev/null
+
+# 2. List all running chime daemons
+ps -axww -o pid,etime,command | grep 'agent-bridge/chime/service.mjs' | grep -v grep
+
+# 3. Kill every PID that is NOT the current lease-holder. SIGTERM first; if it
+#    survives 2 seconds, SIGKILL.
+kill <pid>
+sleep 2; ps -p <pid> 2>/dev/null && kill -9 <pid>
+
+# 4. If you killed everything, respawn cleanly:
+node ~/Projects/agent-bridge/chime/service.mjs --ensure
+
+# 5. Verify exactly one daemon and a fresh lease:
+ps -axww -o pid,command | grep 'agent-bridge/chime/service.mjs' | grep -v grep
+cat ~/.agent-bridge/locks/agent-bridge-chime.lock.json
+```
+
+Do not reuse the older PID — `--ensure` checks the lease and either no-ops (if a healthy daemon is running) or spawns a fresh detached child. After respawn, `tail -f ~/.agent-bridge/logs/agent-bridge.log | jq -c 'select(.event | startswith("chime."))'` should immediately show `chime.started` followed by periodic `chime.snapshot_sent` heartbeats.
+
 ## Security notes
 
 - All communication uses SSH with key-based authentication
