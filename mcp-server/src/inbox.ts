@@ -186,7 +186,9 @@ export function getActivePersona(): string {
  * that need a non-null fallback (e.g. the inbox/watcher subdir resolvers)
  * should use the dir-scoped helpers — those always have a coherent persona
  * to fall back to. Sender code that wants the "did we bind?" signal calls
- * this helper directly and falls back to `claude-code` (legacy) on null.
+ * this helper directly; normal tool reply routing uses
+ * `getActiveClaudeCodeTargetOrDefault()` so tools-only/cold-start sends
+ * fall back to `claude-code/default`.
  */
 export function getActiveClaudeCodeTarget(): string | null {
   return personaIsBound ? activeClaudeCodeTarget : null;

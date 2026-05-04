@@ -217,7 +217,7 @@ export function registerTools(server: McpServer): void {
         + 'The `machine` parameter accepts either a paired remote machine name OR the local machine name (or one of the aliases "local", "self", "localhost"). Same-machine delivery is first-class (3.5.0+): the message JSON is written directly to ~/.agent-bridge/inbox/<target>/<id>.json with no SSH hop. Useful for routing to embedded agents (e.g. target="<harness>/<account-alias>") on the same host.\n\n'
         + 'The target field is REQUIRED as of agent-bridge 3.4.0 — there is intentionally no default delivery routing. '
         + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup. '
-        + '`from_target` / `fromTarget` defaults to `claude-code/<persona>` (the active persona of THIS Claude Code session) for normal Claude Code sends so the remote agent can reply back into THIS session\'s inbox subdir. Falls back to the legacy `claude-code` literal in tools-only mode (no persona resolved). '
+        + '`from_target` / `fromTarget` defaults to `claude-code/<persona>` (the active persona of THIS Claude Code session) for normal Claude Code sends so the remote agent can reply back into THIS session\'s inbox subdir. Falls back to `claude-code/default` when no persona is bound (for example tools-only/cold-start contexts). '
         + 'Set `one_way=true` only when you intentionally do not want a bridge reply path.',
       inputSchema: {
         machine: z
@@ -294,7 +294,7 @@ export function registerTools(server: McpServer): void {
               type: 'text' as const,
               text:
                 `Missing/invalid target. The target field is REQUIRED as of agent-bridge 3.4.0 — there is no default routing. `
-                + `Use "claude-code" for Claude Code ↔ Claude Code, or "<harness>/<account-alias>" (e.g. "openclaw/default") for a per-account session. `
+                + `Use "claude-code/default" for the default Claude Code persona, "claude-code/<persona>" for a named Claude Code persona, or "<harness>/<account-alias>" (e.g. "openclaw/default") for a per-account session. `
                 + `Got: ${JSON.stringify(target ?? null)}.`,
             },
           ],
@@ -350,7 +350,7 @@ export function registerTools(server: McpServer): void {
               type: 'text' as const,
               text:
                 `Missing/invalid from_target. When provided it must be a valid target like `
-                + `"claude-code" or "<harness>/<account-alias>". `
+                + `"claude-code/default", "claude-code/<persona>", or "<harness>/<account-alias>". `
                 + `Got: ${JSON.stringify(resolvedFromTarget)}.`,
             },
           ],
