@@ -132,6 +132,12 @@ peer_id` warnings — those flag bridge-only targets that need
 automatically; warnings would only fire if a target has a non-bridge-only
 shape without a peer_id).
 
+## What's new in v3.0.0
+
+- **Breaking: agent-driven reply routing.** The plugin no longer auto-fans-out replies via `replyVia`. It injects the inbound bridge message into one OpenClaw agent turn with a `[BRIDGE-CONTEXT]` block, then the agent chooses whether to reply over the bridge and/or user-facing channels.
+- **`additionalReplyChannels` replaces `replyVia`.** Use it only as a hint for user-facing channels (`["telegram"]`, `[]`, or sentinels like `"none"` / `"default"`). The old `replyVia` key is deprecated and ignored after one startup warning.
+- **Single-turn dispatch hardening.** Inbound bridge messages now drive exactly one `dispatchInboundReplyWithBase` call, bridge-only array configs are handled explicitly, Windows ESM import paths use `pathToFileURL`, and relay notices include the running agent-bridge version so stale fleet members are visible.
+
 ## What's new in v2.4.1
 
 - **Telegram-visible Agent Bridge relay receipts.** Every inbound bridge message to an OpenClaw target now sends a short best-effort notice to the configured chat before the agent turn runs. The notice starts with `[Agent Bridge relay] 🛰️`, then shows `from/fromTarget → target`, reply path, message id, and a compact preview. This restores the old “I can see another harness messaged this OpenClaw” affordance even when the actual agent reply uses the silent `replyVia: "agent-bridge"` back-channel.
@@ -158,14 +164,14 @@ shape without a peer_id).
 
 ## How it works
 
-| | This module (v2.2.0) |
+| | This module (v3.0+) |
 | --- | --- |
 | Registration | `ChannelPlugin` via `api.registerChannel()` |
-| Inbound dispatch | `dispatchInboundReplyWithBase` from `openclaw/plugin-sdk/compat` (same primitive used by native IRC / Nextcloud Talk channels) |
-| Session key | Resolved via `runtime.channel.routing.resolveAgentRoute({cfg, channel: "telegram", accountId, peer: {kind: "direct", id: peer_id}})` — respects `cfg.session.dmScope` |
-| Routing | Per-target subdir `~/.agent-bridge/inbox/openclaw/<target>/` — each target maps to one Telegram bot / account session |
-| Reply path | `replyVia="telegram"` keeps `OriginatingChannel="telegram"` + `OriginatingTo="telegram:<peerId>"`; `replyVia="agent-bridge"` injects on the native `agent-bridge` channel with an encoded bridge peer id, so in-turn replies SFTP back over agent-bridge instead of Telegram |
-| Cross-harness reply | Outbound `ChannelOutboundAdapter.sendText` on the native `agent-bridge` channel is still available for the rare case where the peer is an agent-bridge-aware harness |
+| Inbound dispatch | One `dispatchInboundReplyWithBase` call per inbound bridge message, using the same primitive as native OpenClaw channels. The injected body contains the original `<channel source="agent-bridge" ...>` block plus `[BRIDGE-CONTEXT]`. |
+| Session key | Resolved through OpenClaw's routing helpers for the chosen primary channel/account/peer. Telegram-bound targets use their configured `peer_id`; bridge-only targets should set `openclaw_channel: "agent-bridge"`. |
+| Routing | Per-target subdir `~/.agent-bridge/inbox/openclaw/<target>/` — each target maps to one configured OpenClaw account/session target. |
+| Reply path | Agent-driven. Natural turn output goes through the primary session-bound outbound; `additionalReplyChannels` only hints which user-facing channels the agent should consider. Bridge replies use `bridge_send_message` / `fromTarget` rather than legacy `replyVia` fan-out. |
+| Cross-harness reply | The inbound `[BRIDGE-CONTEXT]` exposes the sender machine and return target so the agent can send a bridge reply back to the originating harness. |
 
 ## Install
 
