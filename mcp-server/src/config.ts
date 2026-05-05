@@ -25,7 +25,7 @@ import { basename, join } from 'path';
  * `AGENT_BRIDGE_DISABLE_WATCHER` were removed in 4.0.0; persona +
  * cmdline-fallback fully supersede them.
  */
-export const MCP_SERVER_VERSION = '4.0.0';
+export const MCP_SERVER_VERSION = '4.0.1';
 
 /**
  * 4.0.0 — persona env var that identifies this Claude Code instance for

@@ -29,11 +29,11 @@ test("formatRelayNotice uses a glanceable Agent Bridge relay header", () => {
       target: "openclaw/clordlethird",
       content: "Please sync the setup repo and reply with status.",
     },
-    { targetName: "clordlethird", replyVia: "agent-bridge", agentBridgeVersion: "4.0.0" },
+    { targetName: "clordlethird", replyVia: "agent-bridge", agentBridgeVersion: "4.0.1" },
   );
 
   assert.match(text, /^\[Agent Bridge relay\] 🛰️/);
-  assert.match(text, /agent-bridge: v4\.0\.0/);
+  assert.match(text, /agent-bridge: v4\.0\.1/);
   assert.match(text, /received: MacBookPro\/claude-code → openclaw\/clordlethird/);
   assert.match(text, /reply path: agent-bridge/);
   assert.match(text, /id: msg-123/);
