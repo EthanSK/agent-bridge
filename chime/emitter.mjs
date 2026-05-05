@@ -81,9 +81,18 @@ function buildEnvelope({ toMachine, fromMachine, payload, replyTo = null }) {
  * that don't need to wait (CLI hooks) can fire-and-forget.
  */
 export async function emitLifecycleEvent({ kind, sourceId, harness, agentId, label = null, extra = {} }) {
+  const config = loadChimeConfig();
+  // 4.0.1 (Codex P2 2026-05-04) — short-circuit when chimes are disabled.
+  // Without this, hooks would still queue lifecycle events into the chime
+  // inbox, which the disabled service ignores. If the user later enables
+  // chimes, the accumulated stale `agent.end` files would replay and fire
+  // surprise chimes. Returning early means disabled mode is truly silent
+  // and stateless.
+  if (config.enabled === false) {
+    return { delivered: "skipped-disabled", master: null, role: roleFor(config, localMachineName()) };
+  }
   ensureService();
   const machine = localMachineName();
-  const config = loadChimeConfig();
   const role = roleFor(config, machine);
   const master = masterMachineOf(config);
 
@@ -128,7 +137,13 @@ export async function emitLifecycleEvent({ kind, sourceId, harness, agentId, lab
   } catch (err) {
     // Master unreachable — fall back to local inbox so SOME chime still fires.
     // Better to play on the wrong machine than to silently drop.
-    const fallback = buildEnvelope({ toMachine: machine, fromMachine: machine, payload });
+    // 4.0.1 (Codex P2 2026-05-04): mark the fallback payload with
+    // `_localFallback: true` so the service can override peer-suppression
+    // and actually play the sound on this machine. Without this hint, the
+    // service would update fleet state but stay silent (peer role gates
+    // shouldPlayHere=false), defeating the entire fallback.
+    const fallbackPayload = { ...payload, _localFallback: true };
+    const fallback = buildEnvelope({ toMachine: machine, fromMachine: machine, payload: fallbackPayload });
     deliverReplyLocal({
       message: fallback,
       toMachine: machine,

@@ -292,7 +292,21 @@ function recordPeerRegistrationFromPayload(payload, now = Date.now()) {
 async function processInboxOnce() {
   ensureChimeDirs();
   const config = loadChimeConfig();
-  if (config.enabled === false) return;
+  if (config.enabled === false) {
+    // 4.0.1 (Codex P2 2026-05-04) — drain (archive without playback) any
+    // files that landed in the inbox while disabled. Without this, old
+    // pre-disable files would replay if the user later re-enables chimes.
+    // Going forward the emitter short-circuits, so no new files arrive,
+    // but a one-time drain protects users upgrading from <4.0.1.
+    try {
+      for (const name of readdirSync(CHIME_INBOX_DIR).filter((n) => n.endsWith(".json")).sort()) {
+        archiveProcessedFile(join(CHIME_INBOX_DIR, name));
+      }
+    } catch {
+      // best-effort drain
+    }
+    return;
+  }
   const role = roleFor(config);
   const state = loadChimeState();
   const files = readdirSync(CHIME_INBOX_DIR)
@@ -311,6 +325,10 @@ async function processInboxOnce() {
   // and matches the same-cycle pitch decision below.
   let lastPerAgentOriginMachine = null;
   let lastPerAgentWasLocal = false;
+  // 4.0.1 (Codex P2 2026-05-04) — track local-fallback marker so the
+  // playback gate can override peer-suppression for emitter-fallback
+  // events (peer with unreachable master).
+  let saw_localFallbackInCycle = false;
 
   for (const name of files) {
     const filePath = join(CHIME_INBOX_DIR, name);
@@ -324,6 +342,18 @@ async function processInboxOnce() {
     const payload = parsed.payload || {};
     const eventOriginMachine = String(payload.machine || "").trim();
     const isRemoteEvent = eventOriginMachine && eventOriginMachine !== localMachineName();
+    // 4.0.1 (Codex P2 R3 2026-05-04) — only trust the local-fallback marker
+    // when the envelope is from-local-to-local AND the payload's origin is
+    // the local machine. Without this gate, a remote (or misrouted) message
+    // could set `_localFallback: true` and bypass peer-suppression.
+    if (
+      payload._localFallback === true
+      && parsed.envelope?.from === localMachineName()
+      && parsed.envelope?.to === localMachineName()
+      && eventOriginMachine === localMachineName()
+    ) {
+      saw_localFallbackInCycle = true;
+    }
 
     if (payload.kind === "chime.register" || payload.kind === "chime.heartbeat") {
       // Peer ↔ master registration handshake. Master records; peer ignores
@@ -377,10 +407,16 @@ async function processInboxOnce() {
   // -------------------------------------------------------------------------
   // PLAYBACK DECISION — Mini-as-master.
   // -------------------------------------------------------------------------
-  const shouldPlayHere =
+  const baseShouldPlay =
     config.enabled !== false
     && config.playback !== "off"
     && (role === "master" || role === "standalone");
+  // 4.0.1 (Codex P2 2026-05-04) — local-fallback override for peer role.
+  // When this peer's master is unreachable, the emitter writes events
+  // locally with `_localFallback: true` so SOME chime fires. Without this
+  // override, the role-gate above would suppress playback entirely.
+  const sawLocalFallback = saw_localFallbackInCycle;
+  const shouldPlayHere = baseShouldPlay || (role === "peer" && sawLocalFallback);
 
   const totalPerAgentEnded = localPerAgent + remotePerAgent;
   const remoteRate = Number(config.remotePitchRate ?? 1.0);
@@ -391,7 +427,14 @@ async function processInboxOnce() {
     const rate = (localPerAgent === 0 && remotePerAgent > 0) ? remoteRate : 1.0;
     playSound(config.perAgentSound, config.volume, rate);
   }
-  if (shouldPlayHere && fleet.allCompletePlayback) {
+  // 4.0.1 (Codex P2 2026-05-04) — master/standalone always plays all-complete
+  // on the transition boundary, even when every contributing source is a
+  // remote peer. `fleet.allCompletePlayback` enforces local-machine membership
+  // in `playbackHosts`, which is correct for snapshot-broadcast peers but
+  // wrong for the Mini-as-master architecture where the master plays on
+  // behalf of remote peers.
+  const masterAllComplete = baseShouldPlay && fleet.allCompleteTransition;
+  if (masterAllComplete || (shouldPlayHere && fleet.allCompletePlayback)) {
     // All-complete sound plays at normal pitch — it's a "fleet idle" event,
     // not a per-machine event, so the pitch hint isn't meaningful here.
     setTimeout(() => {
@@ -416,11 +459,15 @@ async function processInboxOnce() {
   //
   // Toggle off via config: { "sayBotName": false }.
   // -------------------------------------------------------------------------
-  if (shouldPlayHere && config.sayBotName !== false && (totalPerAgentEnded > 0 || fleet.allCompletePlayback)) {
+  // 4.0.1 — speak when ANY playback fired this cycle. masterAllComplete
+  // covers the "master plays for remote-only fleet idle" case that the
+  // legacy `fleet.allCompletePlayback` gate misses.
+  const allCompleteAudible = masterAllComplete || (shouldPlayHere && fleet.allCompletePlayback);
+  if (shouldPlayHere && config.sayBotName !== false && (totalPerAgentEnded > 0 || allCompleteAudible)) {
     const speechMachine = lastPerAgentOriginMachine || localMachineName();
     const speechBotName = resolveBotNameSync({ machine: speechMachine, config });
     const speechFallback = shortenMachineNameForSpeech(speechMachine);
-    const speechKind = fleet.allCompletePlayback ? "all_complete" : "per_agent";
+    const speechKind = allCompleteAudible ? "all_complete" : "per_agent";
     const phrase = speechForChime({
       kind: speechKind,
       bot_name: speechBotName,
@@ -430,7 +477,7 @@ async function processInboxOnce() {
       // Stagger after the chime sound so we don't speak over Glass/Hero.
       // All-complete sound is itself delayed ~350ms; speak at ~1200ms total.
       // Per-agent sound fires immediately; speak at ~600ms.
-      const delay = fleet.allCompletePlayback ? 1200 : 600;
+      const delay = allCompleteAudible ? 1200 : 600;
       speak(phrase, delay);
     }
     // Best-effort: refresh local bot-name cache async so the NEXT cycle
