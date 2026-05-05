@@ -7,7 +7,7 @@
  * actual reply routes back over the silent agent-bridge back-channel.
  */
 
-const DEFAULT_PREVIEW_CHARS = 180;
+const DEFAULT_PREVIEW_CHARS = 3000;
 
 export function relayNoticeEnabled(pluginCfg = {}, targetCfg = {}) {
   const raw = targetCfg.relayNotice ?? pluginCfg.relayNotice;
@@ -33,15 +33,15 @@ export function formatRelayNotice(msg, opts = {}) {
   const id = clean(msg?.id);
   const replyVia = formatReplyViaList(opts.replyVia);
   const preview = relayNoticePreview(msg?.content, opts.previewChars);
+  const agentBridgeVersion = clean(opts.agentBridgeVersion ?? opts.version);
 
   const from = fromTarget ? `${fromMachine}/${fromTarget}` : fromMachine;
-  const lines = [
-    "[Agent Bridge relay] 🛰️",
-    `received: ${from} → ${target}`,
-  ];
+  const lines = ["[Agent Bridge relay] 🛰️"];
+  if (agentBridgeVersion) lines.push(`agent-bridge: v${agentBridgeVersion}`);
+  lines.push(`received: ${from} → ${target}`);
   if (replyVia) lines.push(`reply path: ${replyVia}`);
   if (id) lines.push(`id: ${id}`);
-  if (preview) lines.push(`preview: “${preview}”`);
+  if (preview) lines.push(`message: “${preview}”`);
   return lines.join("\n");
 }
 

@@ -927,6 +927,7 @@ async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, acco
       text: formatRelayNotice(msg, {
         targetName: target.name,
         replyVia: replyPathDisplay,
+        agentBridgeVersion: resolveAgentBridgeVersion(),
       }),
       cfg: hostCfg,
       accountId: account,
