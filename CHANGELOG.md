@@ -1,5 +1,60 @@
 # Changelog
 
+## agent-bridge 4.0.x follow-ups — 2026-05-04
+
+A bundle of post-4.0.0 fixes + features that landed throughout the day. No top-level version bump (still 4.0.0); these are change-log entries for substantive commits between `87eb6d7` and `bbc5a89`. Codex review pass on the day's full diff (3 rounds) closed with 4 P2 findings → all addressed in [`bbc5a89`](https://github.com/EthanSK/agent-bridge/commit/bbc5a89). No P0/P1 remain.
+
+### Channel watcher resilience (mcp-server)
+
+- **Self-heal dead-escape-hatch on harness ack** ([`9bc78f9`](https://github.com/EthanSK/agent-bridge/commit/9bc78f9)). When the channel watcher trips its escape-hatch and marks the channel dead, an inbound harness ack now clears the dead state automatically rather than requiring `/reload-plugins` or a full process restart. Also adds a third gate to `maybeMarkChannelDead()` — a tool call currently in flight (`getToolCallsInFlight() > 0`) is positive evidence the harness is busy, not dead — so a single long tool plus a burst of inbound pushes during that window can't trip the escape-hatch as a false positive (regression seen on the 2026-05-04 cross-fleet integration test).
+
+### Orphan-suicide chain (mcp-server)
+
+- **Orphan-suicide on `ppid=1` after 60 s grace** ([`8701693`](https://github.com/EthanSK/agent-bridge/commit/8701693)). Reparented MCP children (host crashed, parent ssh hung up) now self-terminate within ~15 s of detection rather than living forever as zombie watchers. Routes through `shutdown()` so the watcher lease + inbox are released cleanly.
+- **Skip-gate for legitimate init-parent-from-boot** ([`e8a5d6f`](https://github.com/EthanSK/agent-bridge/commit/e8a5d6f), [`78a4151`](https://github.com/EthanSK/agent-bridge/commit/78a4151), [`fed227b`](https://github.com/EthanSK/agent-bridge/commit/fed227b)). When the MCP server is started directly under launchd / systemd / container PID 1, `process.ppid` is 1 from boot — there's no reparenting to detect, and tripping suicide would kill a healthy process. Skip the check entirely. The skip-gate uses a module-load-time `STARTUP_PPID` snapshot captured BEFORE all imports (`bootstrap-ppid.ts` is the very first import in the entrypoint graph), so a parent dying during slow dependency loads can't fool the gate.
+
+### Cross-platform fixes (openclaw-channel)
+
+- **Win32 ESM dispatch via `pathToFileURL`** ([`b2965a5`](https://github.com/EthanSK/agent-bridge/commit/b2965a5), [`0159441`](https://github.com/EthanSK/agent-bridge/commit/0159441)). Dynamic `import()` of the dispatch module on Windows now goes through `pathToFileURL(modPath).href` instead of a raw drive-letter path — fixes spaces in install paths, drive letters, and UNC-style file URLs. Drops Node 20-only `pathToFileURL` options for broader compatibility.
+
+### Observability events (mcp-server)
+
+- **`channel.recovered` + `inbox.drain.summary` + `getChannelHealthSnapshot`** ([`bfcec79`](https://github.com/EthanSK/agent-bridge/commit/bfcec79)). New events let post-mortem tooling answer "did the channel come back?" and "how big was the queue when we last drained?" without grepping. `getChannelHealthSnapshot()` is a public diagnostic helper exporting the exact in-memory state used by the escape-hatch + hybrid AC pipeline so status tools and incident reports show the same truth the watcher sees.
+
+### Periodic update (Layer 2 auto-update)
+
+- **Bundle harness-independent auto-updater** ([`7cdd574`](https://github.com/EthanSK/agent-bridge/commit/7cdd574)). New `scripts/agent-bridge-periodic-update.{sh,ps1}` + `scripts/install-periodic-update.{sh,ps1}` install a launchd LaunchAgent (macOS) or Scheduled Task (Windows) that runs every 10 minutes, fetches origin/main, and triggers `update.sh` if origin is ahead — even when no harness is alive. Closes the gap left by the in-process probe (which only runs while a harness is up). See `docs/auto-update.md` § "Periodic update LaunchAgent / Scheduled Task".
+- **Lock semantics tightened** ([`0e763a3`](https://github.com/EthanSK/agent-bridge/commit/0e763a3), [`1250638`](https://github.com/EthanSK/agent-bridge/commit/1250638)). Treat fresh pid-less locks as contended (avoid double-runs across `curl|bash` flows), never reclaim a live PID lock by age, and clarify the curl-pipe-bash skip path so the script doesn't try to reclaim a lock it didn't write.
+
+### OpenClaw channel — agent-driven reply routing (lead-up to v3.0)
+
+Three commits landed before [`e66a9bc`](https://github.com/EthanSK/agent-bridge/commit/e66a9bc) finalized the v3.0 rewrite (already documented at the top of this changelog under "openclaw-channel 3.0.0"):
+
+- **Array-valued `replyVia` + implicit bridge fallback** ([`bb15e3d`](https://github.com/EthanSK/agent-bridge/commit/bb15e3d)) — superseded by `additionalReplyChannels` in v3.0.
+- **One agent turn per inbound + bridge-only array configs** ([`f28a6d5`](https://github.com/EthanSK/agent-bridge/commit/f28a6d5)) — preserved into v3.0; the auto-fanout path was removed and replaced with `dispatchAgentTurn`.
+
+### Auto-update — agent-aware migration injection
+
+- **Inject `## Instructions for the agent receiving this update`** ([`9812936`](https://github.com/EthanSK/agent-bridge/commit/9812936)). When the probe detects new files under `docs/migrations/*.md` in the `LOCAL_HEAD..ORIGIN_HEAD` diff range, it extracts the agent-instruction section from each and injects it verbatim into the `[BRIDGE-UPDATE-AVAILABLE]` bridge message body. Receiving agents now get natural-language directives for non-mechanical migration steps (config audits, service restarts, env var changes) on top of the standard pull+build. Convention + template: [`docs/migrations/README.md`](docs/migrations/README.md). Example: [`docs/migrations/4.0.0-channel-plugin-rewrite.md`](docs/migrations/4.0.0-channel-plugin-rewrite.md).
+
+### Relay-to-user format
+
+- **Version suffix + 1-3 sentence band** ([`37d6aab`](https://github.com/EthanSK/agent-bridge/commit/37d6aab)). The user-facing relay rule (Telegram / Slack / Discord / etc.) now requires the running `agent-bridge` version appended at the end of every relay (e.g. `_(agent-bridge v4.0.0)_`) so the user can spot fleet-wide version drift. The body is now 1-3 sentences (loosened from 1-2 lines per voice 2150 — denser paragraph blocks are fine when the inbound message has real context). Read the version from `agent_bridge_version` on the inbound `<channel>` block (Claude Code) or `[BRIDGE-CONTEXT]` (OpenClaw) — never hardcode. Canonical: [`docs/relay-to-user.md`](docs/relay-to-user.md).
+
+### Docs
+
+- **Persona routing reference** ([`1fd7583`](https://github.com/EthanSK/agent-bridge/commit/1fd7583), [`fe27e4a`](https://github.com/EthanSK/agent-bridge/commit/fe27e4a)). README + AGENTS.md document the 4.0.0 `AGENT_BRIDGE_PERSONA` env var, the cmdline-fallback path, the lease-key encoding (`claude-code__<persona>.watcher-lock.json`), and the .mcp.json portable-default caveat (Codex P2 R1 2026-05-04 — the env block clobbers parent-shell named-persona overrides; documented trade-off, wrapper on roadmap).
+- **Operations / stale-runtime workarounds** ([`277e617`](https://github.com/EthanSK/agent-bridge/commit/277e617)). New [`docs/operations.md`](docs/operations.md) inventories the 11 current workarounds for in-memory plugin code drift (full Claude Code restart, `openclaw gateway restart`, OC↔CC mutual-restart dance, Patch F stale-version peer-kill, manual SIGTERM, plugin-registry-rewire, in-process probe, periodic LaunchAgent, OC heap-fix watchdog, `self-reload-plugins` skill, SessionStart Telegram parseMode patch) with what each solves, what it doesn't, and fragility rating.
+- **Personal-project caveat** ([`56c50c3`](https://github.com/EthanSK/agent-bridge/commit/56c50c3)). README top now flags this as a personal/Ethan-shaped project; community debugging is best-effort.
+- **Migration framework** — `docs/migrations/README.md` template + `docs/migrations/4.0.0-channel-plugin-rewrite.md` worked example (the agent-aware injection's reference shape).
+
+### Codex P2 cleanup ([`bbc5a89`](https://github.com/EthanSK/agent-bridge/commit/bbc5a89))
+
+- **Disabled chime emitter short-circuits** before `ensureService()` so disabled hooks neither spawn the daemon nor queue files. Existing inbox files are drained (archived without playback) on next service tick when `enabled === false`.
+- **Master/standalone all-complete decoupled from `playbackHosts`**. Mini-as-master architecture says master plays for the whole fleet — the legacy gate (`fleet.allCompletePlayback`) suppressed the all-complete sound when every contributing source was a remote peer. Master now plays on `fleet.allCompleteTransition` unconditionally.
+- **Local-fallback playback override + envelope-origin validation**. Peer playback override is gated on a `_localFallback: true` marker that the emitter stamps on the local-fallback envelope; the service requires `envelope.from === envelope.to === payload.machine === localMachine` before honoring the marker so a remote/spoofed payload can't bypass peer suppression.
+- **README .mcp.json caveat documented**. The hardcoded `AGENT_BRIDGE_PERSONA=default` stays (existing source-level test enforces it as the cross-platform safe default for hosts where parent argv can't be inspected); README explicitly notes that Claude Code's MCP host merges plugin env over parent env, so launch-shell named-persona aliases may collapse to `default` until a first-class wrapper ships.
+
 ## agent-bridge chime 1.1.0 — 2026-05-04 (post-Mini-as-master)
 
 ### Speak the Telegram bot name after each chime
