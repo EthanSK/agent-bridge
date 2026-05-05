@@ -26,7 +26,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, stat } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +36,7 @@ import { randomUUID } from 'node:crypto';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexPath = join(__dirname, '..', 'build', 'index.js');
 const buildDir = join(__dirname, '..', 'build');
+const packageVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -747,8 +748,8 @@ test(
       );
       assert.equal(
         kill.context?.our_version,
-        '4.0.0',
-        'our_version must be 4.0.0 in the kill event',
+        packageVersion,
+        `our_version must be ${packageVersion} in the kill event`,
       );
 
       // The placeholder should have received SIGTERM (or SIGKILL after

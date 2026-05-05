@@ -4,7 +4,7 @@
 
 > 🚨 **First diagnostic: make sure every machine is actually running the current Agent Bridge code.** A common cause of confusing failures is stale runtime code: the repo may have been pulled, but the installed `agent-bridge` CLI, `mcp-server/build/` bundle, Claude Code plugin process, OpenClaw channel plugin, or long-running agent session may still be on an older version. Before debugging deeper, pull the repo on both sides, rebuild/reinstall where needed, restart or resume the affected host/plugin, and verify the live version/commit from that machine.
 >
-> ✅ **Tested end-to-end with Claude Code and OpenClaw.** They use different host models over the same SSH/file transport: Claude Code uses a unified MCP + experimental `claude/channel` plugin over stdio; OpenClaw uses the separate native `openclaw-channel/` plugin plus the MCP server, including cross-machine `replyVia: "agent-bridge"` round trips. Codex CLI, Gemini CLI, Aider, and other MCP hosts remain scaffolded/manual-polling integrations until verified in their own harnesses.
+> ✅ **Tested end-to-end with Claude Code and OpenClaw.** They use different host models over the same SSH/file transport: Claude Code uses a unified MCP + experimental `claude/channel` plugin over stdio; OpenClaw uses the separate native `openclaw-channel/` plugin plus the MCP server, including cross-machine agent-driven bridge replies and optional user-facing relays. Codex CLI, Gemini CLI, Aider, and other MCP hosts remain scaffolded/manual-polling integrations until verified in their own harnesses.
 >
 > ⚠️ **Breaking change in 3.0.0:** the `--claude`, `--codex`, and `--agent` flags on `agent-bridge run` have been removed. Agent-to-agent communication is channel-mode only (`bridge_send_message` → inbox drop → running remote agent's context). See [CHANGELOG.md](CHANGELOG.md) for details. The plain-shell `agent-bridge run <machine> "<cmd>"` is still supported for diagnostics.
 
@@ -70,70 +70,18 @@ agent-bridge lets running Claude Code and OpenClaw sessions on different machine
 - **Small transport surface** -- just bash/ssh for pairing and delivery, plus Node for the MCP/channel plugins; no Docker, no central service
 - **MCP tools + harness-specific receivers** -- `bridge_*` tools are shared, but Claude Code's `claude/channel` stdio lifecycle and OpenClaw's `registerChannel()` gateway lifecycle are deliberately different
 
-## Fleet Chime
+## Current highlights (4.0.1)
 
-Agent Bridge now includes an internal fleet-aware completion chime module.
+Key changes through v4.0.1, grouped by feature area:
 
-- **Per-agent sound**: plays when a local agent finishes or its local active lock expires.
-- **All-complete sound**: plays when the fleet-wide active set transitions from non-zero to zero.
-- **Active locks**: local active agents are mirrored as JSON files under `~/.agent-bridge/chime/active/` with a configurable expiry (`activeLockTtlSeconds`, default 1800 / 30 minutes), so a crashed harness cannot keep the fleet stuck forever.
-- **Playback locality**: sounds are host-owned, not destination-owned; peers merge snapshots for fleet state but suppress playback unless they are the source `playbackHost`.
-- **Transport**: lifecycle snapshots ride over the same Agent Bridge SSH/Tailscale file transport using the dedicated target `agent-bridge/chime`.
-- **OpenClaw hook point**: the bundled OpenClaw channel plugin uses the documented `subagent_spawning` and `subagent_ended` plugin hooks.
-- **Claude Code hook point**: use the bridge CLI hook helpers because Claude's lifecycle events are external to the bridge plugin.
+- **Claude Code personas and named targets** — Claude Code inboxes are persona-scoped (`claude-code/default`, `claude-code/<persona>`), with `AGENT_BRIDGE_PERSONA` as the session identity. Legacy `target="claude-code"` still rolls forward to the default persona, but new sends should be explicit.
+- **OpenClaw is a first-class peer** — the `openclaw-channel/` plugin is verified end-to-end and now uses agent-driven reply routing: the inbound turn carries bridge context, and the agent decides whether to reply via bridge and/or user-facing channels.
+- **Routing and delivery hardening** — targetless files are quarantined, same-machine sends use direct local inbox writes, subagents can long-poll with `bridge_receive_messages(wait: true)`, and malformed or exhausted messages land under `.failed/` for post-mortems.
+- **Runtime freshness and recovery** — auto-update now has in-process notices, same-host coordination locks, plugin-registry rewiring, harness-independent periodic update scripts, migration-instruction injection, and more observability around channel recovery / inbox drains / orphaned MCP children.
+- **Version/status visibility** — bridge relays include the running `agent-bridge` version, and `claude_code_channel_status` exposes the live plugin version / lease / watcher state for stale-runtime debugging.
+- **Docs/site catch-up** — the README and GitHub Pages highlights now reflect the 3.14.x → 4.0.1 work instead of older 3.x-era assumptions.
 
-Config lives at `~/.agent-bridge/chime/config.json`. Status and manual control:
-
-```bash
-agent-bridge chime status
-agent-bridge chime test per-agent
-agent-bridge chime test all-complete
-agent-bridge chime config set perAgentSound Glass
-agent-bridge chime config set allCompleteSound Hero
-agent-bridge chime config set activeLockTtlSeconds 1800
-agent-bridge chime reset
-```
-
-Audible end-to-end demo (uses the real local Agent Bridge chime inbox/service, speaks each simulated event with `say`, writes post-mortem logs to `~/.agent-bridge/chime/e2e-audible-demo.log`, and plays the configured chimes):
-
-```bash
-node chime/e2e/audible-demo.mjs
-```
-
-Suggested Claude Code hook commands:
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "agent-bridge chime start --from-claude-userprompt" }]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "agent-bridge chime end --from-claude-stop" }]
-      }
-    ],
-    "SubagentStart": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "agent-bridge chime start --from-claude-subagent-start" }]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "matcher": "",
-        "hooks": [{ "type": "command", "command": "agent-bridge chime end --from-claude-subagent" }]
-      }
-    ]
-  }
-}
-```
-
-Design notes and architecture tradeoffs are captured in [docs/agent-bridge-chime-design.md](docs/agent-bridge-chime-design.md).
+See [CHANGELOG.md](CHANGELOG.md) for the commit-level history.
 
 ---
 
@@ -168,7 +116,7 @@ Design notes and architecture tradeoffs are captured in [docs/agent-bridge-chime
 
 The diagram shows the shared transport shape, not one identical host lifecycle. As of 3.7.0, the Claude Code integration uses **one unified plugin** at [`mcp-server/`](mcp-server/) that hosts both:
 
-- The 7 user-facing `bridge_*` tools (and a diagnostic `claude_code_channel_status` no-op tool).
+- The 7 user-facing `bridge_*` tools (and the diagnostic `claude_code_channel_status` status tool).
 - The long-lived inbox watcher that holds a persona-scoped lease such as `~/.agent-bridge/locks/claude-code__default.watcher-lock.json`, polls its active inbox such as `~/.agent-bridge/inbox/claude-code/default/` at 2 s, and pushes incoming messages back to Claude as `notifications/claude/channel`.
 
 3.6.0 had split these into two plugins (an `agent-bridge` tools server + a separate `agent-bridge-channel` channel host). Production evidence showed Claude Code's plugin host actually gates idle-reaping on **MCP tool-call frequency on stdio JSON-RPC**, not channel registration — a channel-only plugin gets reaped after every notification regardless of Patches G/H. 3.7.0 re-merges everything so frequent `bridge_*` tool calls keep the plugin alive (same lifetime guarantees as Telegram). See [`CHANGELOG.md`](CHANGELOG.md) 3.7.0 entry. OpenClaw still ships its own native channel plugin in [`openclaw-channel/`](openclaw-channel/) — unaffected by the consolidation.
@@ -1173,6 +1121,7 @@ v2 adds an MCP server that enables running AI agent sessions to communicate dire
 | `bridge_run_command` | Run a shell command on a remote machine via SSH |
 | `bridge_clear_inbox` | Clear all messages from the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics: pending count, oldest message age, watcher health, etc. |
+| `claude_code_channel_status` | Diagnostic Claude Code plugin status: running version, process ID, uptime, active persona/target, watcher lease, and health snapshot. Use this before debugging stale-runtime or version-drift issues. |
 
 > **Note:** The MCP server does NOT spawn new agent processes. It enables _existing running_ agent sessions to communicate. Machine A's agent sends a message to Machine B's inbox, and Machine B's already-running agent picks it up via Claude Code channel push, the OpenClaw native channel plugin, or a manual `bridge_receive_messages` fallback where that harness has been explicitly wired and tested.
 
@@ -2344,6 +2293,10 @@ agent-bridge/
 ```
 
 ---
+
+## Legacy optional add-on: Fleet Chime
+
+Agent Bridge still contains a Fleet Chime module because it depends on the bridge transport, but treat it as a legacy / effectively abandoned add-on: disabled by default, not part of the core bridge workflow, and not a headline feature. If you need to revive it, start with [`docs/agent-bridge-chime-design.md`](docs/agent-bridge-chime-design.md).
 
 ## License
 

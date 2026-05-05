@@ -1,31 +1,25 @@
 # Agent Bridge Chime Design
 
-This note records the design and implementation decisions for moving
-`agent-completion-chime` into `agent-bridge` as a fleet-aware feature.
-
-## Source Context
-
-Verbatim voice transcript from Ethan, preserved exactly:
-
-> "No, idiot, send me an example of a fucking page that you made that within a parent that has exactly what the end result would be so I can test it. Are you sure your thinking is max? Why are you so dumb? I didn't hear any sound. Can you make sure the volume on my Mac Mini is max? Also, what's the output device right now? Is it the system? Mac Mini? If not, change it to that and then play the sounds again. And for chime, have you looked up the right way of doing it for OpenClaw? Because obviously Clawed Code is different. Ask your local OpenAI to— just see, open local OpenClaw to make sure it's correct over AgentBridge. Also If you didn't clock already, this needs to be shared between the, the, the Clawed Code and OpenClaw somehow across all the machines. That this should work with Agent Bridge. Actually, this should be like an add-on for Agent Bridge. So it requires Agent Bridge running and set up, and then it uses Agent Bridge to figure out what other harnesses across what machines are actually connected. And we also need to modify Agent Bridge, I guess, to support this. But all the machines need to be able to— you know what, fuck it. Let you know what, this is so dependent on Agent Bridge. Let's just Do this in Agent Bridge, the project Agent Bridge. Okay. The repo. So, yeah, let's start over. Well, not really start over, but like, just do it in Agent Bridge, modify Agent Bridge to be configured with a Chime. The whole point of the global one is when all the harnesses across the machines all finish. So what they can do is they can send a ping over SSH, whatever, Tailscale. Over Tailscale. Alexa, stop. Sorry, I just talked to Alexa there. Yeah, it's like a counter increment decrement. What agents are currently running and then have an ex— or like maybe like keep tracking a file. Whatever the best architecture is for that, what do you think? Okay, this is a big project. So actually, I want you to forward all this new information and everything we've been working on for the Chime thing over to Claude Station Mini, OpenClaw, local OpenClaw over Agent Bridge. I want you to send it, everything I've said word for word and all what we've been working on and the instructions of putting it into Agent Bridge, uh, the new stuff, and just get it to message me on Telegram once it understands. Do this in a long-running sub-agent, make sure you get every single thing I said as well."
+This is legacy design documentation for the optional Fleet Chime add-on. The module still lives in `agent-bridge` because it depends on the bridge transport, but it is disabled by default and should be treated as legacy / effectively abandoned rather than core Agent Bridge functionality.
 
 ## Implemented Shape
 
-- Chime now lives inside `agent-bridge` as an internal module under [`chime/`](../chime/).
+- Chime now lives inside `agent-bridge` as an optional internal module under [`chime/`](../chime/), and is disabled by default for new setups.
 - Lifecycle events are sent over the existing Agent Bridge file transport using a dedicated target: `agent-bridge/chime`.
-- One leased local service owns playback and fleet-state reconciliation per machine, even if both Claude Code and OpenClaw are running there.
+- One configured master machine plays sounds; peers forward lifecycle events to that master over the bridge. Standalone/local playback remains possible by config.
+- Active locks are still TTL-bounded local JSON files, so a crashed harness cannot keep the all-complete state stuck forever.
 - OpenClaw uses the documented plugin hooks `subagent_spawning` and `subagent_ended`.
-- Claude Code remains hook-driven because its lifecycle surface is external to the bridge plugin; the bridge CLI now exposes `agent-bridge chime start|end` helpers for that.
+- Claude Code remains hook-driven because its lifecycle surface is external to the bridge plugin; the bridge CLI exposes `agent-bridge chime start|end` helpers for that.
 
 ## Architecture Answers
 
 1. Offline peers / stale entries
 
-- State is authoritative per `machine + sourceId`, not one global counter.
-- Each source publishes full snapshots, not raw increments, so reconnect replaces drift cleanly.
-- A stale peer with `activeCount > 0` remains blocking only until the active-lock TTL expires.
+- State is keyed per `machine + sourceId`, not one global counter.
+- Sources emit lifecycle events (`agent.start`, `agent.end`, `chime.register`, `chime.heartbeat`) and mirror active agents into TTL-bounded lock files.
+- A stale peer with active locks remains blocking only until the active-lock TTL expires.
 - The TTL defaults to 30 minutes (`activeLockTtlSeconds: 1800`) so a crashed or disconnected harness cannot block Hero forever; operators can raise it toward an hour if needed.
-- A stale peer with `activeCount == 0` is ignored for zero-transition decisions.
+- A stale peer with no active locks is ignored for zero-transition decisions.
 
 2. Zero-transition / debounce
 
@@ -48,16 +42,16 @@ Verbatim voice transcript from Ethan, preserved exactly:
 
 5. Distributed vs leader counter
 
-- Implemented as distributed per-source snapshots.
+- Implemented as distributed per-source lifecycle events and TTL-bounded locks, not a raw global increment/decrement counter.
 - Each source is authoritative only for its own local active set.
-- Peers merge snapshots independently; there is no elected leader or central counter.
+- Playback has a configured master/peer policy. There is no elected leader or central cloud service; the master is just the sole audio output for the human at the desk.
 
 6. Sound playback locality
 
-- Playback is host-owned, not destination-owned.
-- Snapshots include `playbackHost`; destination peers still merge state for fleet accounting, but they suppress all-complete playback unless their local machine name matches the snapshot/source playback host.
-- This prevents an Agent Bridge destination machine from chiming just because another host broadcast a lifecycle snapshot to it.
-- We do not fan out explicit "play now" commands.
+- Playback is intentionally centralized when `masterMachine` is configured: the master plays for the fleet, and peers suppress local playback after forwarding events.
+- Peer-originated events can use `remotePitchRate` so the master can audibly distinguish local vs remote completions.
+- If the master is unreachable, peer emitters may mark a local fallback event so some sound still fires rather than silently dropping the completion cue.
+- We do not fan out explicit "play now" commands to every host.
 
 ## Config
 
@@ -73,7 +67,7 @@ Current keys:
 
 ```json
 {
-  "enabled": true,
+  "enabled": false,
   "scope": "fleet",
   "playback": "local",
   "perAgentSound": "Glass",
@@ -83,7 +77,11 @@ Current keys:
   "activeLockTtlSeconds": 1800,
   "heartbeatSeconds": 30,
   "allCompleteCooldownSeconds": 4,
-  "historyLimit": 200
+  "historyLimit": 200,
+  "masterMachine": "Ethans-Mac-mini",
+  "remotePitchRate": 1.05,
+  "sayBotName": true,
+  "botNamesByMachine": {}
 }
 ```
 
@@ -95,4 +93,5 @@ Current keys:
 - Durable state lives in `~/.agent-bridge/chime/state.json`.
 - Chime service transition logs append to `~/.agent-bridge/chime/chime.log`.
 - Audible demo logs append to `~/.agent-bridge/chime/e2e-audible-demo.log`.
-- Manual recovery is `agent-bridge chime reset`.
+- Manual controls include `agent-bridge chime status`, `agent-bridge chime test per-agent`, `agent-bridge chime test all-complete`, and `agent-bridge chime reset`.
+- The hard kill-switch is `~/.agent-bridge/chime/.kill-switch`; disabled config drains inbox files without playback.

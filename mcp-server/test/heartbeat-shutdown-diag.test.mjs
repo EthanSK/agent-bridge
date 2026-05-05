@@ -16,6 +16,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -24,6 +25,7 @@ import { spawn } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexPath = join(__dirname, '..', 'build', 'index.js');
+const packageVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -111,7 +113,7 @@ test('server.shutdown_diag dumps active handles and request counts on shutdown',
     const events = await readEvents(home);
     const starting = events.find((e) => e.event === 'server.starting');
     assert.ok(starting, 'expected server.starting event');
-    assert.equal(starting.context.version, '4.0.0', 'startup event should report version 4.0.0');
+    assert.equal(starting.context.version, packageVersion, `startup event should report version ${packageVersion}`);
 
     const diag = events.find((e) => e.event === 'server.shutdown_diag');
     assert.ok(diag, 'expected server.shutdown_diag event on shutdown');

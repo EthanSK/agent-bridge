@@ -52,7 +52,7 @@
           </span>
           <span class="logo-copy">
             <span class="logo-title">
-              agent-bridge <span class="logo-version">v3.12.1</span>
+              agent-bridge <span class="logo-version">v4.0.1</span>
             </span>
             <span class="logo-sub">channel-mode · peer-to-peer · SSH</span>
           </span>
@@ -69,7 +69,7 @@
       <header class="hero wrap">
         <div class="hero-meta reveal reveal-1">
           <span><span class="dot" aria-hidden="true"></span> channel open</span>
-          <span class="ver">v3.12.1</span>
+          <span class="ver">v4.0.1</span>
           <span>Claude Code + OpenClaw</span>
           <span>tested end-to-end</span>
         </div>
@@ -123,11 +123,11 @@
           </div>
           <div class="hero-stat">
             <span class="k">Delivery</span>
-            <span class="v"><span class="mark">push</span> · no poll</span>
+            <span class="v"><span class="mark">push</span> · long-poll</span>
           </div>
           <div class="hero-stat">
             <span class="k">MCP tools</span>
-            <span class="v"><span class="mark">7</span> · one concept each</span>
+            <span class="v"><span class="mark">8</span> · 7 bridge + status</span>
           </div>
           <div class="hero-stat">
             <span class="k">License</span>
@@ -389,7 +389,7 @@
 <span class="t-cyan">bridge_send_message</span>({
   <span class="t-bold">machine:</span> <span class="t-green">"MacBook-Pro"</span>,
   <span class="t-bold">message:</span> <span class="t-green">"can you run the e2e suite and paste the failures?"</span>,
-  <span class="t-bold">target:</span> <span class="t-green">"claude-code"</span>
+  <span class="t-bold">target:</span> <span class="t-green">"claude-code/default"</span>
 })
 
 <span class="t-dim">// A few hundred ms later, Machine B's Claude sees:</span>
@@ -398,12 +398,12 @@
 <span class="t-tag">&lt;/channel&gt;</span>
 
 <span class="t-dim">// ...and responds the same way:</span>
-<span class="t-cyan">bridge_send_message</span>({ <span class="t-bold">machine:</span> <span class="t-green">"Mac-Mini"</span>, <span class="t-bold">message:</span> <span class="t-green">"3 failed, logs attached: ..."</span>, <span class="t-bold">target:</span> <span class="t-green">"claude-code"</span> })</pre>
+<span class="t-cyan">bridge_send_message</span>({ <span class="t-bold">machine:</span> <span class="t-green">"Mac-Mini"</span>, <span class="t-bold">message:</span> <span class="t-green">"3 failed, logs attached: ..."</span>, <span class="t-bold">target:</span> <span class="t-green">"claude-code/default"</span> })</pre>
           </div>
         </div>
 
         <p class="section-sub" style="margin-top: 36px;">
-          <strong>Auto-update notifications (3.10.0+, periodic re-probe in 3.11.0+, receiver coordination lock in 3.12.0+).</strong> The MCP server fires <code>scripts/check-update.sh</code> ~30 s after <code>server.connect()</code> on the channel-owner, then re-probes every 3 hours (override with <code>AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS</code>). When <code>origin/main</code> is ahead, a <code>[BRIDGE-UPDATE-AVAILABLE]</code> BridgeMessage drops into <code>~/.agent-bridge/inbox/&lt;target&gt;/</code> and pushes into the running session through the same channel path as a remote message. Receivers dispatch a subagent that runs the updater through <code>scripts/auto-update-coord.sh run --source-dir "$PWD" --cycle &lt;sha&gt; -- ./scripts/update.sh --auto</code> &mdash; the helper holds a checkout-scoped lock so concurrent same-host receivers don&rsquo;t race. Disable entirely with <code>AGENT_BRIDGE_AUTO_UPDATE_CHECK=0</code>. <em>Note: <code>/reload-plugins</code> after a pull+build refreshes plugin descriptors but does NOT respawn the MCP child process when a healthy channel-owner exists; a full Claude Code session restart is the only deterministic way to load the new plugin code.</em>
+          <strong>Auto-update + stale-runtime recovery.</strong> The in-process probe still notifies live harnesses when <code>origin/main</code> is ahead, and receivers still coordinate same-host updates through <code>scripts/auto-update-coord.sh</code>. Recent releases add plugin-registry rewiring (stale Claude/OpenClaw plugin cache paths), harness-independent periodic update scripts for launchd / Windows Scheduled Tasks, and migration-instruction injection into <code>[BRIDGE-UPDATE-AVAILABLE]</code> notices. <em>Runtime caveat remains: disk-fresh code is not always process-fresh code; a full Claude Code session restart is the deterministic way to load a new long-running MCP child.</em>
         </p>
       </section>
 
@@ -440,6 +440,10 @@
             <div class="tool-name">bridge_inbox_stats</div>
             <p>Report pending count, oldest message age, total size, watcher health, processed-ID count, and failed-message count. Useful for diagnosing &ldquo;did my message arrive?&rdquo;</p>
           </div>
+          <div class="tool">
+            <div class="tool-name">claude_code_channel_status</div>
+            <p>Diagnostic Claude Code plugin status: running version, process ID, uptime, active persona/target, watcher lease, and health snapshot. Useful for spotting stale runtime code or fleet version drift.</p>
+          </div>
         </div>
       </section>
 
@@ -473,7 +477,7 @@
               OpenClaw
             </div>
             <div class="compat-status" role="cell"><span class="pill pill--live">● live</span></div>
-            <div class="compat-desc" role="cell">MCP tools out of the box. The <code>openclaw-channel/</code> native channel plugin registers <code>agent-bridge</code> as a first-class OpenClaw channel (same tier as Telegram) via <code>api.registerChannel()</code>, dispatching inbound messages into the running agent session via <code>dispatchInboundReplyWithBase</code> from <code>openclaw/plugin-sdk/compat</code>. Per-target <code>replyVia</code> (<code>"telegram"</code> | <code>"agent-bridge"</code>) decides whether replies land in the matching Telegram chat or SFTP back over the bridge as a silent peer-to-peer back-channel; precedence is per-message &gt; per-target &gt; plugin-level &gt; sender-derived default.</div>
+            <div class="compat-desc" role="cell">MCP tools out of the box. The <code>openclaw-channel/</code> native channel plugin registers <code>agent-bridge</code> as a first-class OpenClaw channel (same tier as Telegram) via <code>api.registerChannel()</code>, dispatching inbound messages into the running agent session via <code>dispatchInboundReplyWithBase</code> from <code>openclaw/plugin-sdk/compat</code>. In v3.0+, reply routing is agent-driven: the inbound turn carries a <code>[BRIDGE-CONTEXT]</code> block, bridge replies are implicit when <code>fromTarget</code> is present, and <code>additionalReplyChannels</code> controls any extra user-facing channels.</div>
           </div>
 
           <div class="compat-row" role="row">
@@ -541,81 +545,51 @@
         <h2 class="section-title">What&rsquo;s <span class="accent">new.</span></h2>
         <ul class="changelog-list">
           <li class="cl-item">
-            <div class="cl-version">3.12.1</div>
+            <div class="cl-version">4.0.1</div>
             <div class="cl-body">
-              <strong>Halve duplicate channel pushes.</strong> The hybrid AC delivery flow re-emits the channel notification on every reinject. With the previous 60 s safety net + 3 retries a slow-thinking receiver (no tool calls within 60 s &mdash; a normal reasoning-heavy pattern) saw the same <code>&lt;channel&gt;</code> block pushed up to 4 times over 4 minutes. 3.12.1 raises the safety net to 180 s and lowers the retry cap to 1, capping worst-case duplicates at 2. The dead-channel escape-hatch + handover-on-restart paths still recover genuinely-lost messages.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.12.0</div>
-            <div class="cl-body">
-              <strong>Auto-update receiver coordination lock.</strong> Multi-target notification fan-out no longer races same-host receivers on the shared checkout / npm install / plugin cache. New <code>scripts/auto-update-coord.sh</code> helper (<code>run</code>/<code>acquire</code>/<code>release</code>/<code>status</code>) holds a checkout-scoped lock at <code>~/.agent-bridge/locks/auto-update.&lt;sha256(realpath)&gt;.lock</code> with a sibling <code>.state</code> file, deterministic skip codes (<code>73</code> = lock held, <code>75</code> = retry-gate active), and <code>auto_update_coord.*</code> events written to <code>~/.agent-bridge/logs/agent-bridge.log</code>.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.11.1</div>
-            <div class="cl-body">
-              <strong>Configurable auto-update interval + live-test recipe.</strong> <code>AGENT_BRIDGE_AUTO_UPDATE_INTERVAL_MS</code> overrides the default 3 h cadence (bounds 30 s &le; value &le; 24 h). New <code>auto_update_check.armed</code> event in <code>~/.agent-bridge/logs/mcp-server.log</code> reports the active interval and source (<code>"env"</code> | <code>"default"</code>) so you can drive the full receiver path end-to-end in ~90 s instead of waiting 3 hours.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.11.0</div>
-            <div class="cl-body">
-              <strong>Periodic re-probe + standby-promotion probe.</strong> 3.10.0's auto-update probe was a one-shot 30 s timer fired only on channel-owner boot; long-lived owners outliving an upstream push, and standby children later promoted into ownership, never re-probed. 3.11.0 adds a 3 h <code>setInterval</code> (kill-switch honoured on every fire) and a <code>subscribeToPromotion()</code> hook that fires a fresh probe when a standby steals the lease from a dead peer.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.10.0</div>
-            <div class="cl-body">
-              <strong>Auto-update notifications.</strong> agent-bridge now tells the running harness when its source checkout has fallen behind <code>origin/main</code> &mdash; the agent sees a <code>[BRIDGE-UPDATE-AVAILABLE]</code> channel message instead of silently drifting. The MCP server fires <code>scripts/check-update.sh</code> ~30 s after <code>server.connect()</code> on the channel-owner, drops a BridgeMessage into <code>~/.agent-bridge/inbox/&lt;target&gt;/</code>, and the existing channel watcher pushes it into the live session via <code>notifications/claude/channel</code>. Idempotent (last-notified SHA at <code>~/.agent-bridge/.last-update-notified-head</code>); kill-switch <code>AGENT_BRIDGE_AUTO_UPDATE_CHECK=0</code>.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.8.0</div>
-            <div class="cl-body">
-              <strong>Long-poll receive for subagents.</strong> <code>bridge_receive_messages</code> now accepts <code>wait: true</code> and <code>timeout_seconds</code> (default 30, server cap 60) so a subagent &mdash; which doesn&rsquo;t see the parent&rsquo;s <code>&lt;channel&gt;</code> pushes &mdash; can block on the inbox until a new message lands. Broadcast semantics: parent + every subagent waiting all wake on the same arrival; pair with <code>peek: true</code> so the parent&rsquo;s channel-push consumer still sees the file.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.7.0</div>
-            <div class="cl-body">
-              <strong>Unified plugin (undo of 3.6.0 split).</strong> Tools and channel run inside a single MCP stdio child again. Production evidence showed Claude Code&rsquo;s plugin host gates idle reaping on tool-call frequency &mdash; a channel-only plugin gets reaped after every notification regardless of SIGTERM ignore. Frequent <code>bridge_*</code> calls now keep the watcher alive (same lifetime model as Telegram).
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.5.0</div>
-            <div class="cl-body">
-              <strong>Same-machine delivery + Claude watcher recovery.</strong> Local/self/localhost sends now land directly in the local target inbox with no SSH loopback, and Claude Code channel-capable standbys can promote when the active watcher owner goes stale.
-            </div>
-          </li>
-          <li class="cl-item">
-            <div class="cl-version">3.4.5</div>
-            <div class="cl-body">
-              <strong>Watcher and reply-routing hardening.</strong> OpenClaw recovered replies decode channel-prefixed route ids, explicit target config preserves <code>legacy_session</code>, watcher ownership uses cross-process leases, empty messages are valid, and <code>agent-bridge status</code> checks every paired machine.
+              <strong>Version-aware relay notices.</strong> Bridge relays now include the running agent-bridge version and preserve longer inbound context in OpenClaw relay notices, so fleet drift is visible from user-facing summaries instead of buried in logs.
             </div>
           </li>
           <li class="cl-item cl-item--breaking">
-            <div class="cl-version">3.0.0 <span class="breaking-tag">breaking</span></div>
+            <div class="cl-version">4.0.0 <span class="breaking-tag">breaking</span></div>
             <div class="cl-body">
-              <strong>Fresh-spawn wrappers removed.</strong> The <code>--claude</code>, <code>--codex</code>, and <code>--agent</code> flags on <code>agent-bridge run</code> are gone. They spawned a <em>new</em> non-interactive agent on the remote machine &mdash; the exact opposite of this project&rsquo;s purpose. Agent-to-agent is now exclusively channel mode (<code>bridge_send_message</code> &rarr; inbox drop &rarr; running remote agent&rsquo;s context). Plain <code>agent-bridge run &lt;machine&gt; "&lt;cmd&gt;"</code> is kept as a diagnostics utility. Versions aligned across CLI, MCP server, and plugin manifest to <code>3.0.0</code>.
+              <strong>Claude Code personas and explicit targets.</strong> Claude Code inboxes are now persona-scoped (<code>claude-code/default</code>, <code>claude-code/&lt;persona&gt;</code>) with <code>AGENT_BRIDGE_PERSONA</code> as the live session identity. Legacy <code>target="claude-code"</code> is still routed to default for rolling upgrades, but new sends should name the target explicitly.
+            </div>
+          </li>
+          <li class="cl-item cl-item--breaking">
+            <div class="cl-version">openclaw-channel 3.0.0 <span class="breaking-tag">breaking</span></div>
+            <div class="cl-body">
+              <strong>Agent-driven OpenClaw reply routing.</strong> The native OpenClaw channel is verified end-to-end and no longer auto-fans-out via <code>replyVia</code>. Inbound bridge turns carry a <code>[BRIDGE-CONTEXT]</code> block; the agent chooses bridge replies and any <code>additionalReplyChannels</code> itself.
             </div>
           </li>
           <li class="cl-item">
-            <div class="cl-version">2.3.2</div>
+            <div class="cl-version">4.0.x / 3.14.x</div>
             <div class="cl-body">
-              <strong>Tilde expansion fix.</strong> Older versions could land messages in a literal <code>~/.agent-bridge/inbox</code> shadow directory. Modern Agent Bridge avoids that whole class by normalizing home-relative SFTP paths before delivery.
+              <strong>Runtime freshness and recovery hardening.</strong> Recent commits added plugin-registry rewiring, harness-independent periodic update scripts, migration instructions inside update notices, orphaned-child cleanup, channel recovery observability, and clearer stale-runtime operations docs.
             </div>
           </li>
           <li class="cl-item">
-            <div class="cl-version">2.3.1</div>
+            <div class="cl-version">3.14.x</div>
             <div class="cl-body">
-              <strong>OpenClaw companion parity pass.</strong> Confirmed the OpenClaw side matches the v2.3.0 plugin-ification: zombie-proof, no hardcoded user paths, identical signal handling.
+              <strong>Named-target routing and relay docs travel with the repo.</strong> Agents are instructed to resolve specific target aliases deliberately instead of silently falling back to default, and every inbound bridge message should be relayed to the user with a concise summary plus the running version.
             </div>
           </li>
           <li class="cl-item">
-            <div class="cl-version">2.3.0</div>
+            <div class="cl-version">3.8.0 / 3.5.0</div>
             <div class="cl-body">
-              <strong>Plugin-ification.</strong> agent-bridge became a single Claude Code plugin that bundles both the <code>bridge_*</code> MCP tools and the incoming channel. One install, both halves. No more hand-editing <code>.mcp.json</code> for the Claude Code path.
+              <strong>Subagent long-poll + same-machine delivery.</strong> <code>bridge_receive_messages</code> supports bounded long-poll waits for subagents that cannot see parent channel pushes, and <code>bridge_send_message</code> can deliver directly to local/self/localhost inboxes without an SSH loopback.
+            </div>
+          </li>
+          <li class="cl-item">
+            <div class="cl-version">3.4.0+</div>
+            <div class="cl-body">
+              <strong>Per-target inboxes and quarantine.</strong> Message delivery is target-subdir based; targetless legacy files are routed to <code>.failed/_unrouted/</code>, malformed files are quarantined under <code>.failed/</code>, and status/stat tools report failed counts for diagnostics.
+            </div>
+          </li>
+          <li class="cl-item">
+            <div class="cl-version">docs/site</div>
+            <div class="cl-body">
+              <strong>Highlights refreshed.</strong> README + site summaries now match the recent 3.14.x → 4.0.1 work instead of older 3.x-era assumptions.
             </div>
           </li>
         </ul>
@@ -632,7 +606,7 @@
             <circle cx="25" cy="16" r="3.5" fill="#4dd0e1"/>
             <path d="M11 16 L21 16" stroke="#ff7a1a" stroke-width="1.3" stroke-dasharray="2 2"/>
           </svg>
-          <span>agent-bridge / v3.12.1</span>
+          <span>agent-bridge / v4.0.1</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/EthanSK/agent-bridge" target="_blank" rel="noopener">GitHub</a>
@@ -642,6 +616,8 @@
           <a href="https://github.com/EthanSK" target="_blank" rel="noopener">@EthanSK</a>
         </div>
         <div class="footer-copy">
+          <strong>Legacy optional add-on:</strong> Fleet Chime is still in the repo because it uses the bridge transport, but treat it as legacy / effectively abandoned: disabled by default, not core Agent Bridge, and not a headline feature.
+          <br><br>
           © 2026 Ethan SK<br>
           built for multi-machine Claude Code + OpenClaw workflows
         </div>
