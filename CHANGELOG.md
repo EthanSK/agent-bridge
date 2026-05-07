@@ -1,5 +1,23 @@
 # Changelog
 
+## agent-bridge 4.0.1 + docs refresh — 2026-05-05
+
+Backfill for the next day's OC/CC chat-derived work after the 2026-05-04 4.0.x bundle. Covers substantive commits from [`384d417`](https://github.com/EthanSK/agent-bridge/commit/384d417) through [`f167c76`](https://github.com/EthanSK/agent-bridge/commit/f167c76): the OpenClaw relay-notice visibility fix, the 4.0.1 version bump, and the README / GitHub Pages / OpenClaw channel documentation refresh that followed Ethan's "What's New has drifted" request.
+
+### OpenClaw relay notices — version + fuller message context
+
+- **Version-aware relay receipts** ([`384d417`](https://github.com/EthanSK/agent-bridge/commit/384d417), released as [`e6df9ce`](https://github.com/EthanSK/agent-bridge/commit/e6df9ce)). OpenClaw's Telegram-visible `[Agent Bridge relay]` notices now include the running `agent-bridge` version via `resolveAgentBridgeVersion()` and show a much larger one-line message preview (`3000` chars, labelled `message:` instead of `preview:`). This makes routine bridge handoffs visible enough for Ethan to spot stale fleet members or misrouted requests without opening raw logs. The follow-up bumped the CLI / MCP server / package metadata from `4.0.0` to `4.0.1` and updated version assertions.
+
+### README / site / OpenClaw channel docs catch-up
+
+- **Agent Bridge highlights refreshed through 4.0.1** ([`d98a121`](https://github.com/EthanSK/agent-bridge/commit/d98a121)). The top-level README and GitHub Pages site now foreground the current bridge reality: Claude Code personas and named targets, OpenClaw as a first-class peer, agent-driven reply routing, same-machine delivery, long-poll receive, inbox quarantine, runtime freshness / recovery work, relay version visibility, and stale-runtime diagnostics. Fleet Chime was demoted from headline feature to a legacy optional add-on, with `docs/agent-bridge-chime-design.md` rewritten accordingly.
+- **OpenClaw channel README caught up to v3.0+** ([`4b1afb6`](https://github.com/EthanSK/agent-bridge/commit/4b1afb6)). Adds a `What's new in v3.0.0` section documenting the breaking move from `replyVia` auto-fanout to agent-driven reply routing, the `additionalReplyChannels` replacement, single-turn dispatch hardening, Windows `pathToFileURL` import handling, and version-bearing relay notices.
+
+### Public README opening / setup tone
+
+- **Setup caveat made user-friendly** ([`905dea9`](https://github.com/EthanSK/agent-bridge/commit/905dea9)). Rephrases the earlier personal-project caveat into a clearer setup note: first-time installs can be environment-specific because SSH, local plugins, and harness channel behaviour differ; users should ask their local agent to inspect logs, file issues with environment details, and send small portability PRs.
+- **README opening rewritten for non-Ethan users** ([`f167c76`](https://github.com/EthanSK/agent-bridge/commit/f167c76)). Replaces the terse internal tagline with a user-facing explanation of what agent-bridge does, adds `Why use it?` and `What works today`, and narrows the setup guidance for agents to the three must-read docs: named-target routing, relay-to-user, and stale-runtime operations.
+
 ## agent-bridge 4.0.x follow-ups — 2026-05-04
 
 A bundle of post-4.0.0 fixes + features that landed throughout the day. No top-level version bump (still 4.0.0); these are change-log entries for substantive commits between `87eb6d7` and `bbc5a89`. Codex review pass on the day's full diff (3 rounds) closed with 4 P2 findings → all addressed in [`bbc5a89`](https://github.com/EthanSK/agent-bridge/commit/bbc5a89). No P0/P1 remain.
