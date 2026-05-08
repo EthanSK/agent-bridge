@@ -5,6 +5,10 @@
  * configured OpenClaw chat before/while the synthetic agent turn runs. They
  * let Ethan see that a bridge/harness message landed even when the agent's
  * actual reply routes back over the silent agent-bridge back-channel.
+ *
+ * Full message bodies are no longer included in the notice. Instead the
+ * OpenClaw channel stores the full inbound BridgeMessage locally under
+ * ~/.agent-bridge/relay-expand/ and includes a short expand id here.
  */
 
 const DEFAULT_PREVIEW_CHARS = 3000;
@@ -16,6 +20,10 @@ export function relayNoticeEnabled(pluginCfg = {}, targetCfg = {}) {
   return true;
 }
 
+/**
+ * Kept as a tiny compatibility helper for older tests/integrations that import
+ * it directly. The default relay notice formatter deliberately does NOT call it.
+ */
 export function relayNoticePreview(content, maxChars = DEFAULT_PREVIEW_CHARS) {
   const text = String(content ?? "")
     .replace(/\s+/g, " ")
@@ -31,8 +39,8 @@ export function formatRelayNotice(msg, opts = {}) {
   const fromTarget = clean(msg?.fromTarget);
   const target = clean(msg?.target) || (opts.targetName ? `openclaw/${opts.targetName}` : "openclaw/?");
   const id = clean(msg?.id);
+  const expandId = clean(opts.expandId);
   const replyVia = formatReplyViaList(opts.replyVia);
-  const preview = relayNoticePreview(msg?.content, opts.previewChars);
   const agentBridgeVersion = clean(opts.agentBridgeVersion ?? opts.version);
 
   const from = fromTarget ? `${fromMachine}/${fromTarget}` : fromMachine;
@@ -40,8 +48,11 @@ export function formatRelayNotice(msg, opts = {}) {
   if (agentBridgeVersion) lines.push(`agent-bridge: v${agentBridgeVersion}`);
   lines.push(`received: ${from} → ${target}`);
   if (replyVia) lines.push(`reply path: ${replyVia}`);
-  if (id) lines.push(`id: ${id}`);
-  if (preview) lines.push(`message: “${preview}”`);
+  if (id) lines.push(`message id: ${id}`);
+  if (expandId) {
+    lines.push(`expand id: ${expandId}`);
+    lines.push(`expand: agent-bridge relay-expand ${expandId}`);
+  }
   return lines.join("\n");
 }
 

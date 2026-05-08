@@ -90,6 +90,7 @@ import {
 import { localMachineName } from "./outbound.js";
 import { encodeBridgePeerId } from "./bridge-peer.js";
 import { formatRelayNotice, relayNoticeEnabled } from "./relay-notice.js";
+import { storeRelayExpandMessage } from "./relay-expand-store.js";
 import { emitLifecycleEvent, ensureService as ensureChimeService } from "../../chime/emitter.mjs";
 
 const PLUGIN_ID = "agent-bridge";
@@ -921,13 +922,28 @@ async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, acco
     additionalReplyChannels,
   });
 
+  const agentBridgeVersion = resolveAgentBridgeVersion();
+  let expandRecord = null;
+  try {
+    expandRecord = storeRelayExpandMessage(msg, {
+      targetName: target.name,
+      replyVia: replyPathDisplay,
+      agentBridgeVersion,
+    });
+  } catch (err) {
+    log?.warn?.(
+      `bridge relay expand-id store failed for ${target.name}/${msg.id}: ${err?.message ?? err}`,
+    );
+  }
+
   try {
     await deliverFn({
       to: String(noticePeerId),
       text: formatRelayNotice(msg, {
         targetName: target.name,
         replyVia: replyPathDisplay,
-        agentBridgeVersion: resolveAgentBridgeVersion(),
+        agentBridgeVersion,
+        expandId: expandRecord?.expandId,
       }),
       cfg: hostCfg,
       accountId: account,

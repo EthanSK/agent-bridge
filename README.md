@@ -76,16 +76,17 @@ agent-bridge lets running Claude Code and OpenClaw sessions on different machine
 - **Small transport surface** -- just bash/ssh for pairing and delivery, plus Node for the MCP/channel plugins; no Docker, no central service
 - **MCP tools + harness-specific receivers** -- `bridge_*` tools are shared, but Claude Code's `claude/channel` stdio lifecycle and OpenClaw's `registerChannel()` gateway lifecycle are deliberately different
 
-## Current highlights (4.0.1)
+## Current highlights (4.1.0)
 
-Key changes through v4.0.1, grouped by feature area:
+Key changes through v4.1.0, grouped by feature area:
 
 - **Claude Code personas and named targets** — Claude Code inboxes are persona-scoped (`claude-code/default`, `claude-code/<persona>`), with `AGENT_BRIDGE_PERSONA` as the session identity. Legacy `target="claude-code"` still rolls forward to the default persona, but new sends should be explicit.
 - **OpenClaw is a first-class peer** — the `openclaw-channel/` plugin is verified end-to-end and now uses agent-driven reply routing: the inbound turn carries bridge context, and the agent decides whether to reply via bridge and/or user-facing channels.
 - **Routing and delivery hardening** — targetless files are quarantined, same-machine sends use direct local inbox writes, subagents can long-poll with `bridge_receive_messages(wait: true)`, and malformed or exhausted messages land under `.failed/` for post-mortems.
 - **Runtime freshness and recovery** — auto-update now has in-process notices, same-host coordination locks, plugin-registry rewiring, harness-independent periodic update scripts, migration-instruction injection, and more observability around channel recovery / inbox drains / orphaned MCP children.
+- **Compact relay expansion** — OpenClaw relay receipts now show a short `expand id` plus `agent-bridge relay-expand <id>` instead of dumping long bridge message bodies into Telegram/user channels; the full message is stored locally under `~/.agent-bridge/relay-expand/` with TTL/bounded rotation.
 - **Version/status visibility** — bridge relays include the running `agent-bridge` version, and `claude_code_channel_status` exposes the live plugin version / lease / watcher state for stale-runtime debugging.
-- **Docs/site catch-up** — the README and GitHub Pages highlights now reflect the 3.14.x → 4.0.1 work instead of older 3.x-era assumptions.
+- **Docs/site catch-up** — the README and GitHub Pages highlights now reflect the 3.14.x → 4.1.0 work instead of older 3.x-era assumptions.
 
 See [CHANGELOG.md](CHANGELOG.md) for the commit-level history.
 
@@ -1065,6 +1066,7 @@ Subsequent devices can join with `tailscale up --auth-key=$key --hostname=<name>
 | `agent-bridge list` | List all paired machines (shows internet_host if set). |
 | `agent-bridge run <machine> "cmd"` | Run a PLAIN shell command on a paired machine (diagnostics only — no agent wrapping). |
 | `agent-bridge reset-path <machine>` | Compatibility command for clearing old path-cache files. It no longer changes endpoint selection in 3.4.2+. |
+| `agent-bridge relay-expand <id>` | Print the full locally stored message for a compact OpenClaw relay notice (`expand id: NN`). Use `--json` for raw metadata. |
 | `agent-bridge unpair <machine>` | Remove a pairing. |
 
 > To talk to the **running agent** on the other machine, use the channel plugin's `bridge_send_message` MCP tool. `agent-bridge run` does not spawn agents. The old `--claude` / `--codex` / `--agent` flags were removed in 3.0.0.
@@ -1322,7 +1324,7 @@ Registers `agent-bridge` as a first-class OpenClaw channel (same tier as Telegra
 >
 > 🪦 **Migrating from `replyVia` (≤ v2.4.x):** the field is no longer interpreted. The plugin emits a single deprecation warning listing every offending key and proceeds without crashing. Replace `replyVia` with `additionalReplyChannels` and delete the old field. **Important caveat:** legacy v2 targets that had `replyVia: "agent-bridge"` AND no `peer_id` were implicitly headless — on upgrade they need `openclaw_channel: "agent-bridge"` set explicitly, otherwise they default to Telegram and get skipped for missing peer_id. See [`openclaw-channel/README.md`](openclaw-channel/README.md#migrating-from-replyvia--v24x) for a jq recipe that promotes bridge-only targets BEFORE deleting `replyVia`. Restart OpenClaw afterwards.
 
-> 🛰️ **Relay receipts:** OpenClaw targets also send a short Telegram-visible receipt for every inbound bridge message before the agent turn runs. The first line is `[Agent Bridge relay] 🛰️`, followed by `from/fromTarget → target`, reply path, message id, and a compact preview. This is independent of `additionalReplyChannels`: even silent back-channel turns can still give the user a glanceable "another harness messaged this OpenClaw" update. Disable with `channels["agent-bridge"].config.relayNotice = false` (or per-target `targets.<name>.relayNotice = false`).
+> 🛰️ **Relay receipts:** OpenClaw targets also send a short Telegram-visible receipt for every inbound bridge message before the agent turn runs. The first line is `[Agent Bridge relay] 🛰️`, followed by `from/fromTarget → target`, reply path, message id, and a short `expand id`. It deliberately does **not** include the full bridge body; the full message is stored locally and can be retrieved with `agent-bridge relay-expand <id>` (for example `agent-bridge relay-expand 07`) when the user asks to expand it. This is independent of `additionalReplyChannels`: even silent back-channel turns can still give the user a glanceable "another harness messaged this OpenClaw" update. Disable with `channels["agent-bridge"].config.relayNotice = false` (or per-target `targets.<name>.relayNotice = false`).
 
 **How OpenClaw push delivery works (v3.0+ agent-driven model):**
 1. Peer's `bridge_send_message` writes a JSON file to `~/.agent-bridge/inbox/openclaw/<target>/` via SFTP over SSH
@@ -1670,7 +1672,7 @@ There is **no default delivery routing** — a call without `target` is rejected
 
 **Named target routing.** When the user names a specific target alias (a persona, a session, a per-account bot, etc.), match the alias LITERALLY before falling back to `<harness>/default`. Voice transcripts often mis-hear short proper-noun aliases; re-read before routing. Full principle + examples: [`docs/named-target-routing.md`](docs/named-target-routing.md), also mirrored in [`AGENTS.md`](AGENTS.md#named-target-routing) and the `bridge_send_message` tool description.
 
-**Relay inbound bridge messages to the user.** Every paired harness MUST relay inbound bridge messages to the user via the harness's configured user-facing channel (Telegram, Slack, Discord, native UI, etc.) as a brief 1-3 sentence summary (sender machine + target + actionable ask), with the running **agent-bridge version appended at the end** (e.g. `_(agent-bridge v3.14.9)_`) so the user can spot fleet-wide version drift. Reply via bridge first if a response is needed, THEN relay to the user. Don't suppress routine internal chatter — relay it. Exception: pure-noise heartbeats / `bridge_status` polls. Full rule + format example + rationale: [`docs/relay-to-user.md`](docs/relay-to-user.md), also mirrored in [`AGENTS.md`](AGENTS.md#relay-inbound-bridge-messages-to-the-user) and the `bridge_send_message` tool description.
+**Relay inbound bridge messages to the user.** Every paired harness MUST relay inbound bridge messages to the user via the harness's configured user-facing channel (Telegram, Slack, Discord, native UI, etc.) as a compact 1-3 sentence summary (sender machine + target + actionable ask), with the running **agent-bridge version appended at the end** (e.g. `_(agent-bridge v4.1.0)_`) so the user can spot fleet-wide version drift. Do not paste the full bridge body by default; if the user asks to expand an OpenClaw relay by `expand id`, run `agent-bridge relay-expand <id>` on that same machine and send the retrieved content subject to normal privacy/channel rules. Reply via bridge first if a response is needed, THEN relay to the user. Don't suppress routine internal chatter except pure-noise heartbeats / `bridge_status` polls. Full rule + format example + rationale: [`docs/relay-to-user.md`](docs/relay-to-user.md), also mirrored in [`AGENTS.md`](AGENTS.md#relay-inbound-bridge-messages-to-the-user) and the `bridge_send_message` tool description.
 
 Target strings accept Unicode letters/digits plus `_`, `.`, `-`, `/` (no `..`, no leading/trailing `/`, no `//`, ≤256 chars) so multilingual harness names are allowed.
 

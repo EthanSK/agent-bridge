@@ -2,17 +2,17 @@
 
 **Canonical reference for the rule that every paired harness must relay inbound bridge messages to the user via the harness's configured user-facing communication channel.**
 
-When a harness (Claude Code, OpenClaw, or any other paired agent) receives an inbound bridge message via the `<channel source="agent-bridge">` block, it MUST relay a brief 1-3 sentence summary of that message to the user via whatever user-facing channel the harness is configured to use — Telegram, Slack, Discord, native UI, email, etc. This gives the user live visibility into cross-harness coordination — they can see what other harnesses are asking, who's responding, and what's actually being decided across the fleet, without having to tail logs or context-switch into other sessions.
+When a harness (Claude Code, OpenClaw, or any other paired agent) receives an inbound bridge message via the `<channel source="agent-bridge">` block, it MUST relay a brief 1-3 sentence summary of that message to the user via whatever user-facing channel the harness is configured to use — Telegram, Slack, Discord, native UI, email, etc. This gives the user live visibility into cross-harness coordination — they can see what other harnesses are asking, who's responding, and what's actually being decided across the fleet, without having to tail logs or context-switch into other sessions. Keep the relay compact: do **not** paste the full bridge message body into the user-facing channel by default.
 
 ## The rule
 
-**Relay every inbound bridge message to the user via your harness's configured user-facing channel** as a brief 1-3 sentence summary covering **sender machine + target + the actionable ask**, with the running **agent-bridge version** appended at the end so the user can see at a glance which build produced the message. Reply via bridge first if a response is needed; THEN summarize on the user-facing channel. Don't suppress the relay just because the message looks like routine internal coordination — the user generally wants to see all of it.
+**Relay every inbound bridge message to the user via your harness's configured user-facing channel** as a brief 1-3 sentence summary covering **sender machine + target + the actionable ask**, with the running **agent-bridge version** appended at the end so the user can see at a glance which build produced the message. Reply via bridge first if a response is needed; THEN summarize on the user-facing channel. Don't paste the whole body unless the user explicitly asks to expand it. Don't suppress the relay just because the message looks like routine internal coordination — the user generally wants to see all of it.
 
 The 1-3 sentence band is intentional: 1 sentence is fine for trivial pings ("ack"), but a denser paragraph block is preferred when the inbound message has real context the user needs to follow (multi-step plans, decisions, errors, version-bump coordination). The previous spec was 1-2 lines; loosened to 1-3 sentences on 2026-05-04 (voice 2150) so the relay isn't artificially terse when the message warrants more.
 
 **Format example (Telegram-style, but adapt to your channel):**
 
-> 📡 Bridge from <sender-machine> (target=<routed-target>): "<1-3 sentence quote of the actionable ask>" Replied via bridge with <action>. _(agent-bridge v<X.Y.Z>)_
+> 📡 Bridge from <sender-machine> (target=<routed-target>): <compact 1-3 sentence summary of the actionable ask>. Replied via bridge with <action>. _(agent-bridge v<X.Y.Z>)_
 
 **Exception:** pure-noise heartbeats / liveness pings with no actionable content (e.g. `bridge_status` polls). Those can be silent.
 
@@ -41,7 +41,7 @@ When in doubt, relay. Over-relaying is fine; under-relaying defeats the rule.
 
 1. **Read the inbound message** carefully — same as you would if it had come over the user-facing channel directly.
 2. **Reply via bridge** first if the message asks something that needs a bridge-side response. The reply should be the substantive answer, not "ack, will check user-side too."
-3. **Summarize on the user-facing channel** as a separate message: any project/context tag your harness uses, 1-2 line summary, what you replied (or "no reply needed"). Use the format example above as a template.
+3. **Summarize on the user-facing channel** as a separate message: any project/context tag your harness uses, 1-3 sentence compact summary, what you replied (or "no reply needed"). Use the format example above as a template.
 
 If the message is purely informational and needs no bridge reply, skip step 2 and just relay (step 3).
 
@@ -50,12 +50,14 @@ If the message is purely informational and needs no bridge reply, skip step 2 an
 - **Lead with whatever tag/header convention your harness uses** for user-facing messages (project tag, status emoji, etc.).
 - **Use a distinctive inline indicator** for bridge-relay messages so the user can scan-filter them. The radar emoji 📡 is a good default but pick whatever fits your channel.
 - **Sender + target are mandatory** in the summary line — the user needs to know which harness asked and which target it routed to.
-- **Quote the actionable ask** in 1-3 sentences. Don't paraphrase; quote enough that the user recognizes the request. Trivial pings stay 1 sentence; messages with real coordination context can use the full 3 sentences as a paragraph block (see voice 2150 — "improve the formatting maybe so it's one massive paragraph block").
+- **Summarize the actionable ask** in 1-3 sentences. Quote short identifiers or critical wording when useful, but do not paste long/full message bodies by default. Trivial pings stay 1 sentence; messages with real coordination context can use the full 3 sentences as a paragraph block (see voice 2150 — "improve the formatting maybe so it's one massive paragraph block").
 - **State your action** after the quote ("Replied via bridge with X" / "No reply needed, FYI" / "Holding for user input").
 - **Append the agent-bridge version** at the end of the relay, e.g. `_(agent-bridge v3.14.9)_`. Read the version from:
   - **Claude Code** — the `agent_bridge_version` attribute on the inbound `<channel>` block (4.0.0+ inlines it on every push), or fall back to `claude_code_channel_status` (returns the same `version` field).
   - **OpenClaw** — the `agent_bridge_version` line inside the `[BRIDGE-CONTEXT]` block.
   Do NOT hardcode the version — both surfaces emit the running build number, so a stale hardcoded literal would lie about fleet drift exactly when the user needs to spot it. The version helps the user spot fleet-wide version drift at a glance ("MBP is on 3.14.5 but Mini just relayed from 3.14.9").
+- **OpenClaw automatic relay notices use expand ids.** v3.1+ OpenClaw channel receipts show `expand id: NN` and `expand: agent-bridge relay-expand NN` instead of a `message:` preview. The full inbound BridgeMessage is stored locally under `~/.agent-bridge/relay-expand/` with a bounded/TTL-pruned rolling id map.
+- **When the user says “expand Agent Bridge relay message NN”**, run `agent-bridge relay-expand NN` on the same machine that produced the relay notice, then send the retrieved full content through the current user-facing channel, applying only normal privacy/channel-safety rules. Use `--json` only when you need machine-readable metadata.
 
 ## Where this rule lives across agent-bridge surfaces
 

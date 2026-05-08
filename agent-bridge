@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.0.1"
+VERSION="4.1.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -2232,6 +2232,125 @@ cmd_mcp_incident_report_help() {
   printf 'Example:\n  agent-bridge mcp-incident-report --around 2026-05-03T12:11:00Z --window-mins 5\n\n'
 }
 
+cmd_relay_expand() {
+  local expand_id="" output_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) output_json=1; shift ;;
+      --help|-h) cmd_relay_expand_help; exit 0 ;;
+      -*) die "Unknown option: $1. Use --help for usage." ;;
+      *)
+        if [ -n "$expand_id" ]; then
+          die "Only one expand id is accepted. Usage: agent-bridge relay-expand <id>"
+        fi
+        expand_id="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [ -z "$expand_id" ] && die "Expand id required. Usage: agent-bridge relay-expand <id>"
+
+  local normalized_id="$expand_id"
+  normalized_id="${normalized_id#\#}"
+  if [[ "$normalized_id" =~ ^[0-9]$ ]]; then
+    normalized_id="0${normalized_id}"
+  fi
+
+  if command -v node >/dev/null 2>&1; then
+    RELAY_EXPAND_ID="$normalized_id" RELAY_EXPAND_JSON="$output_json" node <<'NODE'
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+function normalize(value) {
+  const raw = String(value || '').trim().replace(/^#/, '');
+  return /^\d$/.test(raw) ? `0${raw}` : raw;
+}
+
+function formatList(value) {
+  if (Array.isArray(value)) return value.filter(Boolean).join(', ');
+  return String(value || '');
+}
+
+function formatEntry(entry) {
+  const message = entry.message || {};
+  const metadata = entry.metadata || {};
+  const lines = [
+    `Agent Bridge relay expand ${entry.expandId}`,
+    `stored_at: ${entry.storedAt || ''}`,
+    `expires_at: ${entry.expiresAt || ''}`,
+  ];
+  if (message.id) lines.push(`message_id: ${message.id}`);
+  if (message.from) lines.push(`from: ${message.from}`);
+  if (message.fromTarget) lines.push(`from_target: ${message.fromTarget}`);
+  if (message.target) lines.push(`target: ${message.target}`);
+  if (metadata.replyVia) lines.push(`reply_path: ${formatList(metadata.replyVia)}`);
+  if (metadata.targetName) lines.push(`openclaw_target: ${metadata.targetName}`);
+  if (metadata.agentBridgeVersion) lines.push(`agent_bridge_version: ${metadata.agentBridgeVersion}`);
+  if (message.timestamp) lines.push(`message_timestamp: ${message.timestamp}`);
+  if (message.replyTo) lines.push(`reply_to: ${message.replyTo}`);
+  lines.push('', '--- message ---', String(message.content || ''));
+  return lines.join('\n');
+}
+
+const id = normalize(process.env.RELAY_EXPAND_ID);
+const storePath = process.env.AGENT_BRIDGE_RELAY_EXPAND_STORE
+  || path.join(os.homedir(), '.agent-bridge', 'relay-expand', 'store.json');
+if (!id) {
+  console.error('relay-expand: empty expand id');
+  process.exit(2);
+}
+if (!fs.existsSync(storePath)) {
+  console.error(`relay-expand: no local relay-expand store at ${storePath}`);
+  process.exit(2);
+}
+let store;
+try {
+  store = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+} catch (err) {
+  console.error(`relay-expand: failed to read ${storePath}: ${err.message || err}`);
+  process.exit(2);
+}
+const entry = Array.isArray(store.entries)
+  ? store.entries.find((candidate) => normalize(candidate && candidate.expandId) === id)
+  : null;
+if (!entry) {
+  console.error(`relay-expand: no entry found for expand id ${id}`);
+  process.exit(2);
+}
+if (Number(entry.expiresAtMs || 0) <= Date.now()) {
+  console.error(`relay-expand: entry ${id} expired at ${entry.expiresAt || 'unknown time'}`);
+  process.exit(3);
+}
+if (process.env.RELAY_EXPAND_JSON === '1') {
+  process.stdout.write(`${JSON.stringify(entry, null, 2)}\n`);
+} else {
+  process.stdout.write(`${formatEntry(entry)}\n`);
+}
+NODE
+    return $?
+  fi
+
+  # Minimal dependency-free fallback for machines without Node: the OpenClaw
+  # channel writes a human-readable companion file next to store.json. This
+  # fallback cannot enforce TTL, but keeps expansion usable on stripped-down
+  # shells.
+  local text_path="$CONFIG_DIR/relay-expand/${normalized_id}.txt"
+  [ -f "$text_path" ] || die "No relay-expand entry found for id ${normalized_id}"
+  cat "$text_path"
+}
+
+cmd_relay_expand_help() {
+  printf '\nagent-bridge relay-expand — expand a compact OpenClaw Agent Bridge relay notice\n\n'
+  printf 'Usage:\n  agent-bridge relay-expand [--json] <expand-id>\n\n'
+  printf 'Prints the full locally stored BridgeMessage for a compact relay notice,\n'
+  printf 'using the short id shown as `expand id: NN` in `[Agent Bridge relay]` receipts.\n\n'
+  printf 'Examples:\n'
+  printf '  agent-bridge relay-expand 07\n'
+  printf '  agent-bridge relay-expand --json 07\n\n'
+}
+
 cmd_help() {
   printf '\n'
   printf "${BOLD}agent-bridge${RESET} v%s\n" "$VERSION"
@@ -2249,6 +2368,7 @@ cmd_help() {
   printf '  plugin-registry-rewire  Self-heal stale plugin-registry entries (Claude Code + OpenClaw)\n'
   printf '  install-periodic-update Install harness-independent 10min auto-updater (LaunchAgent / Scheduled Task)\n'
   printf '  mcp-incident-report     Post-mortem report of MCP disconnect events around a timestamp\n'
+  printf '  relay-expand <id>  Expand a compact OpenClaw Agent Bridge relay notice\n'
   printf '  connect <machine>  Open an interactive SSH session\n'
   printf '  run <machine> "cmd"  Run a plain shell command on a paired machine (diagnostics only)\n'
   printf '  list               List all paired machines\n'
@@ -2299,6 +2419,7 @@ main() {
     plugin-registry-rewire) cmd_plugin_registry_rewire "$@" ;;
     install-periodic-update) cmd_install_periodic_update "$@" ;;
     mcp-incident-report) cmd_mcp_incident_report "$@" ;;
+    relay-expand) cmd_relay_expand "$@" ;;
     connect)  cmd_connect "$@" ;;
     run)      cmd_run "$@" ;;
     list)     cmd_list "$@" ;;

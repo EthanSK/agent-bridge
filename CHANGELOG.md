@@ -1,5 +1,14 @@
 # Changelog
 
+## agent-bridge 4.1.0 / openclaw-channel 3.1.0 — 2026-05-08
+
+Ethan asked for Agent Bridge relay notices to stop pasting long/full message bodies into Telegram/user channels and instead show a short human-referenceable expand id. This release replaces the 4.0.1 large-preview behavior with compact receipts plus a local expansion path.
+
+- **Compact OpenClaw relay receipts.** `[Agent Bridge relay] 🛰️` notices now show metadata (`agent-bridge` version, sender/fromTarget → target, reply path, message id) and `expand id: NN` / `expand: agent-bridge relay-expand NN` instead of a `message:` preview. Long bridge content stays out of user-facing relay receipts by default.
+- **Bounded local expand store.** The OpenClaw channel stores the full inbound BridgeMessage + metadata under `~/.agent-bridge/relay-expand/` with a 7-day TTL and a rolling 00-99 id space (bounded to 100 recent entries by default). One-digit references like `7` normalize to `07`.
+- **First-class expansion CLI.** `agent-bridge relay-expand <id>` prints the stored full message and metadata; `--json` prints the raw stored entry for agents/tools. Harness instructions now say that when Ethan asks to “expand Agent Bridge relay message NN,” agents should run that command on the machine that produced the notice and send the retrieved content subject to normal privacy/channel rules.
+- **Version bumps.** CLI / MCP server / Claude plugin metadata moved to `4.1.0`; OpenClaw channel package moved to `3.1.0`.
+
 ## agent-bridge 4.0.1 + docs refresh — 2026-05-05
 
 Backfill for the next day's OC/CC chat-derived work after the 2026-05-04 4.0.x bundle. Covers substantive commits from [`384d417`](https://github.com/EthanSK/agent-bridge/commit/384d417) through [`f167c76`](https://github.com/EthanSK/agent-bridge/commit/f167c76): the OpenClaw relay-notice visibility fix, the 4.0.1 version bump, and the README / GitHub Pages / OpenClaw channel documentation refresh that followed Ethan's "What's New has drifted" request.

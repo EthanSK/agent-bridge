@@ -132,6 +132,11 @@ peer_id` warnings — those flag bridge-only targets that need
 automatically; warnings would only fire if a target has a non-bridge-only
 shape without a peer_id).
 
+## What's new in v3.1.0
+
+- **Compact relay receipts with expand ids.** `[Agent Bridge relay] 🛰️` notices no longer include the full/large bridge body. They show sender/target metadata, message id, and a short `expand id: NN` plus `expand: agent-bridge relay-expand NN`.
+- **Local bounded expand store.** The full inbound BridgeMessage is stored under `~/.agent-bridge/relay-expand/` with a 100-entry rolling id space and 7-day TTL by default. Agents can retrieve recent full content with `agent-bridge relay-expand <id>` when Ethan asks to expand a relay.
+
 ## What's new in v3.0.0
 
 - **Breaking: agent-driven reply routing.** The plugin no longer auto-fans-out replies via `replyVia`. It injects the inbound bridge message into one OpenClaw agent turn with a `[BRIDGE-CONTEXT]` block, then the agent chooses whether to reply over the bridge and/or user-facing channels.
@@ -140,7 +145,7 @@ shape without a peer_id).
 
 ## What's new in v2.4.1
 
-- **Telegram-visible Agent Bridge relay receipts.** Every inbound bridge message to an OpenClaw target now sends a short best-effort notice to the configured chat before the agent turn runs. The notice starts with `[Agent Bridge relay] 🛰️`, then shows `from/fromTarget → target`, reply path, message id, and a compact preview. This restores the old “I can see another harness messaged this OpenClaw” affordance even when the actual agent reply uses the silent `replyVia: "agent-bridge"` back-channel.
+- **Telegram-visible Agent Bridge relay receipts.** Every inbound bridge message to an OpenClaw target now sends a short best-effort notice to the configured chat before the agent turn runs. Since v3.1.0 the notice starts with `[Agent Bridge relay] 🛰️`, then shows `from/fromTarget → target`, reply path, message id, and an `expand id` rather than a body preview. This preserves the old “I can see another harness messaged this OpenClaw” affordance without dumping long bridge content into Telegram/user channels.
 - **Config:** receipts are enabled by default. Set `channels["agent-bridge"].config.relayNotice = false` (or per-target `targets.<name>.relayNotice = false`) to silence them. Optional `relayNoticeChannel` / `relayNoticePeerId` override where the receipt is sent; otherwise it uses the target's normal channel + `peer_id`.
 
 ## What's new in v2.3.0
@@ -240,11 +245,11 @@ Senders on the other machine address a specific target with the new `target` fie
 - On each new `BridgeMessage`:
   1. Parse + dedup against `~/.agent-bridge/.openclaw-v2-delivered`.
   2. Format as `<channel source="agent-bridge" from=... to=... target=... ts=...>content</channel>` (parity with the Claude Code channel plugin).
-  3. Best-effort send a Telegram-visible relay receipt beginning `[Agent Bridge relay] 🛰️` unless `relayNotice` is disabled.
+  3. Store the full BridgeMessage in the local relay-expand store (`~/.agent-bridge/relay-expand/`) and best-effort send a Telegram-visible compact relay receipt beginning `[Agent Bridge relay] 🛰️` unless `relayNotice` is disabled. The receipt includes `expand id: NN` and `expand: agent-bridge relay-expand NN` instead of the full message body.
   4. Resolve the canonical session route via `runtime.channel.routing.resolveAgentRoute(...)`.
-  5. Build a synthetic inbound `ctxPayload` via `runtime.channel.reply.finalizeInboundContext({...})`, pinned either to Telegram (`Provider/OriginatingChannel/OriginatingTo = telegram`) or to the native `agent-bridge` channel with an encoded bridge peer id, depending on `replyVia`.
+  5. Build a synthetic inbound `ctxPayload` via `runtime.channel.reply.finalizeInboundContext({...})`, pinned either to Telegram (`Provider/OriginatingChannel/OriginatingTo = telegram`) or to the native `agent-bridge` channel with an encoded bridge peer id according to the selected primary channel.
   6. `await dispatchInboundReplyWithBase({cfg, channel, accountId, route, storePath, ctxPayload, core: runtime, deliver, onRecordError, onDispatchError})`. This runs a synchronous agent turn in the target session.
-  7. The `deliver` callback forwards each reply payload through the matching outbound adapter, so Telegram-bound targets land in the chat and `replyVia="agent-bridge"` targets SFTP back to the sender machine.
+  7. Replies are agent-driven: the natural turn output goes through the selected primary channel, and the agent calls bridge/user-facing tools explicitly for any additional legs.
 - After successful dispatch, the consumed inbox file is moved to `~/.agent-bridge/archive/openclaw/<target>/`. Seeing a message there means it was delivered to OpenClaw; pending messages remain in `~/.agent-bridge/inbox/openclaw/<target>/`.
 - Legacy messages at `~/.agent-bridge/inbox/*.json` (no subdir, no `target` field) are quarantined to `~/.agent-bridge/inbox/.failed/_unrouted/` with a deprecation log line.
 - The outbound `ChannelOutboundAdapter.sendText` adapter is preserved for cross-harness bridge replies — if the paired peer is another agent-bridge-aware agent (not a Telegram session), the reply can still SFTP back via the bridge instead of landing in Telegram.
