@@ -40,7 +40,7 @@ test("agent-bridge relay-expand prints the stored full relay message", () => {
   }));
 
   const output = execFileSync("bash", [cliPath, "relay-expand", "7"], {
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, AGENT_BRIDGE_RELAY_EXPAND_STORE: join(storeDir, "store.json") },
     encoding: "utf8",
   });
 
@@ -71,7 +71,7 @@ test("agent-bridge relay-expand --json prints the raw stored entry", () => {
   }));
 
   const output = execFileSync("bash", [cliPath, "relay-expand", "--json", "08"], {
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, AGENT_BRIDGE_RELAY_EXPAND_STORE: join(storeDir, "store.json") },
     encoding: "utf8",
   });
   const parsed = JSON.parse(output);
