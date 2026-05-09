@@ -35,6 +35,8 @@ OC channel-plugin emits this byte-identical for every inbound bridge message. CC
 
 **Exception:** pure-noise heartbeats / liveness pings with no actionable content (e.g. `bridge_status` polls). Those can be silent.
 
+**One relay = one user-facing message.** Each inbound bridge `<channel>` block becomes exactly ONE outbound message on the user-facing channel. Do NOT bundle multiple inbound relays into one outbound. Do NOT bundle a relay with unrelated user-facing content (an answer to a separate user question, a status update on another task, etc.). Two inbound bridges → two outbound relay messages. Inbound bridge + outbound user reply → two outbound messages. This makes the user's chat list scannable: each relay = one row they can glance-skip or expand. Established 2026-05-09 (Ethan voice 2324: "Agent bridge relay messages should be their own separate Telegram messages, not part of the same one").
+
 ## Why this matters
 
 Without this rule, cross-harness traffic is invisible to the user unless they open a session and read the channel block themselves. Bridge messages are an internal coordination layer; without an outward relay the user has no idea what their fleet is doing. The relay turns the bridge from a hidden side-channel into a glance-able activity feed.
