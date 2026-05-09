@@ -119,9 +119,9 @@ bridge_send_message({
 
 When a `<channel source="agent-bridge" ...>` block lands in this session, you MUST relay a brief 1-3 sentence summary to the user via the harness's configured user-facing channel (Telegram, Slack, Discord, native UI, etc.).
 
-**As of openclaw-channel 3.2.0 / agent-bridge 4.2.0** the structural fields below are **emitted programmatically by the plugin** via the shared `lib/relay-notice.js` formatter (re-exported by `openclaw-channel/src/relay-notice.js`). On OC the channel plugin sends the completed receipt directly via the gateway bus to the configured Telegram chat — your structural responsibility is just to fill in the Summary blockquote when composing the user-facing reply (the plugin's gateway-side receipt arrives separately as a "this message landed" pre-notice).
+**As of openclaw-channel 3.3.0 / agent-bridge 4.3.0** OC follows the same agent-fill pattern as Claude Code: the channel plugin builds the structural scaffold via `formatRelayScaffold(...)` (shared formatter at `lib/relay-notice.js`, re-exported by `openclaw-channel/src/relay-notice.js`) and prepends a `[RELAY-SCAFFOLD-START] ... [RELAY-SCAFFOLD-END]` fenced block to the inbound body that gets injected into your OC agent session. Your structural responsibility is to lift the scaffold verbatim, replace the `{{SUMMARY_PLACEHOLDER}}` line with a 1–3 sentence Summary blockquote, and emit the completed relay through the harness's user-facing reply tool (Telegram by default for OC). Pre-3.3.0 OC sent a gateway-direct receipt BEFORE the agent turn ran — that path had no Summary (no LLM in the loop) and was replaced in 3.3.0 to give CC + OC a single source of Summary judgment.
 
-Format reference (kept here as a fallback for cases where the plugin-emitted receipt isn't available — older plugin version, custom harness, scaffold stripped by an intermediate layer):
+Format reference (kept here as a fallback for cases where the plugin-emitted scaffold isn't available — older plugin version, custom harness, scaffold stripped by an intermediate layer):
 
 - Header (literal): `[Agent Bridge relay] 🛰️` — NOT 📡, NOT a free-form prefix. Hard-coded in the shared formatter.
 - `agent-bridge: v<X.Y.Z>` — read from `[BRIDGE-CONTEXT]` block (OC) or `claude_code_channel_status` (CC). Never hardcode.

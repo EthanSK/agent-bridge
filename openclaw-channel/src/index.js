@@ -89,7 +89,11 @@ import {
 } from "./channel-plugin.js";
 import { localMachineName } from "./outbound.js";
 import { encodeBridgePeerId } from "./bridge-peer.js";
-import { formatRelayNotice, relayNoticeEnabled } from "./relay-notice.js";
+import {
+  formatRelayNotice,
+  formatRelayScaffold,
+  relayNoticeEnabled,
+} from "./relay-notice.js";
 import { storeRelayExpandMessage } from "./relay-expand-store.js";
 import { emitLifecycleEvent, ensureService as ensureChimeService } from "../../chime/emitter.mjs";
 
@@ -299,15 +303,27 @@ export default {
             const account = target.config.account ?? target.name;
             const telegramPeerId = target.config.peer_id;
 
-            // Pre-flight relay receipt to the user's chat — independent of
-            // additionalReplyChannels. This is a glanceable "something
-            // landed" notice that fires BEFORE the agent turn runs.
-            await sendBridgeRelayNotice({
-              runtime,
+            // [RELAY-SCAFFOLD-IN-OC 2026-05-09 — agent-bridge 4.3.0]
+            // Pre-4.3.0 the OC plugin emitted the user-facing relay receipt
+            // BEFORE the agent turn ran ("pre-flight" sendBridgeRelayNotice
+            // → gateway-direct sendText to Telegram). That path produced a
+            // structurally-correct receipt but had NO Summary blockquote
+            // (the gateway has no LLM in the loop, and the formatter's
+            // `summary` opt was never wired through), which Ethan flagged
+            // as inconsistent with CC's agent-fill-Summary behavior.
+            //
+            // We now mirror CC's pattern: build the scaffold here, populate
+            // the relay-expand store as before, then INJECT the scaffold
+            // into the agent's session via `formatInboundBody` so the agent
+            // fills `{{SUMMARY_PLACEHOLDER}}` and emits the completed relay
+            // through its natural turn output to the primary channel
+            // (Telegram when wired up). The agent now owns the entire
+            // user-facing relay emission — single source of Summary
+            // judgment across CC + OC.
+            const relayCtx = prepareBridgeRelayContext({
               hostCfg,
               pluginCfg,
               target,
-              account,
               msg,
               additionalReplyChannels,
               log,
@@ -372,6 +388,7 @@ export default {
               account,
               target,
               additionalReplyChannels,
+              relayCtx,
               runtime,
               hostCfg,
               replyTargets,
@@ -620,6 +637,7 @@ async function dispatchAgentTurn({
   account,
   target,
   additionalReplyChannels,
+  relayCtx,
   runtime,
   hostCfg,
   replyTargets,
@@ -654,6 +672,7 @@ async function dispatchAgentTurn({
     target,
     additionalReplyChannels,
     primaryChannel: targetChannel,
+    relayCtx,
   });
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
@@ -889,33 +908,30 @@ function registerReplyTarget(replyTargets, { sessionKey, fromMachine, incoming, 
  *
  * Args: `{ to, text, cfg, accountId, replyToId }`.
  */
-async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, account, msg, additionalReplyChannels, log }) {
-  if (!relayNoticeEnabled(pluginCfg, target.config)) return;
 
-  const noticeChannel = target.config.relayNoticeChannel
-    ?? target.config.openclaw_channel
-    ?? "telegram";
-  const noticePeerId = target.config.relayNoticePeerId
-    ?? target.config.peer_id;
-
-  if (!noticePeerId) {
-    log?.debug?.(
-      `bridge relay notice skipped for ${target.name}/${msg.id}: target has no peer_id`,
-    );
-    return;
-  }
-
-  const deliverFn = resolveProviderDeliver({ runtime, targetChannel: noticeChannel });
-  if (!deliverFn) {
-    log?.warn?.(
-      `bridge relay notice skipped for ${target.name}/${msg.id}: no outbound delivery function for channel="${noticeChannel}"`,
-    );
-    return;
-  }
+/**
+ * Build the relay-context bundle (relay-expand store record + reply-path
+ * display + agent-bridge version) for this inbound message.
+ *
+ * Pre-4.3.0 (`sendBridgeRelayNotice`) this function ALSO emitted the
+ * Telegram-visible `[Agent Bridge relay] 🛰️` notice via a gateway-direct
+ * `sendText` BEFORE the agent turn ran. That path is gone — the agent now
+ * owns user-facing relay emission via the scaffold injected into
+ * `formatInboundBody`. This helper is now strictly preparatory:
+ *   - Populates the relay-expand store (so `agent-bridge relay-expand NN`
+ *     keeps resolving long-form bodies).
+ *   - Returns the data the inbound-body formatter needs to embed the
+ *     scaffold (expandId, replyPathDisplay, agentBridgeVersion).
+ *
+ * Returns `null` when relay notices are disabled for this target — callers
+ * MUST handle null and skip scaffold injection accordingly.
+ */
+function prepareBridgeRelayContext({ hostCfg, pluginCfg, target, msg, additionalReplyChannels, log }) {
+  if (!relayNoticeEnabled(pluginCfg, target.config)) return null;
 
   // The relay-notice helper still accepts a `replyVia` field for the human-
-  // readable "reply path" line. Map our new `additionalReplyChannels` model
-  // to that legacy shape: list "agent-bridge" first (always implicit when
+  // readable "reply path" line. Map our `additionalReplyChannels` model to
+  // that legacy shape: list "agent-bridge" first (always implicit when
   // from_target is set) plus every additional user-facing channel.
   const replyPathDisplay = formatReplyPathForNotice({
     msg,
@@ -936,26 +952,12 @@ async function sendBridgeRelayNotice({ runtime, hostCfg, pluginCfg, target, acco
     );
   }
 
-  try {
-    await deliverFn({
-      to: String(noticePeerId),
-      text: formatRelayNotice(msg, {
-        targetName: target.name,
-        replyVia: replyPathDisplay,
-        agentBridgeVersion,
-        expandId: expandRecord?.expandId,
-      }),
-      cfg: hostCfg,
-      accountId: account,
-      replyToId: null,
-    });
-  } catch (err) {
-    // A receipt should never block the actual agent-to-agent dispatch. Log and
-    // keep going so bridge messages still get processed if Telegram is flaky.
-    log?.warn?.(
-      `bridge relay notice failed for ${target.name}/${msg.id}: ${err?.message ?? err}`,
-    );
-  }
+  return {
+    expandId: expandRecord?.expandId ?? null,
+    replyPathDisplay,
+    agentBridgeVersion,
+    targetName: target.name,
+  };
 }
 
 /**
@@ -1450,7 +1452,7 @@ async function loadDispatchRuntime(log) {
  * The BRIDGE-CONTEXT block is intentionally compact and machine-readable
  * (key: value lines) so the agent has unambiguous data to act on.
  */
-function formatInboundBody({ msg, target, additionalReplyChannels, primaryChannel }) {
+function formatInboundBody({ msg, target, additionalReplyChannels, primaryChannel, relayCtx }) {
   const machine = localMachineName();
   const attrs = [
     `source="agent-bridge"`,
@@ -1514,7 +1516,41 @@ function formatInboundBody({ msg, target, additionalReplyChannels, primaryChanne
     );
   }
 
-  return `${channelBlock}\n\n${ctxLines.join("\n")}`;
+  // [RELAY-SCAFFOLD-IN-OC 2026-05-09 — agent-bridge 4.3.0]
+  // When the primary channel is a user-facing channel (Telegram, Slack,
+  // Discord, etc.), the agent's natural turn output flows there — that's
+  // the user-facing relay leg. Prepend a `formatRelayScaffold` block so
+  // the agent sees the deterministic structural fields and a
+  // `{{SUMMARY_PLACEHOLDER}}` it must replace with a 1-3 sentence Summary
+  // blockquote before sending. This mirrors CC's pattern (mcp-server
+  // prepends the same scaffold to the inbound `<channel>` push) and
+  // gives OC + CC a single source of Summary judgment in the agent.
+  //
+  // When the primary channel is the silent agent-bridge back-channel,
+  // there is no user reading the output — no scaffold injection needed.
+  // The relay-expand store is still populated upstream so
+  // `agent-bridge relay-expand NN` keeps working for ad-hoc lookups.
+  const isUserFacingPrimary =
+    primaryChannel &&
+    primaryChannel !== AGENT_BRIDGE_CHANNEL_ID;
+
+  let scaffoldPrefix = "";
+  if (isUserFacingPrimary && relayCtx) {
+    try {
+      const scaffold = formatRelayScaffold(msg, {
+        targetName: relayCtx.targetName ?? target?.name,
+        replyVia: relayCtx.replyPathDisplay,
+        agentBridgeVersion: relayCtx.agentBridgeVersion,
+        expandId: relayCtx.expandId ?? undefined,
+      });
+      scaffoldPrefix = `${scaffold}\n\n`;
+    } catch {
+      // Defensive — never let a scaffold formatting bug block dispatch.
+      scaffoldPrefix = "";
+    }
+  }
+
+  return `${scaffoldPrefix}${channelBlock}\n\n${ctxLines.join("\n")}`;
 }
 
 function escapeAttr(v) {
