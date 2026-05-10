@@ -1,6 +1,6 @@
 # Changelog
 
-## agent-bridge 4.5.0 / openclaw-channel 3.4.0 — 2026-05-10
+## agent-bridge 4.5.0 / openclaw-channel 4.5.0 — 2026-05-10
 
 Ethan asked for relay notices to stop showing one ambiguous Agent Bridge version and instead show both the source-side and destination-side runtime identity, including the source/destination target labels.
 
@@ -8,7 +8,7 @@ Ethan asked for relay notices to stop showing one ambiguous Agent Bridge version
 - **Wire metadata propagation.** Current MCP/Claude Code sends and OpenClaw bridge replies stamp `sourceAgentBridgeVersion` on outbound `BridgeMessage` JSON. Receivers combine that sender version with their local runtime version (`destinationAgentBridgeVersion`) when building the relay scaffold and metadata.
 - **Backwards compatibility.** Older peers that do not send `sourceAgentBridgeVersion` render the source version as `agent-bridge unknown`; legacy `agentBridgeVersion` / `agent_bridge_version` aliases are still accepted, and the receiver still exposes legacy `agent_bridge_version` as a destination/local alias for older agents.
 - **Tests and docs.** Focused formatter, OpenClaw BRIDGE-CONTEXT, relay-expand, envelope, and MCP meta tests now cover source/destination version propagation. Relay docs and skills now describe the dual-version format.
-- **Version bumps.** CLI / MCP server / Claude plugin metadata moved to `4.5.0`; OpenClaw channel package moved to `3.4.0`.
+- **Version alignment.** CLI / MCP server / Claude plugin metadata moved to `4.5.0`, and the OpenClaw channel adapter package now uses the same visible `4.5.0` version. A regression test enforces this lockstep versioning so OpenClaw's plugin list does not show a confusing adapter-only number.
 
 ## agent-bridge 4.4.0 — 2026-05-10
 
@@ -1470,7 +1470,7 @@ If the soak test reveals a future death despite 3.5.2's instrumentation, the new
   - New `deliverReplyLocal({ message, toMachine, inboxDir?, outboxDir?, logger? })` — performs the inbox write directly on disk with atomic rename, mirroring `sendLocalMessage` semantics including the best-effort outbox copy.
   - `deliverReply()` now short-circuits to `deliverReplyLocal` when `toMachine` is the local machine. Cross-machine SSH path is untouched.
 - `openclaw-channel/test/outbound-local.test.js`: 11 new cases covering local-name and alias detection, atomic-write cleanup, malformed-target rejection, alias routing through `deliverReply`, the unchanged remote-throw behaviour, and the mixed local-send + paired-remote scenario.
-- Version bumps: `mcp-server/package.json` 3.5.0 → 3.5.1, `mcp-server/.claude-plugin/plugin.json` 3.5.0 → 3.5.1, `mcp-server/src/index.ts` server version + startup log to 3.5.1, `agent-bridge` bash CLI `VERSION` 3.5.0 → 3.5.1, `mcp-server/package-lock.json` to match. `openclaw-channel/package.json` bumped 2.3.4 → 2.3.5 (independent semver track).
+- Version bumps: `mcp-server/package.json` 3.5.0 → 3.5.1, `mcp-server/.claude-plugin/plugin.json` 3.5.0 → 3.5.1, `mcp-server/src/index.ts` server version + startup log to 3.5.1, `agent-bridge` bash CLI `VERSION` 3.5.0 → 3.5.1, `mcp-server/package-lock.json` to match. `openclaw-channel/package.json` bumped 2.3.4 → 2.3.5 (it used an independent semver track at the time; 4.5.0 later moved the visible adapter package version to lockstep with Agent Bridge).
 
 #### Compatibility
 
