@@ -676,31 +676,16 @@ async function dispatchAgentTurn({
     relayCtx,
   });
 
-  const ctxPayload = runtime.channel.reply.finalizeInboundContext({
-    Body: body,
-    RawBody: rawContent,
-    CommandBody: rawContent,
-    From: `${targetChannel}:${peerId}`,
-    To: `${targetChannel}:${peerId}`,
-    SessionKey: route.sessionKey,
-    AccountId: route.accountId,
-    ChatType: "direct",
-    ConversationLabel: String(fromMachine ?? "agent-bridge"),
-    SenderId: String(peerId),
-    SenderName: String(fromMachine ?? "agent-bridge"),
-    Provider: targetChannel,
-    Surface: targetChannel,
-    MessageSid: msg.id,
-    Timestamp: msg.timestamp
-      ? (Number.isFinite(Number(msg.timestamp))
-        ? Number(msg.timestamp)
-        : Date.parse(msg.timestamp) || Date.now())
-      : Date.now(),
-    OriginatingChannel: targetChannel,
-    OriginatingTo: `${targetChannel}:${peerId}`,
-    // CommandAuthorized defaults via finalizeInboundContext; bridge content
-    // is untrusted, so we don't flip it on.
-  });
+  const ctxPayload = runtime.channel.reply.finalizeInboundContext(buildInboundContextPayloadInput({
+    body,
+    rawContent,
+    targetChannel,
+    peerId,
+    route,
+    fromMachine,
+    accountId: route.accountId,
+    msg,
+  }));
 
   log.info(
     `about to dispatch ${msg.id} from ${fromMachine} target=${target.name} `
@@ -758,6 +743,48 @@ async function dispatchAgentTurn({
     `dispatched ${msg.id} from ${fromMachine} target=${target.name} `
     + `primary=${targetChannel} sessionKey=${route.sessionKey}`,
   );
+}
+
+function buildInboundContextPayloadInput({
+  body,
+  rawContent,
+  targetChannel,
+  peerId,
+  route,
+  fromMachine,
+  accountId,
+  msg,
+}) {
+  return {
+    Body: body,
+    // OpenClaw's inbound context finalizer prefers BodyForAgent when present,
+    // then falls back to CommandBody/RawBody before Body. Keep the scaffolded
+    // bridge context in the agent-visible field while preserving raw content
+    // for command parsing and transcript/debug fields.
+    BodyForAgent: body,
+    RawBody: rawContent,
+    CommandBody: rawContent,
+    From: `${targetChannel}:${peerId}`,
+    To: `${targetChannel}:${peerId}`,
+    SessionKey: route.sessionKey,
+    AccountId: accountId,
+    ChatType: "direct",
+    ConversationLabel: String(fromMachine ?? "agent-bridge"),
+    SenderId: String(peerId),
+    SenderName: String(fromMachine ?? "agent-bridge"),
+    Provider: targetChannel,
+    Surface: targetChannel,
+    MessageSid: msg.id,
+    Timestamp: msg.timestamp
+      ? (Number.isFinite(Number(msg.timestamp))
+        ? Number(msg.timestamp)
+        : Date.parse(msg.timestamp) || Date.now())
+      : Date.now(),
+    OriginatingChannel: targetChannel,
+    OriginatingTo: `${targetChannel}:${peerId}`,
+    // CommandAuthorized defaults via finalizeInboundContext; bridge content
+    // is untrusted, so we don't flip it on.
+  };
 }
 
 function getProcessState() {
@@ -1054,6 +1081,7 @@ export const __testing = {
   pickPrimaryChannel,
   formatInboundBody,
   formatReplyPathForNotice,
+  buildInboundContextPayloadInput,
 };
 
 function resolveTargets({ pluginCfg, openclawGlobalCfg, log }) {

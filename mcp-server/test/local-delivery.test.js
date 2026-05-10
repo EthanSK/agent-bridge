@@ -88,7 +88,7 @@ test('sendLocalMessage with legacy claude-code target lands at flat inbox/claude
   assert.equal(parsed.id, msg.id);
   assert.equal(parsed.target, 'claude-code', 'legacy `claude-code` target preserved on the wire');
   assert.equal(parsed.fromTarget, 'claude-code', 'legacy fromTarget preserved on the wire');
-  assert.equal(parsed.sourceAgentBridgeVersion, '4.5.0', 'sender-side Agent Bridge version stamped on the wire');
+  assert.equal(parsed.sourceAgentBridgeVersion, '4.5.1', 'sender-side Agent Bridge version stamped on the wire');
   assert.equal(parsed.content, 'hello local world');
   assert.equal(parsed.from, 'TestMachine');
   assert.equal(parsed.to, 'TestMachine');

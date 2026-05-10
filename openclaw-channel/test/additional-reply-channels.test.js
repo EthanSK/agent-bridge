@@ -22,6 +22,7 @@ const {
   pickPrimaryChannel,
   formatInboundBody,
   formatReplyPathForNotice,
+  buildInboundContextPayloadInput,
   normalizeExplicitTargets,
 } = indexTesting;
 
@@ -526,6 +527,25 @@ test("formatInboundBody: no from_target → bridge_reply_target says 'not routab
   });
   assert.match(body, /bridge_reply_target: <none/);
   assert.match(body, /additional_user_channels: none/);
+});
+
+test("buildInboundContextPayloadInput keeps scaffolded body agent-visible", () => {
+  const body = "[RELAY-SCAFFOLD-START]\nnotice\n[RELAY-SCAFFOLD-END]\n\n<channel>hi</channel>";
+  const payload = buildInboundContextPayloadInput({
+    body,
+    rawContent: "hi",
+    targetChannel: "telegram",
+    peerId: "6164541473",
+    route: { sessionKey: "agent:main:telegram:default:direct:6164541473" },
+    fromMachine: "MacBookPro",
+    accountId: "default",
+    msg: makeMsg({ timestamp: "2026-05-10T14:40:00Z" }),
+  });
+
+  assert.equal(payload.Body, body);
+  assert.equal(payload.BodyForAgent, body);
+  assert.equal(payload.RawBody, "hi");
+  assert.equal(payload.CommandBody, "hi");
 });
 
 // ── formatReplyPathForNotice ───────────────────────────────────────────────
