@@ -23,12 +23,24 @@
 #   5. (Optional, when invoked with --with-openclaw-mcp-repair) repair the
 #      OpenClaw `agent-bridge` MCP server entry to point at the dev clone's
 #      mcp-server/build/index.js.
+#   6. Post-update OC-driven CC restart (skippable via --skip-oc-restart).
+#      Asks the local running OpenClaw — if any — to drive a full Claude Code
+#      restart via its `restart-claude-yolo` skill. This is NOT typing into
+#      CC's terminal directly (which CLAUDE.md forbids in the periodic-update
+#      context); it's a bridge message asking OC to do an orderly /quit +
+#      relaunch. Necessary because /reload-plugins doesn't respawn MCP
+#      children, so a rebuild without a restart leaves the running CC session
+#      attached to its OLD agent-bridge MCP child. See
+#      scripts/post-update-oc-restart.sh.
 #
 # Deliberately does NOT:
-#   - Restart the OpenClaw gateway (interactive / heavy-handed).
+#   - Restart the OpenClaw gateway directly (interactive / heavy-handed) —
+#     OC manages its own restarts after handling the bridge ask.
 #   - Type into Claude Code's terminal (/reload-plugins). The user can
 #     restart Claude Code at their own cadence — see CLAUDE.md
-#     "/reload-plugins is NOT a hot-reload" rule.
+#     "/reload-plugins is NOT a hot-reload" rule. Step 6 above ASKS OC to do
+#     the restart cleanly via its own AppleScript orchestration; the periodic
+#     updater itself never sends synthetic keystrokes.
 #
 # Idempotent + safe to re-run. Logs to:
 #   ~/.agent-bridge/logs/periodic-update.log               (human readable)
@@ -46,11 +58,13 @@ export PATH="$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:
 # ---------- Arg parsing -----------------------------------------------------
 
 WITH_OPENCLAW_MCP_REPAIR=0
+SKIP_OC_RESTART=0
 for arg in "$@"; do
   case "$arg" in
     --with-openclaw-mcp-repair) WITH_OPENCLAW_MCP_REPAIR=1 ;;
+    --skip-oc-restart) SKIP_OC_RESTART=1 ;;
     -h|--help)
-      sed -n '2,40p' "$0"
+      sed -n '2,55p' "$0"
       exit 0
       ;;
     *)
@@ -267,7 +281,44 @@ else
   emit warn "registry.rewire_skipped" '{"reason":"agent-bridge_not_executable"}'
 fi
 
-# ---------- Step 5 (optional): OpenClaw MCP repair --------------------------
+# ---------- Step 5 (optional): OpenClaw MCP repair (moved below) ------------
+# NB: the on-disk ordering is Step 6 (OC-driven CC restart bridge) BEFORE
+# Step 5 (optional MCP repair). The repair step only fires when invoked with
+# `--with-openclaw-mcp-repair` and is harmless either way, while Step 6
+# benefits from running as close to the rebuild as possible so OC can pick up
+# the new code path on its own restart.
+
+# ---------- Step 6: Post-update OC-driven CC restart ------------------------
+#
+# Only fires when we actually rebuilt (changed=1). Probes for local OC, and if
+# present, sends a same-machine bridge message asking OC to invoke its
+# `restart-claude-yolo` skill against the local CC session. All failure modes
+# are non-fatal — the periodic update flow still completes "successfully".
+#
+# See scripts/post-update-oc-restart.sh + docs/auto-update.md for the why.
+
+if [[ "$changed" == "1" && "$SKIP_OC_RESTART" != "1" ]]; then
+  if [[ -x "$REPO/scripts/post-update-oc-restart.sh" ]]; then
+    echo "asking local OpenClaw (if running) to drive a CC restart via restart-claude-yolo skill"
+    if "$REPO/scripts/post-update-oc-restart.sh" \
+         --reason "agent-bridge periodic-update rebuild" \
+         --repo-root "$REPO"; then
+      emit info "oc.cc_restart_bridge_sent" '{}'
+    else
+      rc=$?
+      echo "WARN: post-update-oc-restart.sh exited rc=$rc (non-fatal; update still landed)"
+      emit warn "oc.cc_restart_bridge_failed" "{\"rc\":$rc}"
+    fi
+  else
+    echo "post-update-oc-restart.sh not present or not executable — skipping OC restart bridge"
+    emit info "oc.cc_restart_bridge_skipped" '{"reason":"script_missing"}'
+  fi
+elif [[ "$SKIP_OC_RESTART" == "1" ]]; then
+  echo "--skip-oc-restart — skipping OC restart bridge"
+  emit info "oc.cc_restart_bridge_skipped" '{"reason":"flag"}'
+fi
+
+# ---------- Step 5 (optional, runs after Step 6): OpenClaw MCP repair -------
 
 if [[ "$WITH_OPENCLAW_MCP_REPAIR" == "1" ]]; then
   expected_path="$REPO/mcp-server/build/index.js"

@@ -1,6 +1,6 @@
 # agent-bridge auto-update flow
 
-[AUTO-UPDATE-CHECK 2026-04-29] · [PLUGIN-REGISTRY-REWIRE 2026-05-01] · [PERIODIC-UPDATE 2026-05-04] · [AGENT-AWARE-UPDATE-NOTIFICATIONS 2026-05-04]
+[AUTO-UPDATE-CHECK 2026-04-29] · [PLUGIN-REGISTRY-REWIRE 2026-05-01] · [PERIODIC-UPDATE 2026-05-04] · [AGENT-AWARE-UPDATE-NOTIFICATIONS 2026-05-04] · [POST-UPDATE-OC-RESTART 2026-05-11]
 
 This doc describes the full auto-update sequence — from the periodic origin
 probe down to the post-build self-healing of harness-side plugin registry
@@ -56,6 +56,8 @@ Within Layer 1, auto-update has two halves:
      5. Claude plugin cache sync
      6. (Optional) OpenClaw gateway restart
      7. `/reload-plugins` automation via `self-reload-plugins` skill
+     8. **Post-update OC-driven CC restart** (4.6.0+) — see
+        [Post-update OC-driven CC restart](#post-update-oc-driven-cc-restart-step-460) below.
 
 ## Plugin-registry-rewire step (3.14.0+)
 
@@ -178,6 +180,126 @@ agent-bridge plugin-registry-rewire --verbose # log to stderr
 
 This is the same code path as the auto-update flow's Step 3.
 
+## Post-update OC-driven CC restart step (4.6.0+)
+
+[POST-UPDATE-OC-RESTART 2026-05-11]
+
+### Why this exists
+
+`/reload-plugins` reloads plugin **descriptors** (manifests, skills, hooks,
+slash commands) — but it does **not** respawn MCP child processes. Patch F's
+channel-owner lease coordination prefers continuity: if a healthy MCP child
+is already running, a newly-spawned child becomes a standby instead of
+evicting the owner. Net result: after `npm run build` of a new agent-bridge
+version, the running Claude Code session keeps using its OLD MCP child until
+CC is fully restarted.
+
+Per Ethan's CLAUDE.md:
+
+> "Restart Claude Code via OC, not via direct kill or /reload-plugins. The
+> canonical way to restart a Claude Code session for code refresh is to
+> bridge the local OpenClaw and ask it to drive the restart via its
+> `restart-claude-tel` skill (or equivalent CC-restart skill). OC has the
+> AppleScript / terminal orchestration to cleanly `/quit` + relaunch the CC
+> session."
+
+The post-update step automates that hand-off so the user doesn't have to
+ask each time.
+
+### What it does
+
+`scripts/post-update-oc-restart.sh` runs after the rebuild + rewire + cache
+sync + `/reload-plugins` automation in the Layer 1 runner
+(`scripts/update.sh` Step 8) and after the rewire in the Layer 2 periodic
+updater (`scripts/agent-bridge-periodic-update.sh` Step 6, only when an
+actual rebuild happened).
+
+1. **Probe**: GET `http://127.0.0.1:<gateway-port>/`. The gateway port is
+   read from `~/.openclaw/openclaw.json` (`gateway.port`); falls back to
+   `18789` if the config isn't present or the field is missing.
+2. **Compose**: build a `BridgeMessage` JSON with
+   `target: "openclaw/default"`, `fromTarget:
+   "agent-bridge/post-update-hook"`, and a one-way body that:
+   - Starts with `[ETHAN-AUTHED] AGENT_BRIDGE_POST_UPDATE` so the receiving
+     OC agent can recognise it as an automated post-update hook (not a
+     human-typed instruction).
+   - Names the local machine + timestamp + the reason
+     (`update.sh post-rebuild` vs `periodic-update rebuild`).
+   - Tells OC to invoke its `restart-claude-yolo` skill (legacy on-disk dir
+     name: `skills/restart-claude-tel`) against the local CC session, and
+     links the skill's canonical source for self-discovery (see "Linked
+     skill" below).
+   - Cites the CLAUDE.md rule so OC knows this isn't a `/reload-plugins`
+     suggestion.
+3. **Deliver**: atomic write to
+   `~/.agent-bridge/inbox/openclaw/default/<msg-id>.json` (no SSH hop;
+   matches the `sendLocalMessage` path in `mcp-server/src/inbox.ts`).
+4. **Log**: NDJSON events under `skill:
+   "agent-bridge-post-update-oc-restart"` in `~/.claude/logs/skills.log`
+   (`oc.not_running` / `skill.end` / `skill.error`).
+
+The script is **one-way**. It does NOT block waiting for OC's response —
+the parent update process exits right after this returns. OC picks up the
+inbox file via its `openclaw-channel` plugin watcher and drives the
+restart asynchronously.
+
+### Failure handling
+
+All failure modes are non-fatal — the parent update flow always continues:
+
+| Failure                                | Behaviour |
+| -------------------------------------- | --------- |
+| OC gateway not reachable on port       | Log `oc.not_running`, exit 0. Update succeeds. |
+| Inbox dir creation fails               | Log `skill.error reason=mkdir_failed`, exit 0. Update succeeds. |
+| BridgeMessage JSON malformed           | Log `skill.error reason=malformed_bridge_json`, exit 0. Update succeeds. |
+| Atomic-rename stage→final fails        | Log `skill.error reason=rename_failed`, exit 0. Update succeeds. |
+| Script itself missing or non-executable | Update flow prints a one-line warning and continues. |
+
+### Linked skill
+
+The receiving OC agent invokes its `restart-claude-yolo` skill. The
+canonical source for that skill lives in Ethan's OpenClaw workspace repo
+(`dot-openclaw-ethan-mbp`) at:
+
+**<https://github.com/EthanSK/dot-openclaw-ethan-mbp/tree/main/skills/restart-claude-tel>**
+
+The directory name is the legacy `restart-claude-tel` (the `_tel` suffix
+referred to the Telegram terminal); the `SKILL.md` `name:` field is the
+current `restart-claude-yolo`. The skill encodes the full recovery
+playbook — frontmost-app inspection, light-touch resume-prompt handling
+before any kill, then if a real restart is needed:
+`zsh -lic 'claude-yolo --resume'` to relaunch into the existing session.
+
+We deliberately **link** rather than inline the skill body so any update to
+the skill on the OC side stays the source of truth without doc drift.
+
+### Operator levers
+
+`scripts/post-update-oc-restart.sh` flags:
+
+| Flag                 | Effect |
+| -------------------- | ------ |
+| `--persona <id>`     | Override the OC target persona (default `openclaw/default`). |
+| `--reason <string>`  | Override the human-readable reason embedded in the bridge body. |
+| `--repo-root <path>` | Override the resolved agent-bridge repo root (diagnostic only — body is repo-independent). |
+| `--from-machine <name>` | Override the `from`/`to` machine name on the BridgeMessage. |
+
+Both runners accept `--skip-oc-restart` to suppress the step entirely:
+
+```bash
+scripts/update.sh --skip-oc-restart
+scripts/agent-bridge-periodic-update.sh --skip-oc-restart
+```
+
+### What if OC isn't installed?
+
+Treated as normal. The probe finds no listener on the gateway port and the
+script exits 0 with an `oc.not_running` log line. No bridge message is
+written. CC is restartable manually by the user the next time they touch
+the session; the rule "`/reload-plugins` is NOT a hot-reload" still
+applies. We don't fall back to typing into CC's terminal directly because
+the periodic updater explicitly forbids that.
+
 ## Periodic update LaunchAgent / Scheduled Task
 
 [PERIODIC-UPDATE 2026-05-04]
@@ -216,13 +338,25 @@ under a per-checkout lock. Each invocation:
    `mcp-server/build/index.js`. Preserves MBP's pre-2026-05-04 behaviour
    where one OS-level job both updates the bridge and keeps OC's MCP wiring
    fresh.
+6. **(Skippable via `--skip-oc-restart`)** post-update OC-driven CC restart
+   — only when an actual rebuild happened. Asks the local OpenClaw (if any)
+   to drive a clean CC `/quit` + relaunch via its `restart-claude-yolo`
+   skill. See the
+   [Post-update OC-driven CC restart](#post-update-oc-driven-cc-restart-step-460)
+   section above for the why + failure handling. This is distinct from
+   "typing into CC's terminal directly", which the periodic updater still
+   refuses to do.
 
-The body deliberately does NOT restart the OpenClaw gateway and does NOT
-type `/reload-plugins` into the user's Claude Code terminal. Both are
-interactive / runtime actions outside the scope of a 10-min background job.
+The body deliberately does NOT restart the OpenClaw gateway directly and
+does NOT type `/reload-plugins` into the user's Claude Code terminal — both
+are interactive / runtime actions outside the scope of a 10-min background
+job. Step 6 above asks OC to drive the CC restart cleanly via its own
+AppleScript orchestration; the periodic updater itself never sends
+synthetic keystrokes.
+
 Ethan's CLAUDE.md `/reload-plugins is NOT a hot-reload` rule still applies:
-to actually load a new mcp-server build, fully restart Claude Code at the
-user's own cadence.
+when OC isn't running and Step 6 is a no-op, the user must fully restart
+Claude Code at their own cadence to load a new mcp-server build.
 
 ### Files
 
@@ -300,12 +434,13 @@ Unregister-ScheduledTask -TaskName 'AgentBridge Self-Update' -Confirm:$false
 
 `scripts/update.sh` flags:
 
-| Flag             | Effect |
-| ---------------- | ------ |
-| `--auto`         | SessionStart-safe mode — implies `--yes --skip-openclaw`, silent unless real changes. |
-| `--yes`          | Answer yes to all interactive prompts. |
-| `--skip-openclaw`| Skip the OpenClaw gateway restart. |
-| `--skip-reload`  | Skip the `/reload-plugins` automation. |
+| Flag                | Effect |
+| ------------------- | ------ |
+| `--auto`            | SessionStart-safe mode — implies `--yes --skip-openclaw`, silent unless real changes. |
+| `--yes`             | Answer yes to all interactive prompts. |
+| `--skip-openclaw`   | Skip the OpenClaw gateway restart (Step 6). |
+| `--skip-reload`     | Skip the `/reload-plugins` automation (Step 7). |
+| `--skip-oc-restart` | Skip the post-update OC-driven CC restart bridge (Step 8). |
 
 ### Coord lock
 

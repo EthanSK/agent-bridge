@@ -15,20 +15,26 @@
 #   7. (macOS / Linux / Windows-via-Git-Bash) trigger /reload-plugins in the
 #      running Claude Code terminal if ~/.claude/skills/self-reload-plugins is
 #      present
+#   8. Ask local OpenClaw (if running) to drive a full Claude Code restart via
+#      its `restart-claude-yolo` skill — /reload-plugins doesn't respawn MCP
+#      children, so this is the only way the rebuilt agent-bridge actually
+#      lands in the running CC session. See scripts/post-update-oc-restart.sh.
 #
 # 3.7.0+: the dedicated claude-code-channel package was deleted and merged
 # back into mcp-server/. There's nothing else to build for Claude Code.
 #
 # Usage:
 #   scripts/update.sh [--yes] [--auto] [--skip-openclaw] [--skip-reload]
+#                     [--skip-oc-restart]
 #
 # Options:
-#   -y, --yes         answer yes to interactive prompts
-#   --auto           SessionStart-safe mode: implies --yes --skip-openclaw,
-#                    stays silent when no commits are pulled and no rebuild is
-#                    needed, and only prints on real changes or errors
-#   --skip-openclaw  skip the OpenClaw gateway restart step
-#   --skip-reload    skip Claude Code /reload-plugins automation
+#   -y, --yes            answer yes to interactive prompts
+#   --auto              SessionStart-safe mode: implies --yes --skip-openclaw,
+#                       stays silent when no commits are pulled and no rebuild
+#                       is needed, and only prints on real changes or errors
+#   --skip-openclaw     skip the OpenClaw gateway restart step
+#   --skip-reload       skip Claude Code /reload-plugins automation
+#   --skip-oc-restart   skip the post-update OC-driven CC restart bridge
 #
 # Cache cleanup:
 #   After a successful pull + rebuild, older inactive Claude Code plugin cache
@@ -53,9 +59,10 @@ ASSUME_YES=0
 AUTO=0
 SKIP_OPENCLAW=0
 SKIP_RELOAD=0
+SKIP_OC_RESTART=0
 
 usage() {
-  sed -n '2,36p' "$0"
+  sed -n '2,40p' "$0"
 }
 
 for arg in "$@"; do
@@ -68,13 +75,14 @@ for arg in "$@"; do
       ;;
     --skip-openclaw) SKIP_OPENCLAW=1 ;;
     --skip-reload) SKIP_RELOAD=1 ;;
+    --skip-oc-restart) SKIP_OC_RESTART=1 ;;
     -h|--help)
       usage
       exit 0
       ;;
     *)
       echo "unknown arg: $arg" >&2
-      echo "usage: $0 [--yes] [--auto] [--skip-openclaw] [--skip-reload]" >&2
+      echo "usage: $0 [--yes] [--auto] [--skip-openclaw] [--skip-reload] [--skip-oc-restart]" >&2
       exit 2
       ;;
   esac
@@ -293,7 +301,7 @@ fi
 # ---------- 1. Git pull -----------------------------------------------------
 
 hr
-say "==> Step 1/7: git fetch + pull"
+say "==> Step 1/8: git fetch + pull"
 
 # Capture HEAD before + after so later steps can early-exit if nothing changed.
 HEAD_BEFORE="$(git rev-parse HEAD)"
@@ -347,7 +355,7 @@ fi
 # ---------- 2. MCP server rebuild -------------------------------------------
 
 hr
-say "==> Step 2/7: rebuild mcp-server (tools-only)"
+say "==> Step 2/8: rebuild mcp-server (tools-only)"
 
 if [[ ! -d "mcp-server" ]]; then
   say "no mcp-server/ dir — skipping (this repo layout is unexpected)"
@@ -380,7 +388,7 @@ fi
 # update still landed; the registry mismatch is a follow-up issue.
 
 hr
-say "==> Step 3/7: plugin registry rewire"
+say "==> Step 3/8: plugin registry rewire"
 
 if [[ -f "$REPO_ROOT/scripts/plugin-registry-rewire.mjs" ]] && command -v node >/dev/null 2>&1; then
   rewire_out_file="$(mktemp)"
@@ -401,13 +409,13 @@ fi
 # ---------- 4. Stale Claude plugin cache archive ----------------------------
 
 hr
-say "==> Step 4/7: stale Claude plugin cache archive"
+say "==> Step 4/8: stale Claude plugin cache archive"
 archive_stale_plugin_caches
 
 # ---------- 5. Claude plugin cache sync -------------------------------------
 
 hr
-say "==> Step 5/7: Claude plugin cache sync"
+say "==> Step 5/8: Claude plugin cache sync"
 
 # 3.7.0+: clean up any old claude-code-channel install if it's still around.
 if [[ -d "claude-code-channel" ]]; then
@@ -474,7 +482,7 @@ fi
 # ---------- 6. OpenClaw gateway restart -------------------------------------
 
 hr
-say "==> Step 6/7: OpenClaw gateway restart"
+say "==> Step 6/8: OpenClaw gateway restart"
 
 if (( SKIP_OPENCLAW )); then
   say "--skip-openclaw — skipping."
@@ -501,7 +509,7 @@ fi
 # ---------- 7. /reload-plugins via self-reload-plugins skill ----------------
 
 hr
-say "==> Step 7/7: Claude Code /reload-plugins"
+say "==> Step 7/8: Claude Code /reload-plugins"
 
 case "$(uname -s)" in
   Darwin|Linux|MINGW*|MSYS*|CYGWIN*) ;;
@@ -523,6 +531,36 @@ else
   else
     say "    declined — run /reload-plugins manually so MCP tools reconnect to the new build."
   fi
+fi
+
+# ---------- 8. Post-update OC-driven CC restart -----------------------------
+#
+# `/reload-plugins` (Step 7) refreshes manifests + skills but does NOT respawn
+# MCP child processes — so the rebuilt agent-bridge code stays unloaded in the
+# running CC session until CC is fully restarted. The canonical fix per Ethan's
+# CLAUDE.md is to bridge the local OpenClaw and ask it to drive the restart
+# via its `restart-claude-yolo` skill (legacy dir: skills/restart-claude-tel),
+# which has the AppleScript / terminal orchestration to cleanly `/quit` +
+# relaunch the CC session.
+#
+# Failure here MUST NOT abort the update flow — the original rebuild still
+# landed and the user can manually restart CC if the bridge send fails.
+
+hr
+say "==> Step 8/8: post-update OC-driven CC restart"
+
+if (( SKIP_OC_RESTART )); then
+  say "--skip-oc-restart — skipping."
+elif (( NOTHING_CHANGED )); then
+  say "no new commits and no rebuild — skipping OC restart bridge."
+elif [[ -x "$REPO_ROOT/scripts/post-update-oc-restart.sh" ]]; then
+  if ! bash "$REPO_ROOT/scripts/post-update-oc-restart.sh" \
+        --reason "agent-bridge update.sh post-rebuild" \
+        --repo-root "$REPO_ROOT"; then
+    say "    post-update-oc-restart.sh exited non-zero (non-fatal). The update still landed; restart Claude Code manually to load the new MCP child."
+  fi
+else
+  say "    post-update-oc-restart.sh not present or not executable — skipping."
 fi
 
 hr

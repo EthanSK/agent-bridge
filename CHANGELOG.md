@@ -1,5 +1,17 @@
 # Changelog
 
+## agent-bridge 4.6.0 / openclaw-channel 4.6.0 — 2026-05-11
+
+After every auto-update / rebuild, the running Claude Code session is still attached to its OLD agent-bridge MCP child until CC is fully restarted (`/reload-plugins` reloads descriptors but does not respawn MCP children — Patch F's channel-owner lease prefers continuity). Per Ethan's CLAUDE.md, the canonical fix is to bridge the local OpenClaw and ask it to drive a clean CC restart via its `restart-claude-yolo` skill. This release automates that hand-off so the user doesn't have to ask each time.
+
+- **`scripts/post-update-oc-restart.sh`** — new helper. Probes for local OpenClaw via the gateway port (read from `~/.openclaw/openclaw.json` → `gateway.port`, default `18789`). When OC is reachable, atomically writes a same-machine `BridgeMessage` JSON to `~/.agent-bridge/inbox/openclaw/default/<msg-id>.json` (no SSH hop) with `target: "openclaw/default"`, `fromTarget: "agent-bridge/post-update-hook"`, and a one-way body prefixed `[ETHAN-AUTHED] AGENT_BRIDGE_POST_UPDATE` that asks OC to invoke its `restart-claude-yolo` skill. When OC isn't running, the script logs `oc.not_running` to `~/.claude/logs/skills.log` and exits cleanly. All failure modes are non-fatal — the parent update flow always continues.
+- **Wired into both update paths.**
+  - `scripts/update.sh` Step 8/8 (skippable via `--skip-oc-restart`) — fires after the rebuild, registry rewire, plugin cache sync, OC gateway restart, and `/reload-plugins` automation.
+  - `scripts/agent-bridge-periodic-update.sh` Step 6 (skippable via `--skip-oc-restart`) — fires only when an actual rebuild happened (`changed=1`). Distinct from the periodic updater's existing "don't type into CC's terminal" rule: this asks OC to do the restart cleanly via its own AppleScript orchestration; the periodic updater itself still never sends synthetic keystrokes.
+- **Docs.** `docs/auto-update.md` gains a new "Post-update OC-driven CC restart" section that explains the rationale, lists the failure modes, documents the operator levers, and links the receiving skill at <https://github.com/EthanSK/dot-openclaw-ethan-mbp/tree/main/skills/restart-claude-tel> (linked, not inlined, so skill updates stay the source of truth).
+- **Local validation.** Manual probe-and-deliver run against a throwaway persona confirmed: (a) the OC HTTP probe succeeds on `127.0.0.1:18789`, (b) the JSON payload validates against `BridgeMessage` (all required fields present, lowercase msg-id per `feedback_bridge_msg_id_lowercase.md`), (c) atomic stage→rename lands the file in the right inbox subdir, (d) the unreachable-port path correctly fails the probe and would log `oc.not_running`, (e) the macOS `date` `%3N` quirk was caught and fixed (timestamps now via `node -e new Date().toISOString()` with a GNU-`date` fallback). Test files were cleaned up; no real restart-claude-yolo run was triggered during the test.
+- **Version bumps.** CLI / MCP server / OpenClaw channel adapter all moved to `4.6.0`. No breaking changes to the `BridgeMessage` wire format or any existing exports.
+
 ## agent-bridge 4.5.0 / openclaw-channel 4.5.0 — 2026-05-10
 
 Ethan asked for relay notices to stop showing one ambiguous Agent Bridge version and instead show both the source-side and destination-side runtime identity, including the source/destination target labels.
