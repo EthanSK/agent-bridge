@@ -1,5 +1,15 @@
 # Changelog
 
+## agent-bridge 4.4.0 — 2026-05-10
+
+Real bug observed earlier today: an OpenClaw/Codex agent subprocess on the MBP ran with `HOME=/Users/ethansarif-kattan/.openclaw/agents/main/agent/codex-home/home` (a sandboxed home, not the real user home). `agent-bridge list` and `agent-bridge status` from that subprocess silently reported "No paired machines" because the CLI reads its config at `$HOME/.agent-bridge/config` — and the sandbox home has no such file. The real config lives under the user's actual home. This release auto-detects that pattern and falls back transparently.
+
+- **Sandboxed-HOME auto-detect in the bash CLI.** Before computing `CONFIG_DIR`, `agent-bridge` now asks: does `$HOME/.agent-bridge/config` exist? If not, look up the OS-level user home via `getent passwd $(id -u)` (Linux) → `dscl . -read /Users/$USER NFSHomeDirectory` (macOS) → `eval echo "~$USER"` (POSIX fallback). If that real home differs from `$HOME` AND has its own `.agent-bridge/config`, the CLI repoints `HOME` to the real home for the rest of the run. All subsequent path resolution (`$HOME/.agent-bridge/{config,keys,inbox,logs}`) lands on the user's actual config — no more silent "no pairings" lies from sandboxed subprocesses.
+- **Explicit `AGENT_BRIDGE_HOME` override.** Callers that want to pin the bridge state dir explicitly can set `AGENT_BRIDGE_HOME=<dir>` and the CLI will use it, skipping auto-detection. Existing JS/chime code treats this as the bridge state dir itself (`~/.agent-bridge`), so the CLI now honors that form; a parent home dir is also accepted and normalized to `<dir>/.agent-bridge` for convenience.
+- **Conservative fallback.** The auto-detect ONLY fires when (1) `$HOME/.agent-bridge/config` does not exist AND (2) the resolved real home does. Users who legitimately set `$HOME` elsewhere see no change. Set `AGENT_BRIDGE_VERBOSE=1` to print a one-liner notice when fallback engages.
+- **Test coverage.** New `test/cli-sandboxed-home.sh` covers five cases: sandboxed HOME → falls back to real home; explicit `AGENT_BRIDGE_HOME` state-dir override; explicit `AGENT_BRIDGE_HOME` parent-home override; normal HOME path untouched; no config anywhere → no crash. Existing `cli-status-stdin.sh` and `cli-local-status.sh` continue to pass unchanged.
+- **Version bumps.** CLI and MCP package metadata moved to `4.4.0`. The runtime behavior fix is in the bash CLI surface that broke; `openclaw-channel` is unchanged.
+
 ## agent-bridge 4.3.0 / openclaw-channel 3.3.0 — 2026-05-09
 
 Ethan flagged that 4.2.0's Summary blockquote was wired into Claude Code's relay pushes but NOT into OpenClaw's auto-emitted Telegram relays — OC was still firing a gateway-direct `[Agent Bridge relay] 🛰️` notice via `formatRelayNotice` BEFORE the agent turn ran, with no Summary because there was no LLM in the loop. This release pulls OC onto the same agent-fill pattern Claude Code already uses, so both harnesses produce identical, Summary-bearing relays from a single source of judgment.

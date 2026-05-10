@@ -1751,6 +1751,18 @@ The MCP server includes production-grade inbox management:
 | `BRIDGE_PRUNE_MAX_AGE_MS` | `86400000` | Max message age in milliseconds (24h) |
 | `BRIDGE_PRUNE_MAX_INBOX` | `100` | Max inbox message count |
 | `BRIDGE_PRUNE_INTERVAL_MS` | `300000` | Prune interval in milliseconds (5 min) |
+| `AGENT_BRIDGE_HOME` | _(unset)_ | Override the bridge state directory the bash CLI uses for config, keys, inbox, and logs. Existing JS/chime code treats this as the `.agent-bridge` directory itself, e.g. `~/.agent-bridge`; the CLI also accepts a parent home dir and normalizes it to `<dir>/.agent-bridge`. Useful for sandboxed subprocesses, CI, or harnesses running with `$HOME` pointing somewhere other than the real user home. When unset, the CLI uses `$HOME/.agent-bridge` if it has a config, else falls back to the OS-level user home from `getpwuid`. See "Sandboxed HOME" below. |
+| `AGENT_BRIDGE_VERBOSE` | `0` | Set to `1` to print a one-line notice when the CLI auto-detects a sandboxed `$HOME` and falls back to the real user home. |
+
+#### Sandboxed HOME (CLI auto-detect, 4.4.0+)
+
+Some agent harnesses (OpenClaw / Codex agent subprocesses, Docker containers, restricted launchers) run the `agent-bridge` bash CLI with `$HOME` pointing at a sandbox directory rather than the real user home. Without a fix, `agent-bridge list` and `agent-bridge status` would silently report "No paired machines" — the CLI dutifully reads `$HOME/.agent-bridge/config` from a path that doesn't exist.
+
+**4.4.0+ behaviour:** before computing the config path, the CLI checks whether `$HOME/.agent-bridge/config` exists. If not, it looks up the OS-level user home via `getent passwd $(id -u)` (Linux), `dscl . -read /Users/$USER NFSHomeDirectory` (macOS), or `eval echo "~$USER"` (POSIX fallback). If that real home differs from `$HOME` AND has its own `.agent-bridge/config`, the CLI repoints `HOME` to the real home for the rest of the run. All subsequent path resolution lands on the user's actual config.
+
+**Override knobs:** set `AGENT_BRIDGE_HOME=<state-dir>` for an explicit override that skips auto-detection. The preferred form is the bridge state dir itself, such as `~/.agent-bridge`; a parent home dir is also accepted for CLI convenience. Set `AGENT_BRIDGE_VERBOSE=1` to surface a one-line notice on stderr whenever fallback engages.
+
+The fallback is conservative: it only fires when (1) `$HOME/.agent-bridge/config` does NOT exist AND (2) the resolved real home DOES have one. Users who legitimately point `$HOME` at a different state dir see no change.
 
 ---
 

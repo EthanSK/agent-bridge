@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.3.0"
+VERSION="4.4.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -25,8 +25,103 @@ if [ "$INVOKED_AS" = "claude-bridge" ]; then
   printf '\033[0;33m  [deprecated] "claude-bridge" has been renamed to "agent-bridge". Please update your scripts.\033[0m\n' >&2
 fi
 
+# -- Sandboxed-HOME auto-detect (4.4.0) --------------------------------------
+# Some agent harnesses (OpenClaw / Codex sandboxes, Docker containers, restricted
+# subprocesses) run the agent-bridge CLI with `$HOME` pointing at a sandbox dir
+# rather than the real user's home. The real `~/.agent-bridge/config` then lives
+# under the user's actual home, but the CLI silently reports "No paired
+# machines" because it dutifully reads `$HOME/.agent-bridge/config` from the
+# sandbox path that doesn't exist.
+#
+# Resolution order:
+#   1. Explicit override via `AGENT_BRIDGE_HOME` env var — caller knows best.
+#      Existing JS/chime code treats this as the bridge state dir itself
+#      (`~/.agent-bridge`). For CLI convenience, a parent home dir is also
+#      accepted and normalized to `<dir>/.agent-bridge`.
+#   2. `$HOME` if `$HOME/.agent-bridge/config` exists — normal case, no change.
+#   3. The OS-level user home from `getpwuid(getuid())` (via `getent passwd`,
+#      `dscl`, or `eval echo ~$USER`) IF that home differs from `$HOME`
+#      AND `<that home>/.agent-bridge/config` exists. This catches the
+#      sandboxed-HOME case automatically.
+#   4. Fall back to `$HOME` (no config exists anywhere — fresh install path).
+#
+# We never silently override `$HOME` for users who legitimately set it: the
+# fallback only kicks in when the current `$HOME` has no agent-bridge config
+# AND the real user home does. That keeps "what the user asked for" intact
+# while fixing the sandbox-subprocess footgun.
+_real_user_home() {
+  # Prefer getent (Linux), then dscl (macOS), then eval ~$USER as last resort.
+  local uid home
+  uid="$(id -u 2>/dev/null || true)"
+  if command -v getent >/dev/null 2>&1 && [ -n "$uid" ]; then
+    home="$(getent passwd "$uid" 2>/dev/null | cut -d: -f6)"
+    if [ -n "$home" ]; then
+      printf '%s' "$home"
+      return 0
+    fi
+  fi
+  if [ -n "${USER:-}" ] && command -v dscl >/dev/null 2>&1; then
+    home="$(dscl . -read "/Users/$USER" NFSHomeDirectory 2>/dev/null | awk '/^NFSHomeDirectory:/ {print $2}')"
+    if [ -n "$home" ]; then
+      printf '%s' "$home"
+      return 0
+    fi
+  fi
+  if [ -n "${USER:-}" ]; then
+    home="$(eval echo "~$USER" 2>/dev/null || true)"
+    case "$home" in
+      ~*) ;; # eval failed, leave empty
+      *) [ -n "$home" ] && printf '%s' "$home" && return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+_ab_expand_user_path() {
+  local path="$1"
+  case "$path" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${path#~/}" ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
+_ab_normalize_bridge_home_override() {
+  local raw="$1" expanded
+  expanded="$(_ab_expand_user_path "$raw")"
+  # Preferred existing meaning: AGENT_BRIDGE_HOME is the state dir containing
+  # config/keys/inbox/logs. Accept parent home dirs too so callers can pass the
+  # same path they would otherwise assign to HOME.
+  if [ -f "$expanded/config" ] || [ -d "$expanded/keys" ] || [ "$(basename "$expanded")" = ".agent-bridge" ]; then
+    printf '%s' "$expanded"
+  else
+    printf '%s/.agent-bridge' "$expanded"
+  fi
+}
+
+AGENT_BRIDGE_CONFIG_DIR_OVERRIDE=""
+if [ -n "${AGENT_BRIDGE_HOME:-}" ]; then
+  # Explicit state-dir override wins. Trust it.
+  AGENT_BRIDGE_CONFIG_DIR_OVERRIDE="$(_ab_normalize_bridge_home_override "$AGENT_BRIDGE_HOME")"
+elif [ ! -f "$HOME/.agent-bridge/config" ]; then
+  _ab_real_home="$(_real_user_home 2>/dev/null || true)"
+  if [ -n "$_ab_real_home" ] && [ "$_ab_real_home" != "$HOME" ] \
+     && [ -f "$_ab_real_home/.agent-bridge/config" ]; then
+    # Sandboxed HOME detected. Repoint to the real user home so config,
+    # keys, inbox, and logs all resolve to the same place the daemon /
+    # MCP server use.
+    if [ "${AGENT_BRIDGE_VERBOSE:-0}" = "1" ]; then
+      printf '%s\n' "  [agent-bridge] Sandboxed HOME detected ($HOME has no .agent-bridge/config)." >&2
+      printf '%s\n' "  [agent-bridge] Falling back to real user home: $_ab_real_home" >&2
+      printf '%s\n' "  [agent-bridge] Set AGENT_BRIDGE_HOME=<dir> to override, or AGENT_BRIDGE_VERBOSE=0 to silence this notice." >&2
+    fi
+    HOME="$_ab_real_home"
+  fi
+  unset _ab_real_home
+fi
+
 # -- Paths --------------------------------------------------------------------
-CONFIG_DIR="$HOME/.agent-bridge"
+CONFIG_DIR="${AGENT_BRIDGE_CONFIG_DIR_OVERRIDE:-$HOME/.agent-bridge}"
 CONFIG_FILE="$CONFIG_DIR/config"
 KEYS_DIR="$CONFIG_DIR/keys"
 PATH_CACHE_FILE="$CONFIG_DIR/path-cache.json"
@@ -63,7 +158,7 @@ dim()  { printf "${DIM}  %s${RESET}\n" "$1"; }
 # Fields always set: ts, component="cli", machine, event, level, msg.
 # If context is provided it MUST be a valid JSON object or the line is still
 # written without a context field (best-effort).
-AGENT_BRIDGE_LOG_FILE="$HOME/.agent-bridge/logs/agent-bridge.log"
+AGENT_BRIDGE_LOG_FILE="$CONFIG_DIR/logs/agent-bridge.log"
 AGENT_BRIDGE_LOG_MAX_SIZE=$((50 * 1024 * 1024)) # 50 MB
 
 _log_rotate_if_needed() {
@@ -78,7 +173,7 @@ _log_rotate_if_needed() {
 
 log_event() {
   local level="${1:-info}" event="${2:-cli.unknown}" msg="${3:-}" ctx="${4:-}"
-  local logs_dir="$HOME/.agent-bridge/logs"
+  local logs_dir="$CONFIG_DIR/logs"
   mkdir -p "$logs_dir" 2>/dev/null || return 0
   chmod 700 "$logs_dir" 2>/dev/null || true
   _log_rotate_if_needed
@@ -2101,7 +2196,7 @@ cmd_mcp_incident_report() {
   done
   case "$window_mins" in ''|*[!0-9]*) die "--window-mins must be a positive integer" ;; esac
 
-  local log_file="$HOME/.agent-bridge/logs/agent-bridge.log"
+  local log_file="$CONFIG_DIR/logs/agent-bridge.log"
   [ -f "$log_file" ] || die "log file not found: $log_file (no events to report)"
 
   command -v node >/dev/null 2>&1 || die "node is required for 'agent-bridge mcp-incident-report'"
