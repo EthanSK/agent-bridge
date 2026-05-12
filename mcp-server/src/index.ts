@@ -98,6 +98,7 @@ import { startWatcher, stopWatcher, replayUndeliveredMessages, registerAliveSign
 import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 import { formatRelayScaffold } from './relay-notice.js';
+import { storeRelayExpandMessage } from './relay-expand-store.js';
 
 // 3.7.1 — version is sourced from config.ts (single source of truth shared
 // with watcher.ts so lease files carry our build version for Patch F's
@@ -1036,6 +1037,47 @@ async function main(): Promise<void> {
         // This replaces the previous "agent hand-composes the entire relay
         // from prose guidance" pattern, which drifted from OC's programmatic
         // shape over time. Canonical user-facing format: docs/relay-to-user.md.
+        //
+        // [RELAY-EXPAND-STORE-CC 2026-05-12 — agent-bridge 4.7.1]
+        // Populate the shared relay-expand store under
+        // `~/.agent-bridge/relay-expand/` so `agent-bridge relay-expand <id>`
+        // can resolve the full inbound BridgeMessage later, then thread the
+        // allocated `expandId` into the scaffold so the relay receipt
+        // includes `expand id: NN` + `expand: agent-bridge relay-expand NN`
+        // lines, byte-identical to OC's emit shape (parity with OpenClaw's
+        // `prepareBridgeRelayContext` in openclaw-channel/src/index.js).
+        // Failures here are non-fatal: we still emit the scaffold without
+        // the expand-id lines so the relay leg keeps working.
+        const replyPathDisplay = message.fromTarget ? 'agent-bridge' : '';
+        let expandId: string | null = null;
+        try {
+          const record = storeRelayExpandMessage(
+            {
+              id: message.id,
+              from: message.from,
+              to: message.to,
+              fromTarget: message.fromTarget,
+              target: message.target,
+              sourceAgentBridgeVersion: message.sourceAgentBridgeVersion,
+              type: message.type,
+              content: message.content,
+              timestamp: message.timestamp,
+              replyTo: message.replyTo,
+              ttl: message.ttl,
+            },
+            {
+              replyVia: replyPathDisplay,
+              sourceAgentBridgeVersion: message.sourceAgentBridgeVersion,
+              destinationAgentBridgeVersion: VERSION,
+              agentBridgeVersion: VERSION,
+            },
+          );
+          expandId = record?.expandId ?? null;
+        } catch (err) {
+          logWarn(
+            `relay-expand store failed for ${message.id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
         const relayScaffold = formatRelayScaffold(
           {
             id: message.id,
@@ -1049,6 +1091,7 @@ async function main(): Promise<void> {
           {
             replyVia: message.fromTarget ? 'agent-bridge' : undefined,
             destinationAgentBridgeVersion: VERSION,
+            ...(expandId ? { expandId } : {}),
           },
         );
         const contentWithScaffold = `${relayScaffold}\n\n${message.content}`;
@@ -1088,6 +1131,12 @@ async function main(): Promise<void> {
               // primary delivery path so the agent sees it inline with the
               // bridge body.
               relay_scaffold: relayScaffold,
+              // [RELAY-EXPAND-ID-IN-META 2026-05-12 — agent-bridge 4.7.1]
+              // Surface the allocated expand id (when the store-write
+              // succeeded) so tooling/agents can pre-emptively run
+              // `agent-bridge relay-expand <id>` without scraping the
+              // scaffold body. Mirrors how `expand id:` appears inline.
+              ...(expandId ? { expand_id: expandId } : {}),
             },
           },
         }).catch((err) => {

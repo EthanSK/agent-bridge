@@ -19,8 +19,8 @@ destination: <to-machine>/<target> (agent-bridge v<A.B.C>|unknown)
 received: <from-machine>[/<from-target>] → <to-machine>/<target>
 reply path: <comma-joined channels>
 message id: <msg-id>
-expand id: <NN>           # OC-only, has relay-expand store
-expand: agent-bridge relay-expand <NN>   # OC-only
+expand id: <NN>           # populated by every harness with a relay-expand store (OC + CC since 4.7.1)
+expand: agent-bridge relay-expand <NN>
 
 <1-3 sentence summary of the actionable ask>
 <one line of action — "Replied via bridge with X" / "No reply needed, FYI" / "Holding for user input">
@@ -94,7 +94,7 @@ If the message is purely informational and needs no bridge reply, skip step 2 an
   - **Claude Code** — `source_agent_bridge_version` and `destination_agent_bridge_version` attributes on the inbound `<channel>` meta; fall back to legacy `agent_bridge_version` as the destination/local version or call `claude_code_channel_status`.
   - **OpenClaw** — `source_agent_bridge_version` and `destination_agent_bridge_version` lines inside `[BRIDGE-CONTEXT]`; legacy `agent_bridge_version` remains a destination/local alias.
   Older peers may not send a source version; write `agent-bridge unknown` for that side rather than guessing. Do NOT hardcode versions — stale literals would hide exactly the fleet drift the relay is meant to expose.
-- **OpenClaw automatic relay notices use expand ids.** v3.1+ OpenClaw channel receipts show `expand id: NN` and `expand: agent-bridge relay-expand NN` instead of a `message:` preview. The full inbound BridgeMessage is stored locally under `~/.agent-bridge/relay-expand/` with a bounded/TTL-pruned rolling id map.
+- **Relay notices use expand ids on every harness with a relay-expand store.** OpenClaw (v3.1+) and Claude Code (agent-bridge 4.7.1+) channel receipts show `expand id: NN` and `expand: agent-bridge relay-expand NN` instead of a `message:` preview. The full inbound BridgeMessage is stored locally under `~/.agent-bridge/relay-expand/` with a bounded/TTL-pruned rolling id map (shared formatter at `lib/relay-expand-store.js`).
 - **When the user says “expand Agent Bridge relay message NN”**, run `agent-bridge relay-expand NN` on the same machine that produced the relay notice, then send the retrieved full content through the current user-facing channel, applying only normal privacy/channel-safety rules. Use `--json` only when you need machine-readable metadata.
 
 ## Where this rule lives across agent-bridge surfaces
