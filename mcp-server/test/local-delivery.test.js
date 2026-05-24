@@ -88,7 +88,7 @@ test('sendLocalMessage with legacy claude-code target lands at flat inbox/claude
   assert.equal(parsed.id, msg.id);
   assert.equal(parsed.target, 'claude-code', 'legacy `claude-code` target preserved on the wire');
   assert.equal(parsed.fromTarget, 'claude-code', 'legacy fromTarget preserved on the wire');
-  assert.equal(parsed.sourceAgentBridgeVersion, '4.5.2', 'sender-side Agent Bridge version stamped on the wire');
+  assert.equal(parsed.sourceAgentBridgeVersion, config.MCP_SERVER_VERSION, 'sender-side Agent Bridge version stamped on the wire');
   assert.equal(parsed.content, 'hello local world');
   assert.equal(parsed.from, 'TestMachine');
   assert.equal(parsed.to, 'TestMachine');
@@ -129,7 +129,7 @@ test('sendLocalMessage preserves source-authored relaySummary on the wire', () =
   const raw = readFileSync(expectedPath, 'utf8');
   const parsed = JSON.parse(raw);
 
-  assert.equal(parsed.sourceAgentBridgeVersion, '4.5.2', 'default sender version still stamped');
+  assert.equal(parsed.sourceAgentBridgeVersion, config.MCP_SERVER_VERSION, 'default sender version still stamped');
   assert.equal(parsed.relaySummary, 'Source wants OpenClaw to code-post this receipt.');
 });
 

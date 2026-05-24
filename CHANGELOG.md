@@ -1,5 +1,14 @@
 # Changelog
 
+## agent-bridge 4.7.2 / openclaw-channel 4.7.2 — 2026-05-24
+
+Ethan caught a routing-diagnostic blind spot: `bridge_receive_messages` was behaving correctly for its original job, but that job was scoped to the active Claude Code persona inbox. In tools-only contexts it could not inspect OpenClaw target inboxes, so an agent could misread an OpenClaw reply-path issue as "Agent Bridge is not replying" when the transport and OpenClaw watcher were using a different target path.
+
+- **Target-specific diagnostic peeks.** `bridge_receive_messages` now accepts `target`, `include_pending_ack`, `include_archived`, `reply_to`, and `limit` for non-destructive inspection of arbitrary target subdirs such as `openclaw/default` or `openclaw/clawdiboi2`. These peeks never consume, archive, quarantine, or otherwise mutate another harness's inbox files.
+- **Safe boundary preserved.** The default no-target receive path is unchanged: it still reads/long-polls the active Claude Code persona inbox and only consumes when `peek` is false. Target-specific long-poll is rejected because the watcher hook is persona-scoped.
+- **Regression coverage.** New tests cover OpenClaw pending/pending-ack/archive inspection, reply filtering, per-section newest limits, parse-error reporting without mutation, and legacy `claude-code` target compatibility under `claude-code/default`.
+- **Version bumps.** CLI / MCP server / Claude plugin metadata / OpenClaw channel adapter all moved to `4.7.2`. No BridgeMessage wire-format break.
+
 ## agent-bridge 4.7.0 / openclaw-channel 4.7.0 — 2026-05-12
 
 Real bug: the Windows periodic-update Scheduled Task kept the dev clone at `%USERPROFILE%\.openclaw\workspace\agent-bridge` (or `%USERPROFILE%\Projects\agent-bridge`) current, but never refreshed the packaged CLI shim copied into `%LOCALAPPDATA%\agent-bridge\bin\` by `install.ps1`. That layout difference is Windows-specific — macOS's `install.sh` symlinks `/usr/local/bin/agent-bridge` straight at the dev clone, so a `git pull` already updates the CLI in place. On Windows, `.cmd` shims don't have symlink semantics, so `install.ps1` COPIES the two CLI files — and from then on they drift forever. SHITTYWINDOWS stayed at 4.5.0 for days while Mini + MBP advanced to 4.6.0; users had to download both files manually from `raw.githubusercontent.com` to recover.

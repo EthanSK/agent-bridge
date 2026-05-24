@@ -44,6 +44,7 @@ import {
   claudeCodeTargetForPersona,
   inboxSubdir,
   archiveSubdir,
+  pendingAckSubdir,
   failedSubdir,
   leaseFileNameForTarget,
   isValidTarget,
@@ -120,6 +121,21 @@ export interface InboxStats {
   watcherLeaseFresh: boolean | null;
   processedIdCount: number;
   failedCount: number;
+}
+
+export interface TargetInboxPeekOptions {
+  includeArchived?: boolean;
+  includePendingAck?: boolean;
+  replyTo?: string;
+  limit?: number;
+}
+
+export interface TargetInboxPeekResult {
+  target: string;
+  pending: BridgeMessage[];
+  pendingAck: BridgeMessage[];
+  archived: BridgeMessage[];
+  parseErrors: string[];
 }
 
 // ── Internal state ───────────────────────────────────────────────────────────
@@ -604,6 +620,76 @@ function parseMessageFile(filePath: string): BridgeMessage | null {
   }
 }
 
+function targetMatchesExpected(messageTarget: string, expectedTarget: string): boolean {
+  if (messageTarget === expectedTarget) return true;
+  // Rolling-upgrade compatibility: pre-4.0.0 Claude senders may still put the
+  // legacy target literal in files that physically live under
+  // inbox/claude-code/default/.
+  if (expectedTarget === claudeCodeTargetForPersona(DEFAULT_PERSONA) && messageTarget === CLAUDE_CODE_TARGET) {
+    return true;
+  }
+  return false;
+}
+
+function parseMessageFileForTarget(
+  filePath: string,
+  expectedTarget: string,
+): { message: BridgeMessage | null; error?: string } {
+  try {
+    const raw = readFileSync(filePath, 'utf8');
+    const msg = JSON.parse(raw) as BridgeMessage;
+    if (!msg.id || !msg.timestamp) {
+      throw new Error('Missing required fields: id, timestamp');
+    }
+    if (!msg.target || !isValidTarget(msg.target)) {
+      throw new Error(`Missing/invalid target: ${JSON.stringify(msg.target ?? null)}`);
+    }
+    if (!targetMatchesExpected(msg.target, expectedTarget)) {
+      throw new Error(
+        `Message target ${JSON.stringify(msg.target)} does not match ${JSON.stringify(expectedTarget)}`,
+      );
+    }
+    return { message: msg };
+  } catch (err) {
+    const fileName = filePath.split('/').pop() ?? filePath;
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return { message: null, error: `${fileName}: ${errMsg}` };
+  }
+}
+
+function readTargetDir(
+  dir: string,
+  target: string,
+  opts: { replyTo?: string; parseErrors: string[] },
+): BridgeMessage[] {
+  if (!existsSync(dir)) return [];
+  const messages: BridgeMessage[] = [];
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir).filter(f => f.endsWith('.json'));
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    opts.parseErrors.push(`${dir}: ${errMsg}`);
+    return [];
+  }
+
+  for (const file of files) {
+    const { message, error } = parseMessageFileForTarget(join(dir, file), target);
+    if (!message) {
+      if (error) opts.parseErrors.push(error);
+      continue;
+    }
+    if (opts.replyTo && message.replyTo !== opts.replyTo) continue;
+    messages.push(message);
+  }
+
+  messages.sort(
+    (a, b) =>
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  );
+  return messages;
+}
+
 function countJsonFilesRecursive(dir: string): number {
   let count = 0;
   try {
@@ -985,6 +1071,40 @@ export function consumeInbox(): BridgeMessage[] {
 export function peekInbox(): { count: number; messages: BridgeMessage[] } {
   const messages = readInbox();
   return { count: messages.length, messages };
+}
+
+/**
+ * Non-destructive inspection for any target inbox subdir.
+ *
+ * This is intentionally separate from readInbox()/consumeInbox(), which are
+ * scoped to the active Claude Code persona and own that inbox lifecycle. The
+ * target peek path is for diagnostics and cross-harness routing checks: it
+ * never consumes, archives, quarantines, or mutates another harness's files.
+ */
+export function peekInboxForTarget(
+  target: string,
+  opts: TargetInboxPeekOptions = {},
+): TargetInboxPeekResult {
+  const parseErrors: string[] = [];
+  const limit = Math.max(1, Math.min(Math.floor(opts.limit ?? 50), 500));
+  const readOpts = { replyTo: opts.replyTo, parseErrors };
+
+  const pending = readTargetDir(inboxSubdir(target), target, readOpts);
+  const pendingAck = opts.includePendingAck
+    ? readTargetDir(pendingAckSubdir(target), target, readOpts)
+    : [];
+  const archived = opts.includeArchived
+    ? readTargetDir(archiveSubdir(target), target, readOpts)
+    : [];
+
+  const trimNewest = (messages: BridgeMessage[]) => messages.slice(Math.max(0, messages.length - limit));
+  return {
+    target,
+    pending: trimNewest(pending),
+    pendingAck: trimNewest(pendingAck),
+    archived: trimNewest(archived),
+    parseErrors: parseErrors.slice(0, 25),
+  };
 }
 
 /**

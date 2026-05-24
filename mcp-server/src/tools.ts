@@ -30,6 +30,7 @@ import {
   sendLocalMessage,
   consumeInbox,
   peekInbox,
+  peekInboxForTarget,
   clearInbox,
   getInboxStats,
   getActiveClaudeCodeTargetOrDefault,
@@ -473,7 +474,8 @@ export function registerTools(server: McpServer): void {
       description:
         'Manual active Claude Code persona inbox inspection / long-poll receive. In normal Claude Code channel-owner mode, incoming messages are pushed automatically into the running parent session; channel pushes do NOT reach subagents. Subagents that need to receive a bridge reply should call this tool with `wait: true, timeout_seconds: 30` and loop on `timed_out: true` until the expected message arrives (or use `peek: true` so the parent and other subagents still see the same content). '
         + 'Messages are removed from the active persona inbox (for example ~/.agent-bridge/inbox/claude-code/default/) after reading unless peek=true. Results are chronological, deduplicated, and TTL-expired messages are auto-pruned. '
-        + 'When `wait: true` and no message is in the inbox, the tool blocks until either an arrival is detected via the in-process watcher hook or `timeout_seconds` elapses. On timeout the response includes `timed_out: true` (additive flag — pre-3.8.0 callers ignoring it still see the empty result). Server-side cap on `timeout_seconds` is 60.',
+        + 'When `wait: true` and no message is in the inbox, the tool blocks until either an arrival is detected via the in-process watcher hook or `timeout_seconds` elapses. On timeout the response includes `timed_out: true` (additive flag — pre-3.8.0 callers ignoring it still see the empty result). Server-side cap on `timeout_seconds` is 60. '
+        + 'For diagnostics, pass `target` to non-destructively peek another target inbox such as `openclaw/default`; target peeks never consume messages and can include pending-ack/archive files for post-mortem routing checks.',
       inputSchema: {
         peek: z
           .boolean()
@@ -493,9 +495,122 @@ export function registerTools(server: McpServer): void {
           .describe(
             `Long-poll duration in seconds when wait=true. Default: ${LONG_POLL_DEFAULT_TIMEOUT_S}. Server caps at ${LONG_POLL_MAX_TIMEOUT_S}.`,
           ),
+        target: z
+          .string()
+          .optional()
+          .describe(
+            'Optional slash-delimited target to inspect non-destructively, e.g. "openclaw/default", "openclaw/clawdiboi2", or "claude-code/default". Target peeks are diagnostics-only and never consume.',
+          ),
+        include_archived: z
+          .boolean()
+          .optional()
+          .describe(
+            'When target is provided, also search ~/.agent-bridge/inbox/.archive/<target>/ for delivered messages. Default: false.',
+          ),
+        include_pending_ack: z
+          .boolean()
+          .optional()
+          .describe(
+            'When target is provided, also search ~/.agent-bridge/inbox/.pending-ack/<target>/ for messages staged after a channel push. Default: false.',
+          ),
+        reply_to: z
+          .string()
+          .optional()
+          .describe(
+            'When target is provided, filter pending/pending-ack/archive results to a specific replyTo message id.',
+          ),
+        limit: z
+          .number()
+          .optional()
+          .describe(
+            'When target is provided, return at most this many newest messages per section. Default: 50, max: 500.',
+          ),
       },
     },
-    async ({ peek, wait, timeout_seconds }) => {
+    async ({ peek, wait, timeout_seconds, target, include_archived, include_pending_ack, reply_to, limit }) => {
+      // -- target diagnostic path ------------------------------------------
+      // The default receive path is intentionally Claude-persona scoped. This
+      // explicit target peek covers OpenClaw/other harness diagnostics without
+      // racing their watchers by consuming or quarantining their files.
+      if (target) {
+        if (!isValidTarget(target)) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Invalid target ${JSON.stringify(target)}. Expected a slash-delimited target like "openclaw/default" or "claude-code/default".`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (wait) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  'target-specific bridge_receive_messages is diagnostic peek-only and does not support wait=true. '
+                  + 'Omit target to long-poll the active Claude Code persona inbox, or repeat a target peek from the caller.',
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = peekInboxForTarget(target, {
+          includeArchived: include_archived === true,
+          includePendingAck: include_pending_ack === true,
+          replyTo: reply_to,
+          limit,
+        });
+        const total = result.pending.length + result.pendingAck.length + result.archived.length;
+        const lines: string[] = [
+          total === 0
+            ? `No messages found for target=${target}.`
+            : `${total} message(s) found for target=${target}:`,
+          '',
+        ];
+
+        const appendSection = (label: string, messages: typeof result.pending) => {
+          if (messages.length === 0) return;
+          lines.push(`${label}:`);
+          for (const msg of messages) {
+            lines.push(
+              `- [${msg.timestamp}] ${msg.id} from=${msg.from}`
+              + (msg.fromTarget ? ` fromTarget=${msg.fromTarget}` : '')
+              + (msg.replyTo ? ` replyTo=${msg.replyTo}` : '')
+              + ` content=${JSON.stringify(msg.content.substring(0, 200))}${msg.content.length > 200 ? '...' : ''}`,
+            );
+          }
+          lines.push('');
+        };
+
+        appendSection('pending', result.pending);
+        appendSection('pending-ack', result.pendingAck);
+        appendSection('archived', result.archived);
+        if (result.parseErrors.length > 0) {
+          lines.push(`parse errors (non-mutating): ${result.parseErrors.length}`);
+          for (const err of result.parseErrors.slice(0, 5)) lines.push(`- ${err}`);
+          if (result.parseErrors.length > 5) lines.push(`- +${result.parseErrors.length - 5} more`);
+          lines.push('');
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: lines.join('\n').trimEnd() }],
+          structuredContent: {
+            target,
+            count: total,
+            pending: result.pending,
+            pending_ack: result.pendingAck,
+            archived: result.archived,
+            parse_errors: result.parseErrors,
+            peek_only: true,
+            timed_out: false,
+          },
+        };
+      }
+
       // -- 3.8.0 — long-poll helper ----------------------------------------
       // Reads the inbox via peek or consume, returns the formatted result
       // alongside structured metadata. Used both for the immediate-snapshot
