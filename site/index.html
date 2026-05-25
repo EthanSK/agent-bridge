@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>agent-bridge &mdash; Bridge Claude Code and OpenClaw sessions across machines</title>
+    <title>agent-bridge &mdash; Bridge agent harness sessions across machines</title>
     <meta
       name="description"
-      content="Bridge Claude Code and OpenClaw sessions across machines. Agent-to-agent messaging over SSH with harness-specific push paths."
+      content="Bridge running AI agent harness sessions across machines. Agent-to-agent messaging over SSH with harness-specific push paths."
     />
     <meta name="robots" content="index, follow, max-image-preview:large" />
     <link rel="canonical" href="https://ethansk.github.io/agent-bridge/" />
@@ -19,21 +19,21 @@
     <meta property="og:type" content="website" />
     <meta property="og:locale" content="en_GB" />
     <meta property="og:url" content="https://ethansk.github.io/agent-bridge/" />
-    <meta property="og:title" content="agent-bridge &mdash; Bridge Claude Code and OpenClaw sessions across machines" />
-    <meta property="og:description" content="Agent-to-agent messaging over SSH. Claude Code plugin, OpenClaw native channel, zero cloud." />
+    <meta property="og:title" content="agent-bridge &mdash; Bridge agent harness sessions across machines" />
+    <meta property="og:description" content="Agent-to-agent messaging over SSH for running agent harnesses. Harness-specific push paths, peer-to-peer, zero cloud." />
     <meta property="og:image" content="https://ethansk.github.io/agent-bridge/og-image.png" />
     <meta property="og:image:secure_url" content="https://ethansk.github.io/agent-bridge/og-image.png" />
     <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
-    <meta property="og:image:alt" content="agent-bridge: Claude Code and OpenClaw sessions connected over SSH, peer-to-peer with no cloud." />
+    <meta property="og:image:alt" content="agent-bridge: AI agent harness sessions connected over SSH, peer-to-peer with no cloud." />
 
     <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="agent-bridge &mdash; Bridge Claude Code and OpenClaw sessions across machines" />
-    <meta name="twitter:description" content="Agent-to-agent messaging over SSH. Claude Code plugin plus OpenClaw native channel." />
+    <meta name="twitter:title" content="agent-bridge &mdash; Bridge agent harness sessions across machines" />
+    <meta name="twitter:description" content="Agent-to-agent messaging over SSH for running agent harnesses." />
     <meta name="twitter:image" content="https://ethansk.github.io/agent-bridge/og-image.png" />
-    <meta name="twitter:image:alt" content="agent-bridge: Claude Code and OpenClaw sessions connected over SSH, peer-to-peer with no cloud." />
+    <meta name="twitter:image:alt" content="agent-bridge: AI agent harness sessions connected over SSH, peer-to-peer with no cloud." />
 
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -70,7 +70,7 @@
         <div class="hero-meta reveal reveal-1">
           <span><span class="dot" aria-hidden="true"></span> channel open</span>
           <span class="ver">v4.1.0</span>
-          <span>Claude Code + OpenClaw</span>
+          <span>AI agent harnesses</span>
           <span>tested end-to-end</span>
         </div>
 
@@ -81,7 +81,7 @@
         </h1>
 
         <p class="hero-lede reveal reveal-3">
-          <strong>agent-bridge</strong> lets running Claude Code and OpenClaw sessions push messages to each other across machines &mdash; agent-to-agent, not shell-to-shell. Both share the same SSH file transport, but their host models are different: Claude Code uses an MCP + <code>claude/channel</code> stdio plugin; OpenClaw uses a native <code>openclaw-channel/</code> gateway plugin. No broker, no cloud, no fresh agents spawned on the remote side.
+          <strong>agent-bridge</strong> lets running AI agent harness sessions push messages to each other across machines &mdash; agent-to-agent, not shell-to-shell. Every harness shares the same SSH file transport, while each receiver keeps its own host lifecycle: Claude Code uses an MCP + <code>claude/channel</code> stdio plugin; OpenClaw uses a native <code>openclaw-channel/</code> gateway plugin. No broker, no cloud, no fresh agents spawned on the remote side.
         </p>
 
         <div class="hero-actions reveal reveal-4">
@@ -101,7 +101,7 @@
             <div class="peer-node peer-node--a">
               <span class="label">peer a</span>
               <span class="name">Mac-Mini</span>
-              <span class="host">ethansk@192.168.0.14 · Claude Code session</span>
+              <span class="host">ethansk@192.168.0.14 · agent harness session</span>
             </div>
             <div class="peer-wire" aria-hidden="true">
               <span class="chan">&lt;channel&gt;</span>

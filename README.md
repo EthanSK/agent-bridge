@@ -2,9 +2,9 @@
 
 **Let your AI agents on different machines talk to each other.**
 
-agent-bridge connects running Claude Code and OpenClaw sessions across your own computers using SSH and local inboxes. Send a task to the agent already sitting on another laptop, ask your always-on desktop to run a diagnostic, or let OpenClaw and Claude Code coordinate without copy-pasting between chats.
+agent-bridge connects running AI agent harness sessions across your own computers using SSH and local inboxes. Send a task to the agent already sitting on another laptop, ask your always-on desktop to run a diagnostic, or let different harnesses coordinate without copy-pasting between chats.
 
-[![Claude Code](https://img.shields.io/badge/Claude_Code-channel_plugin-blueviolet)](https://github.com/EthanSK/agent-bridge)
+[![Agent harness bridge](https://img.shields.io/badge/agent_harness-bridge-blueviolet)](https://github.com/EthanSK/agent-bridge)
 
 [Website](https://ethansk.github.io/agent-bridge/) | [GitHub](https://github.com/EthanSK/agent-bridge)
 
@@ -71,7 +71,7 @@ Other docs in `docs/` cover auto-update, channel-plugin history, lifecycle notes
 
 ## What is agent-bridge?
 
-agent-bridge lets running Claude Code and OpenClaw sessions on different machines talk to each other agent-to-agent, and (optionally) run commands on each other's machines over SSH. Design goals:
+agent-bridge lets running AI agent harness sessions on different machines talk to each other agent-to-agent, and (optionally) run commands on each other's machines over SSH. Design goals:
 
 - **Peer-to-peer** -- no central server, no cloud, direct SSH between your machines
 - **Real-time push where the host supports it** -- Claude Code receives `<channel source="agent-bridge">` events; OpenClaw receives native channel turns through `openclaw-channel/`
