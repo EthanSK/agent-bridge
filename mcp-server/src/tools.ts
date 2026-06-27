@@ -5,6 +5,7 @@
  * - bridge_list_machines: List paired machines and their status
  * - bridge_status: Check if a machine is reachable
  * - bridge_send_message: Send a message to a remote machine's running agent
+ * - bridge_notify: Pop a native macOS notification on a chosen Mac (local or remote)
  * - bridge_receive_messages: Check for and consume incoming messages
  * - bridge_run_command: Run a shell command on a remote machine
  * - bridge_clear_inbox: Clear all messages from the local inbox
@@ -38,6 +39,11 @@ import {
 import { subscribeToInboxArrival } from './watcher.js';
 import { logInfo, logError } from './logger.js';
 import { logEvent } from './log.js';
+import {
+  renderLocalNotification,
+  buildRemoteNotifyCommand,
+  DEFAULT_NOTIFY_GROUP,
+} from './notify.js';
 
 // 3.8.0 — long-poll bounds for `bridge_receive_messages`. The default 30 s
 // keeps pollers reasonably tight while the 60 s cap ensures we never park an
@@ -433,6 +439,177 @@ export function registerTools(server: McpServer): void {
               type: 'text' as const,
               text: `Failed to send message to ${toName} target=${target}: ${errMsg}`,
             },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // -- bridge_notify ---------------------------------------------------------
+  //
+  // Pop a NATIVE macOS notification banner on a chosen Mac. Primary use: tell
+  // the user "the agent finished task X" on whichever Mac they're sitting at.
+  //
+  // ROUTING (see notify.ts header for the full rationale):
+  //   • machine = local (name/alias) → render in-process here via
+  //     renderLocalNotification (terminal-notifier, osascript fallback).
+  //   • machine = remote             → sshExec(m, "agent-bridge notify --local …")
+  //     so the REMOTE machine's own bundled CLI renders natively on THAT Mac.
+  //
+  // This is a FIRE-AND-FORGET SIDE EFFECT — it does NOT wake/message the remote
+  // agent and writes NO inbox file. For agent-to-agent messaging use
+  // bridge_send_message. Unlike bridge_run_command, local IS a first-class
+  // render path here (we do not reject local-loopback).
+  server.registerTool(
+    'bridge_notify',
+    {
+      title: 'Notify (native macOS banner)',
+      description:
+        'Pops a NATIVE macOS notification on a chosen paired Mac (or this one). '
+        + 'Primary use: notify the user that an agent finished a task, on whichever Mac they are sitting at.\n\n'
+        + 'The `machine` param accepts a paired remote name OR "local"/"self"/"localhost" (or this machine\'s real name). '
+        + 'Local pops directly in-process; remote routes the notification over the bridge (SSH) to the target, which renders it natively there '
+        + '(terminal-notifier if installed, otherwise an osascript fallback — decided per-machine by what is installed on the target).\n\n'
+        + 'This is a FIRE-AND-FORGET side effect — it does NOT wake or message the remote agent, and writes no inbox file. '
+        + 'For agent-to-agent messaging use bridge_send_message instead.\n\n'
+        + 'Sound: omit or pass "none" for a silent banner; pass "default" for the system default; pass a named system sound (e.g. "Glass", "Ping") to use it. '
+        + 'Subtitle is shown as a second line on terminal-notifier; on the osascript fallback (no subtitle field) it is folded into the title as "title — subtitle".',
+      inputSchema: {
+        machine: z
+          .string()
+          .describe(
+            'Target machine: a paired remote name (renders natively on that Mac over SSH) OR the local machine name / an alias ("local", "self", "localhost") to pop the banner on THIS Mac.',
+          ),
+        title: z.string().describe('Notification title (required, bold first line).'),
+        message: z.string().describe('Notification body text (required).'),
+        subtitle: z
+          .string()
+          .optional()
+          .describe('Optional subtitle (second line). Folded into the title on the osascript fallback.'),
+        sound: z
+          .string()
+          .optional()
+          .describe('Optional sound. "none"/omitted = silent; "default" = system default; or a named sound like "Glass"/"Ping".'),
+        group: z
+          .string()
+          .optional()
+          .describe(`Optional collapse id so repeat notifications replace instead of stacking. Default "${DEFAULT_NOTIFY_GROUP}".`),
+      },
+    },
+    async ({ machine: machineName, title, message, subtitle, sound, group }) => {
+      const isLocal = isLocalMachineName(machineName);
+
+      // -- LOCAL PATH: render in-process, no SSH, no inbox --------------------
+      if (isLocal) {
+        try {
+          renderLocalNotification({ title, message, subtitle, sound, group });
+          logEvent({
+            event: 'tool.bridge_notify',
+            msg: `Notification rendered locally`,
+            context: { machine: machineName, transport: 'local' },
+          });
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Notification delivered to ${machineName} (transport=local).`,
+              },
+            ],
+          };
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          logError(`Local notification failed: ${errMsg}`);
+          logEvent({
+            event: 'tool.bridge_notify.failed',
+            level: 'error',
+            msg: `Local notification failed`,
+            context: { machine: machineName, transport: 'local', error: errMsg },
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: `Failed to render local notification: ${errMsg}` },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // -- REMOTE PATH: sshExec the remote's own `agent-bridge notify --local` -
+      // Same not-found error shape as bridge_send_message / bridge_run_command.
+      const machine = getMachine(machineName);
+      if (!machine) {
+        const all = loadConfig();
+        const availableNames = [
+          getLocalMachineName(),
+          ...all.map(m => m.name),
+          ...LOCAL_MACHINE_ALIASES,
+        ].join(', ');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `Machine "${machineName}" not found. Available: ${availableNames}. `
+                + `(Pass the local machine name or "local"/"self"/"localhost" to notify THIS Mac.)`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Build the remote command with every free-form field shell-quoted (the
+      // single most important correctness detail — see shellQuoteForSsh).
+      const remoteCmd = buildRemoteNotifyCommand({ title, message, subtitle, sound, group });
+      logEvent({
+        event: 'tool.bridge_notify',
+        msg: `Sending notification to ${machineName} over SSH`,
+        context: { machine: machineName, transport: 'ssh' },
+      });
+
+      try {
+        // 15s is plenty for a remote banner pop; reuses the Tailscale-first
+        // endpoint selection + key auth + retry/backoff inside sshExec.
+        const res = await sshExec(machine, remoteCmd, 15000);
+        if (res.exitCode !== 0) {
+          logEvent({
+            event: 'tool.bridge_notify.failed',
+            level: 'error',
+            msg: `Remote notification non-zero exit on ${machineName}`,
+            context: { machine: machineName, transport: 'ssh', exit_code: res.exitCode },
+          });
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  `Notification to ${machineName} failed (exit ${res.exitCode}).`
+                  + (res.stderr.trim() ? `\nstderr:\n${res.stderr.trim()}` : ''),
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Notification delivered to ${machineName} (transport=ssh).`,
+            },
+          ],
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logError(`Remote notification failed on ${machineName}: ${errMsg}`);
+        logEvent({
+          event: 'tool.bridge_notify.failed',
+          level: 'error',
+          msg: `Remote notification failed on ${machineName}`,
+          context: { machine: machineName, transport: 'ssh', error: errMsg },
+        });
+        return {
+          content: [
+            { type: 'text' as const, text: `Failed to notify ${machineName}: ${errMsg}` },
           ],
           isError: true,
         };

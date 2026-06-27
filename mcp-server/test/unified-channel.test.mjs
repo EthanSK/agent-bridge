@@ -34,7 +34,7 @@ import { randomUUID } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexPath = join(__dirname, '..', 'build', 'index.js');
-const EXPECTED_VERSION = '4.7.2';
+const EXPECTED_VERSION = '4.8.0';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -106,10 +106,14 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant, sourced from config.ts.
+  // Version constant, sourced from config.ts. Pinned to EXPECTED_VERSION so a
+  // version bump only needs the single constant at the top of this file updated.
+  const versionRe = new RegExp(
+    `MCP_SERVER_VERSION\\s*=\\s*['"]${EXPECTED_VERSION.replace(/\./g, '\\.')}['"]`,
+  );
   assert.ok(
-    /MCP_SERVER_VERSION\s*=\s*['"]4\.7\.2['"]/.test(configSrc),
-    'MCP_SERVER_VERSION must be 4.7.2 in config.ts',
+    versionRe.test(configSrc),
+    `MCP_SERVER_VERSION must be ${EXPECTED_VERSION} in config.ts`,
   );
   // 4.0.0 — `parentLooksChannelCapable` lives in persona.js. Assert the
   // built persona module carries the Claude Code parent signatures.

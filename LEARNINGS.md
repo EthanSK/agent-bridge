@@ -24,6 +24,14 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-27T20:00:00Z
+**Trigger:** bridge_notify macOS-notify design build 2026-06-27
+**Symptom:** Needed a way to pop a native macOS notification on any paired Mac (tell the user an agent finished a task on whichever Mac they're at)
+**Root cause:** N/A (new feature). Key DESIGN DECISION worth remembering: a notification is a FIRE-AND-FORGET SIDE EFFECT, not an agent message — do NOT route it through the inbox/watcher path (that needs a live remote channel-owner and is async). The inbox path is the wrong tool for banners.
+**Fix:** New `bridge_notify` MCP tool + `agent-bridge notify` CLI verb. Routing: machine=local renders in-process (terminal-notifier, osascript fallback); machine=remote runs `sshExec(m, "agent-bridge notify --local …")` so the REMOTE machine's own CLI renders natively there (decides terminal-notifier-vs-osascript by what IT has installed — fallback is load-bearing, Mini may lack terminal-notifier). Renderer lives in TWO mirrored places that must stay byte-identical: `_render_local_notification` (bash) + `renderLocalNotification` (mcp-server/src/notify.ts). Free-form notification text MUST be shell-quoted before entering the SSH command string — `qq()` = `printf '%q'` in bash, `shellQuoteForSsh()` in TS — this is the one place it breaks if done naively. osascript has no subtitle field so subtitle folds into title as "title — subtitle". Files: mcp-server/src/notify.ts (new), mcp-server/src/tools.ts (bridge_notify), agent-bridge (cmd_notify + _render_local_notification + qq). CLI is testable immediately (no MCP restart); the MCP tool calls the same code paths so passing CLI tests imply a working tool.
+**Commit:** <see PR>
+**Guard:** mcp-server/test/notify-quoting.test.mjs (shellQuoteForSsh round-trips hostile strings through a real shell; buildRemoteNotifyCommand word-split parity) + test/cli-notify.sh (notify --local renders via stubbed terminal-notifier; --sound none silent; missing flags die; osascript fallback when terminal-notifier absent). Version-pin test in unified-channel.test.mjs now references EXPECTED_VERSION constant so future bumps only touch one line.
+---
 **Date:** 2026-06-27T19:23:01Z
 **Trigger:** Nest-to-Mini build task 2026-06-27
 **Symptom:** Want a Google Nest / Gemini-for-Home speaker to control a machine's Claude Code by voice; emulated Hue does not work with Google Home

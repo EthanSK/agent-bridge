@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.7.2"
+VERSION="4.8.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -2055,6 +2055,221 @@ cmd_config_help() {
   printf '  agent-bridge config MacBook-Pro --identity-file ~/.agent-bridge/keys/agent-bridge_Mac-mini\n'
 }
 
+# ============================================================================
+# notify — pop a native macOS notification on a chosen Mac (local or remote)
+# ============================================================================
+#
+# THE BIG ARCHITECTURAL DECISION (mirrored in mcp-server/src/notify.ts):
+# A notification is a FIRE-AND-FORGET SIDE EFFECT — "pop a banner on a Mac" —
+# NOT an agent message. So notifications do NOT go through the inbox/watcher
+# path (the path bridge_send_message uses, which needs a live remote agent).
+# Instead:
+#   • Local notify  = render right here, in this CLI (terminal-notifier /
+#                     osascript). No SSH, no inbox.
+#   • Remote notify = SSH to the target and run the target's OWN
+#                     `agent-bridge notify --local …`, so the REMOTE machine
+#                     renders the banner natively using whatever notifier IT
+#                     has installed. This reuses the same Tailscale-first SSH
+#                     path as `agent-bridge run`.
+# This makes notify fully synchronous (real success/failure back) and testable
+# from the CLI immediately — no MCP restart needed.
+
+# qq — shell-quote one free-form field for safe embedding in the remote SSH
+# command string. printf '%q' is the single most important correctness detail:
+# notification titles/messages are free-form (spaces, quotes, $, backticks,
+# newlines) and the whole command string is re-parsed by the REMOTE shell.
+# Without this, a title like `Done; rm -rf ~` would break (or worse).
+qq() { printf '%q' "$1"; }
+
+# _render_local_notification — pop a native banner ON THIS Mac.
+# Args: title message subtitle sound group
+#   • Prefer terminal-notifier (real -title/-subtitle/-message/-group support,
+#     and -group collapses duplicates instead of stacking).
+#   • Fall back to osascript `display notification` when terminal-notifier is
+#     NOT installed. The fallback is LOAD-BEARING (not every machine has the
+#     brew package, e.g. the Mac Mini) — do not assume terminal-notifier.
+# Sound mapping: "none"/"" => silent (omit -sound); "default" or a named sound
+# (Glass/Ping/…) => pass through. osascript has NO subtitle field, so we fold
+# the subtitle into the title as "title — subtitle".
+_render_local_notification() {
+  local title="$1" message="$2" subtitle="${3:-}" sound="${4:-}" group="${5:-agent-bridge}"
+
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    # Build an ARGUMENT ARRAY (never a concatenated string) so spaces/quotes in
+    # the fields survive verbatim with zero extra shell interpretation.
+    local args=(-title "$title" -message "$message" -group "${group:-agent-bridge}")
+    [ -n "$subtitle" ] && args+=(-subtitle "$subtitle")
+    case "$sound" in
+      none|"") : ;;                 # silent — no -sound flag at all
+      *)       args+=(-sound "$sound") ;;  # "default" or a named system sound
+    esac
+    terminal-notifier "${args[@]}"
+    return $?
+  fi
+
+  # -- osascript fallback ----------------------------------------------------
+  # No subtitle field in AppleScript notifications → fold into the title.
+  local disp_title="$title"
+  [ -n "$subtitle" ] && disp_title="$title — $subtitle"
+  # Escape backslash first, then double-quote, for the AppleScript string
+  # literals embedded in the -e script.
+  local esc_msg esc_title
+  esc_msg="$(printf '%s' "$message"    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  esc_title="$(printf '%s' "$disp_title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  # `sound name "<name>"` clause only when a real sound was requested.
+  local sound_clause=""
+  case "$sound" in
+    none|"") sound_clause="" ;;
+    *)
+      local esc_sound
+      esc_sound="$(printf '%s' "$sound" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+      sound_clause=" sound name \"$esc_sound\""
+      ;;
+  esac
+  osascript -e "display notification \"$esc_msg\" with title \"$esc_title\"$sound_clause"
+}
+
+cmd_notify() {
+  local machine_name="" title="" message="" subtitle="" sound="" group="" force_local=0
+
+  # Flag/positional parsing modelled on cmd_run: <machine> is positional,
+  # everything else is a flag. --local forces the local render path (this is
+  # exactly the flag the REMOTE end is invoked with over SSH).
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --local)            force_local=1; shift ;;
+      --title)            title="$2"; shift 2 ;;
+      --title=*)          title="${1#*=}"; shift ;;
+      --message)          message="$2"; shift 2 ;;
+      --message=*)        message="${1#*=}"; shift ;;
+      --subtitle)         subtitle="$2"; shift 2 ;;
+      --subtitle=*)       subtitle="${1#*=}"; shift ;;
+      --sound)            sound="$2"; shift 2 ;;
+      --sound=*)          sound="${1#*=}"; shift ;;
+      --group)            group="$2"; shift 2 ;;
+      --group=*)          group="${1#*=}"; shift ;;
+      --help|-h)          cmd_notify_help; exit 0 ;;
+      -*)                 die "Unknown option: $1 (try: agent-bridge notify --help)" ;;
+      *)
+        if [ -z "$machine_name" ]; then
+          machine_name="$1"
+        else
+          die "Unexpected argument: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$title" ]   || die "--title is required. Usage: agent-bridge notify <machine|--local> --title <t> --message <m>"
+  [ -n "$message" ] || die "--message is required. Usage: agent-bridge notify <machine|--local> --title <t> --message <m>"
+
+  # LOCAL render when --local was passed OR the named machine is this machine.
+  if [ "$force_local" -eq 1 ] || { [ -n "$machine_name" ] && is_local_machine "$machine_name"; }; then
+    _render_local_notification "$title" "$message" "$subtitle" "$sound" "$group"
+    exit $?
+  fi
+
+  [ -n "$machine_name" ] || die "Machine name required (or pass --local). Usage: agent-bridge notify <machine|--local> --title <t> --message <m>"
+
+  if ! cfg_exists "$machine_name"; then
+    die "Machine \"$machine_name\" not found. Run 'agent-bridge list' to see paired machines."
+  fi
+
+  # -- REMOTE: SSH to the target and run ITS own `agent-bridge notify --local` -
+  # Endpoint selection mirrors cmd_run: Tailscale-first (internet_host), no
+  # fallback to LAN if internet_host is configured.
+  local host user port keypath internet_host internet_port
+  host="$(cfg_get "$machine_name" host)"
+  user="$(cfg_get "$machine_name" user)"
+  port="$(cfg_get "$machine_name" port 2>/dev/null || printf '22')"
+  keypath="$(cfg_identity_file "$machine_name")"
+  internet_host="$(cfg_get "$machine_name" internet_host 2>/dev/null || true)"
+  internet_port="$(cfg_get "$machine_name" internet_port 2>/dev/null || printf '22')"
+
+  local try_host try_port chosen
+  if [ -n "$internet_host" ]; then
+    try_host="$internet_host"; try_port="$internet_port"; chosen="internet"
+  else
+    try_host="$host"; try_port="$port"; chosen="lan"
+  fi
+
+  # Build the remote command. Every free-form field is quoted with qq (printf
+  # %q) so it survives the SSH command string intact. We only pass optional
+  # flags when set, so the remote CLI's own defaults apply when absent.
+  local inner_cmd
+  inner_cmd="agent-bridge notify --local --title $(qq "$title") --message $(qq "$message")"
+  [ -n "$subtitle" ] && inner_cmd="$inner_cmd --subtitle $(qq "$subtitle")"
+  [ -n "$sound" ]    && inner_cmd="$inner_cmd --sound $(qq "$sound")"
+  [ -n "$group" ]    && inner_cmd="$inner_cmd --group $(qq "$group")"
+
+  # PATH-PREPEND WRAP (real-world robustness): the SSH remote shell is
+  # non-interactive, so its PATH is minimal and usually does NOT include
+  # ~/.local/bin (the install.sh default location) or /opt/homebrew/bin where
+  # agent-bridge / its notifier live. A login shell does NOT help here either,
+  # because zsh users add those dirs in ~/.zshrc (interactive), which `sh -lc`
+  # never sources. So we explicitly prepend the standard install locations to
+  # PATH before invoking — shell-flavor independent. Without this the remote
+  # command fails with exit 127 even though agent-bridge IS installed. The
+  # combined command is qq-quoted so it arrives as a single argument to -c.
+  local with_path
+  with_path="export PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\"; $inner_cmd"
+  local remote_cmd
+  remote_cmd="sh -c $(qq "$with_path")"
+
+  printf "${DIM}  Sending notification to %s (via %s)...${RESET}\n" "$machine_name" "$chosen"
+  log_event info "cli.notify.start" "sending notification to $machine_name" "{\"machine\":\"$machine_name\",\"path\":\"$chosen\"}"
+
+  local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "ConnectTimeout=10" "-p" "$try_port" "-o" "LogLevel=ERROR")
+  if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
+    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
+  fi
+  args+=("${user}@${try_host}" "$remote_cmd")
+
+  local exit_code=0
+  ssh "${args[@]}" || exit_code=$?
+
+  if [ "$exit_code" -eq 0 ]; then
+    ok "notification delivered to $machine_name"
+    log_event info "cli.notify.done" "notification delivered to $machine_name" "{\"machine\":\"$machine_name\",\"exit_code\":0}"
+  else
+    printf "${YELLOW}  notification to %s failed (exit %d).${RESET}\n" "$machine_name" "$exit_code"
+    log_event warn "cli.notify.failed" "notification to $machine_name failed" "{\"machine\":\"$machine_name\",\"exit_code\":$exit_code}"
+  fi
+  exit "$exit_code"
+}
+
+cmd_notify_help() {
+  printf 'Usage:\n'
+  printf '  agent-bridge notify <machine> --title <t> --message <m> [--subtitle <s>] [--sound <name>] [--group <id>]\n'
+  printf '  agent-bridge notify --local   --title <t> --message <m> [--subtitle <s>] [--sound <name>] [--group <id>]\n\n'
+  printf 'Pop a NATIVE macOS notification banner on a paired Mac (or this one).\n'
+  printf 'Primary use: tell the user an agent finished a task, on whichever Mac\n'
+  printf 'they are sitting at.\n\n'
+  printf 'Routing:\n'
+  printf '  • <machine> = local name / "local"/"self"/"localhost", or --local:\n'
+  printf '      renders in-process here (terminal-notifier, osascript fallback).\n'
+  printf '  • <machine> = a paired remote name:\n'
+  printf '      SSHes to the target and runs its own `agent-bridge notify --local`,\n'
+  printf '      so the banner renders natively on THAT Mac.\n\n'
+  printf 'This is a fire-and-forget SIDE EFFECT — it does NOT wake or message the\n'
+  printf 'remote agent. For agent-to-agent messaging use the bridge_send_message\n'
+  printf 'MCP tool.\n\n'
+  printf 'Sound: omit or "--sound none" = silent; "--sound default" = system\n'
+  printf 'default; "--sound Glass" (or any named system sound) = that sound.\n\n'
+  printf 'Options:\n'
+  printf '  --title <t>      Title (required)\n'
+  printf '  --message <m>    Body text (required)\n'
+  printf '  --subtitle <s>   Subtitle (folded into title on the osascript fallback)\n'
+  printf '  --sound <name>   default | none | a named system sound (Glass, Ping, …)\n'
+  printf '  --group <id>     Collapse id (default: agent-bridge)\n'
+  printf '  --local          Force the local render path (used by the remote end)\n'
+  printf '  -h, --help       Show this help\n\n'
+  printf 'Examples:\n'
+  printf '  agent-bridge notify --local --title "Test" --message "hello" --subtitle "from MBP"\n'
+  printf '  agent-bridge notify Ethans-Mac-mini --title "Done" --message "task finished" --sound default\n'
+}
+
 cmd_chime() {
   local resolved script_dir repo_root chime_cli
   resolved="$0"
@@ -2464,6 +2679,7 @@ cmd_help() {
   printf '  pair               Pair with another machine (interactive or flags)\n'
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
   printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
+  printf '  notify <machine>   Pop a native macOS notification on a Mac (local or remote); --local renders here\n'
   printf '  plugin-registry-rewire  Self-heal stale plugin-registry entries (Claude Code + OpenClaw)\n'
   printf '  install-periodic-update Install harness-independent 10min auto-updater (LaunchAgent / Scheduled Task)\n'
   printf '  mcp-incident-report     Post-mortem report of MCP disconnect events around a timestamp\n'
@@ -2515,6 +2731,7 @@ main() {
     pair)     cmd_pair "$@" ;;
     config)   cmd_config "$@" ;;
     chime)    cmd_chime "$@" ;;
+    notify)   cmd_notify "$@" ;;
     plugin-registry-rewire) cmd_plugin_registry_rewire "$@" ;;
     install-periodic-update) cmd_install_periodic_update "$@" ;;
     mcp-incident-report) cmd_mcp_incident_report "$@" ;;
