@@ -94,6 +94,32 @@ See [CHANGELOG.md](CHANGELOG.md) for the commit-level history.
 
 ---
 
+## Notifications (4.8.0+)
+
+agent-bridge can pop a native macOS notification banner on any Mac in the fleet — local or remote — via the `bridge_notify` MCP tool and the `agent-bridge notify` CLI verb.
+
+This is a **fire-and-forget side effect, NOT an agent message**: it does not write to an inbox, does not wake or message the remote agent, and returns the real render success/failure synchronously. Use it for "task finished / build done / audio switched" style banners; for anything the remote agent must act on, use `bridge_send_message`.
+
+**Local-vs-remote routing:**
+
+- **Local** (`--local`): rendered in-process on this Mac. Pure-bash path — prefers `terminal-notifier`, falls back to `osascript display notification` when it's not installed.
+- **Remote** (a machine name): SSHes to the target and runs the target's OWN `agent-bridge notify --local …`, so the remote machine renders it with its own notifier and reports its real exit status back.
+
+```bash
+# Pop a banner on this machine
+agent-bridge notify --local --title "Build" --message "done"
+
+# Pop a banner on a remote machine (renders there, via its own notifier)
+agent-bridge notify Ethans-Mac-mini --title "Done" --message "task finished" --sound default
+
+# Optional flags
+agent-bridge notify --local --title "T" --message "M" --subtitle "S" --sound "Glass" --group "build"
+```
+
+The MCP equivalent is the `bridge_notify` tool (see [INSTRUCTIONS.md](INSTRUCTIONS.md#mcp-tools)) — same local/remote semantics, callable directly by an agent. Note: the running MCP child only exposes the `bridge_notify` tool after a full Claude Code restart; the `agent-bridge notify` CLI verb works immediately after build.
+
+---
+
 ## Architecture overview
 
 ```

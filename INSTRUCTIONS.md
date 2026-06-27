@@ -138,6 +138,22 @@ The MCP server provides the shared `bridge_*` tools for EXISTING running agent s
 | `bridge_clear_inbox` | Clear the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics and watcher health |
 
+#### `bridge_notify` / `agent-bridge notify` (4.8.0+)
+
+Pop a native macOS notification banner on a chosen Mac. This is a **fire-and-forget side effect, NOT an agent message** — it does not write to an inbox, does not wake or message the remote agent, and returns the real render success/failure synchronously.
+
+- **Local** (`--local`, or `bridge_notify` with no machine): rendered in-process on THIS Mac. Pure-bash path — prefers `terminal-notifier`, falls back to `osascript display notification` if it's not installed (e.g. a Mac with no Homebrew package).
+- **Remote** (`bridge_notify` with a machine name, or `agent-bridge notify <machine> …`): SSHes to the target and runs the target's OWN `agent-bridge notify --local …`, so the REMOTE machine renders it with its own notifier. Fully synchronous — you get the remote's real exit status back.
+
+CLI:
+
+```bash
+agent-bridge notify --local --title "Build" --message "done" [--subtitle s] [--sound name]
+agent-bridge notify Ethans-Mac-mini --title "Done" --message "task finished" --sound default
+```
+
+Use it for "task finished / build done / audio switched" style banners. For anything the remote AGENT must act on, use `bridge_send_message` instead.
+
 ### Claude Code unified plugin (3.7.0+)
 
 When used with Claude Code, agent-bridge ships **one unified plugin** at [`mcp-server/`](mcp-server/). It hosts both:
