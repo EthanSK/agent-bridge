@@ -1,0 +1,20 @@
+{
+  "name": "agent-bridge-alexa-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Amazon Alexa / Echo → agent-bridge bridge. Speak a freeform task to an Echo; a thin Alexa custom skill POSTs it to this receiver, which FIRE-AND-FORGET injects the task into the local machine's running Claude Code session via agent-bridge sendLocalMessage(), then returns a fast spoken ack. When the agent finishes it speaks the result back to the Echo via alexa_remote_control.sh (with a Telegram fallback).",
+  "main": "src/server.mjs",
+  "bin": {
+    "agent-bridge-alexa": "src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "inject": "node src/inject.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "EthanSK",
+  "license": "MIT"
+}
