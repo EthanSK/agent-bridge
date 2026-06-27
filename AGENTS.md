@@ -119,6 +119,28 @@ agent-bridge run MacBook-Pro "brew update && brew upgrade"
 
 > `agent-bridge run` is a plain remote-shell utility. It does NOT spawn or invoke an agent. The `--claude`, `--codex`, and `--agent` flags were removed in 3.0.0 — they ran a fresh non-interactive agent session (`claude --print` etc.) on the remote machine, which is the opposite of what this project is for.
 
+### Pop a native macOS notification on any Mac (4.8.0+)
+
+Pop a native macOS banner on **this** Mac or on a paired remote Mac. Primary use: tell the user an agent finished a task, on whichever Mac they are sitting at.
+
+```bash
+# Local — pops on THIS Mac immediately (terminal-notifier, osascript fallback):
+agent-bridge notify --local --title "Build done" --message "all tests green" --subtitle "from MBP"
+
+# Remote — SSHes to the target and runs ITS own `agent-bridge notify --local`,
+# so the banner renders natively on that Mac:
+agent-bridge notify Ethans-Mac-mini --title "Done" --message "task finished" --sound default
+```
+
+MCP tool form (`bridge_notify`):
+
+```text
+bridge_notify({ machine: "local",           title: "Build done", message: "all green", subtitle: "from MBP" })
+bridge_notify({ machine: "Ethans-Mac-mini", title: "Done",       message: "task finished", sound: "default" })
+```
+
+> **This is a fire-and-forget side effect — it does NOT wake or message the remote agent and writes NO inbox file.** For agent-to-agent messaging use `bridge_send_message`. Routing: a *local* machine renders in-process; a *remote* machine is reached via `sshExec` running the remote's own `agent-bridge notify --local …`, so each machine decides terminal-notifier-vs-osascript by what it has installed. Sound: omit or `none` = silent; `default` = system default; a named sound (e.g. `Glass`, `Ping`) passes through. On the osascript fallback (no subtitle field) the subtitle is folded into the title as `"title — subtitle"`.
+
 ### Same-machine delivery (3.5.0+)
 
 `bridge_send_message` accepts the **local machine name** (or one of the reserved aliases `local`, `self`, `localhost`) as its `machine` parameter. The message JSON is written directly to `~/.agent-bridge/inbox/<target>/<id>.json` — no SSH hop, no loopback round-trip:

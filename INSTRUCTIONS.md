@@ -10,6 +10,7 @@ agent-bridge pair --name "X" --host IP --port 22 --user U --token T --pubkey "ss
 agent-bridge list                               # List paired machines
 agent-bridge status [machine]                   # Check reachability
 agent-bridge run <machine> "command"            # Run a PLAIN shell command remotely (diagnostics only)
+agent-bridge notify <machine|--local> --title T --message M   # Pop a native macOS notification on a Mac (4.8.0+)
 agent-bridge relay-expand <id>                  # Expand a compact OpenClaw relay notice by expand id
 agent-bridge connect <machine>                  # Open interactive SSH session
 agent-bridge unpair <machine>                   # Remove a pairing
@@ -131,6 +132,7 @@ The MCP server provides the shared `bridge_*` tools for EXISTING running agent s
 | `bridge_list_machines` | List paired machines and connection details |
 | `bridge_status` | Check if a machine is reachable via SSH |
 | `bridge_send_message` | Send a message to another machine's running agent |
+| `bridge_notify` | Pop a native macOS notification on a chosen Mac (local in-process, or remote via `sshExec` running the remote's own `agent-bridge notify --local`). Fire-and-forget side effect — does NOT wake/message the remote agent (4.8.0+). |
 | `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox. 3.8.0+ supports long-poll via `wait: true, timeout_seconds: 30` (capped at 60 s) for subagents that can't receive parent-only channel pushes. |
 | `bridge_run_command` | Run a shell command on a remote machine |
 | `bridge_clear_inbox` | Clear the local inbox |
