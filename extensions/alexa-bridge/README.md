@@ -2,13 +2,15 @@
 
 An **agent-bridge extension** that lets you **speak a freeform task to an Amazon
 Echo** and have it injected into a machine's running **Claude Code** session.
-The agent works for as long as it needs, then **speaks the result back to the
-Echo** (with a Telegram fallback).
+The agent works for as long as it needs, then **reports the result back over two
+RELIABLE channels** — a native **macOS notification** on the Mac you're at, plus
+a **Telegram message** with the full result. (Announcing on the Echo itself is an
+optional extra, not required.)
 
 Unlike a normal Alexa skill — which must answer within ~8 seconds — this uses a
 **fire-and-forget** design: Alexa acks instantly ("On it — I'll let you know
-when it's done."), the agent does the slow work out-of-band, and the result is
-announced later via Amazon's unofficial announcement API.
+when it's done."), the agent does the slow work out-of-band, and the result
+comes back later via the two reliable callbacks.
 
 ```
 "Alexa, ask my agent to <freeform task>"
@@ -19,12 +21,15 @@ announced later via Amazon's unofficial announcement API.
   → ~/.agent-bridge/inbox/claude-code/default/msg-*.json  (atomic write)
   → agent-bridge file watcher (~2s)
   → <channel source="agent-bridge"> block pushed into the running Claude Code session
-  → Claude works as long as it needs…
-  → …then runs:  speak.sh "<result>"
-       → alexa_remote_control.sh -d "<Echo>" -e "speak:<result>"   (unofficial API, NO 8s limit)
-       → if that fails (missing / not authed / Amazon changed the API):
-            → Telegram fallback (result is never lost)
   → "On it — I'll let you know when it's done."  (the instant ack, spoken first)
+  → Claude works as long as it needs…
+  → …then reports the result back over TWO RELIABLE CHANNELS (no fragile API):
+       1. macOS notification on the Mac you're at:
+            agent-bridge notify <target> --title "Alexa task done" --message "<result>" --sound default
+            (SSHes to <target>, default MacBookPro, renders a native banner there)
+       2. Telegram message with the FULL result
+       (+ OPTIONAL: if the Echo speak-back is set up, also speak.sh "<result>"
+          → alexa_remote_control.sh -e "speak:<result>"  — unofficial, best-effort)
 ```
 
 ## Why fire-and-forget (the 8-second constraint)
@@ -32,9 +37,46 @@ announced later via Amazon's unofficial announcement API.
 Alexa custom skills MUST return an HTTP response within **~8 seconds** or the
 user hears an error. Real agent work takes minutes. So the receiver **cannot do
 the work inside the request** — it injects the task (a fast atomic file write)
-and acks immediately. The long result comes back on a **separate leg**
-(`speak.sh`), which talks to Amazon's announcement API directly and is **not**
+and acks immediately. The long result comes back **out-of-band**, after the
+agent finishes, over the two reliable callbacks above — neither of which is
 bound by the 8s rule.
+
+## The result callback (why macOS notification + Telegram, not the Echo)
+
+The earlier design announced results on the Echo via `alexa_remote_control.sh`,
+an **unofficial** tool driving Amazon's private API with a login cookie that
+expires every ~2 weeks. That's fragile, so it's been **demoted to optional**.
+The **primary callbacks are both reliable** and ship with agent-bridge v4.8.0 /
+dot-claude:
+
+1. **macOS notification** — the agent runs `agent-bridge notify <target>
+   --title "Alexa task done" --message "<concise result>" --sound default`. The
+   `notify` verb SSHes to `<target>` and renders a native banner there. Target
+   is configurable via `ALEXA_BRIDGE_NOTIFY_TARGET` (default **MacBookPro** = the
+   Mac Ethan is usually at); the resolved name is baked into the injected prompt.
+2. **Telegram** — the agent sends a Telegram message with the **full** result
+   (the same Telegram path speak.sh's fallback uses).
+
+Both are zero-unofficial-API. The loop works **fully without** the Amazon cookie
+auth — Echo speak-back is a nice-to-have on top.
+
+## Setup checklist (required vs optional)
+
+**REQUIRED to make the loop work:**
+1. Run the receiver (foreground or LaunchAgent) on the machine where Claude Code
+   runs. See "Run the receiver" below.
+2. Get a **public HTTPS URL** for it — enable Tailscale Funnel (preferred) or run
+   cloudflared. See "Public HTTPS endpoint" below.
+3. **Import the Alexa skill** (`skill.json`) and set its endpoint to your public
+   URL + `/alexa`. See "Import the Alexa skill" below.
+
+That's it — speak a task and the result comes back as a macOS notification +
+Telegram message.
+
+**OPTIONAL (only if you also want the result spoken on the Echo):**
+- The one-time `alexa_remote_control` Amazon cookie auth (Ethan-only, needs Amazon
+  login + OTP). See "(OPTIONAL) One-time alexa_remote_control auth". Skipping this
+  costs you nothing but the spoken-on-Echo nicety.
 
 ## How it plugs into agent-bridge
 
@@ -62,10 +104,11 @@ build`) so `build/inbox.js` exists.
   deps). Routes `POST /alexa` (LaunchRequest / IntentRequest / SessionEnded) and
   `GET /health`.
 - `src/inject.mjs` — the agent-bridge injection path (+ a CLI test mode).
-- `speak.sh` — the speak-back leg: `alexa_remote_control.sh` with a Telegram
-  fallback.
+- `speak.sh` — **OPTIONAL/secondary** Echo speak-back leg:
+  `alexa_remote_control.sh` with a Telegram fallback. Not on the critical path —
+  the loop works fully without it.
 - `speak.config.example` — copy to `speak.config` (git-ignored) and set your
-  Echo name.
+  Echo name (only needed if you opt into the Echo speak-back).
 - `skill.json` — ready-to-import Alexa interaction model.
 - `launchd/` — LaunchAgent plist template + `install.sh`.
 
@@ -74,6 +117,10 @@ build`) so `build/inbox.js` exists.
 - `ALEXA_BRIDGE_PORT` — port the receiver binds (default `8787`).
 - `ALEXA_BRIDGE_TARGET` — inbox the task lands in (default `claude-code/default`).
 - `ALEXA_BRIDGE_TTL` — TTL stamped on each message (default `86400`).
+- `ALEXA_BRIDGE_NOTIFY_TARGET` — the machine the agent pops a macOS notification
+  on when it finishes (default **`MacBookPro`**). Baked into the injected prompt
+  so the agent runs `agent-bridge notify <this> …`. Set it to whichever Mac you
+  sit at. (The LaunchAgent installer also accepts this env var.)
 - `ALEXA_BRIDGE_SECRET` — optional shared secret. If set, `POST /alexa` requires
   `?secret=<value>` (in the endpoint URL) or an `x-alexa-bridge-secret` header.
 - `AGENT_BRIDGE_INBOX_JS` — force the path to agent-bridge's `build/inbox.js`.
@@ -174,7 +221,12 @@ health JSON.
 6. **Test** tab → enable testing in **Development**. Now say (or type in the
    simulator): *"ask my agent to what time is it"*.
 
-## One-time alexa_remote_control auth (ONLY Ethan can do this)
+## (OPTIONAL) One-time alexa_remote_control auth — for Echo speak-back only
+
+> **This is OPTIONAL and NOT a blocker.** The loop's result callbacks (macOS
+> notification + Telegram) work without any of this. Do this ONLY if you also
+> want the result spoken aloud on the Echo. Skipping it costs you nothing but the
+> spoken-on-Echo nicety.
 
 `speak.sh` wraps thorsten-gehrig's `alexa_remote_control.sh`, which needs a
 logged-in Amazon **cookie**. Generating it requires **Ethan's Amazon login +
@@ -242,19 +294,22 @@ curl -s -X POST http://localhost:8787/alexa \
 bash speak.sh "test result from alexa-bridge"
 ```
 
-## ⚠️ Honest note: the speak-back leg is fragile
+## ⚠️ Honest note: the OPTIONAL Echo speak-back is fragile (but nothing depends on it)
 
-The **inject leg** (Alexa → agent) is robust — it's plain HTTP + agent-bridge's
-own delivery path.
+Both **critical legs are robust**:
+- The **inject leg** (Alexa → agent) is plain HTTP + agent-bridge's own delivery
+  path.
+- The **result callbacks** (agent → macOS notification + Telegram) use
+  agent-bridge's `notify` verb and the Telegram Bot API — both official/reliable.
 
-The **speak-back leg** (agent → Echo) relies on `alexa_remote_control.sh`, an
-**unofficial** tool driving Amazon's **private** API with a login cookie. This
-means:
+The only fragile piece is the **optional Echo speak-back** (`speak.sh` →
+`alexa_remote_control.sh`), an **unofficial** tool driving Amazon's **private**
+API with a login cookie that:
 
-- Amazon can change their API at any time and break the speak-back.
-- The cookie **expires periodically** (~2 weeks) and needs a manual re-auth
-  (Amazon login + OTP).
+- Amazon can change/break at any time, and
+- **expires periodically** (~2 weeks), needing a manual re-auth (Amazon login +
+  OTP).
 
-That's exactly why the **Telegram fallback exists** — it's the safety net so you
-always get your result even when the Echo announcement can't fire. Treat Echo
-speak-back as best-effort and Telegram as the guarantee.
+But **nothing depends on it** — it's a best-effort extra on top of the reliable
+macOS-notification + Telegram callbacks. If it breaks or you never set it up, you
+still get every result.

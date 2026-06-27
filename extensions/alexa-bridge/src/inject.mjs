@@ -125,8 +125,9 @@ export async function inject({ target = 'claude-code/default', content, ttlSecon
 
 // ── CLI mode (manual testing) ───────────────────────────────────────────────
 // `node src/inject.mjs "<task text>"` — wraps the given text in the same
-// fire-and-forget framing the receiver uses (including the speak-back
-// instruction) and injects it. Lets you verify the round-trip (a <channel>
+// fire-and-forget framing the receiver uses (macOS-notify + Telegram callbacks,
+// with the Echo speak-back optional) and injects it. Lets you verify the
+// round-trip (a <channel>
 // block should surface in the running Claude Code session within ~2s) WITHOUT
 // needing Alexa / Amazon / an Echo.
 const isCli = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
@@ -137,12 +138,19 @@ if (isCli) {
   // Resolve the absolute path to speak.sh so the injected instruction is
   // copy-pasteable regardless of the agent's cwd. speak.sh lives one dir up.
   const speakSh = resolve(__dirname, '..', 'speak.sh');
+  // Notify target = the Mac to pop the macOS banner on (default MacBookPro).
+  const notifyTarget = process.env.ALEXA_BRIDGE_NOTIFY_TARGET || 'MacBookPro';
 
-  // Mirror the EXACT framing server.mjs uses so a CLI test is representative.
+  // Mirror the EXACT callback framing server.mjs uses (macOS notify + Telegram
+  // required; Echo speak-back optional) so a CLI test is representative.
   const content =
-    `[alexa] ${taskText} — when done, speak the result back to the Echo by running: `
-    + `bash ${speakSh} "<your concise result>". `
-    + `If the Echo speak-back fails it auto-falls-back to Telegram, so always run it. `
+    `[alexa] ${taskText}\n\n`
+    + `When you finish this task, report the result back to me over BOTH of these reliable channels (do BOTH, do not skip either):\n`
+    + `1. Pop a native macOS notification on the Mac I'm at by running: `
+    + `agent-bridge notify ${notifyTarget} --title "Alexa task done" --message "<your concise one-line result>" --sound default\n`
+    + `2. Send me a Telegram message with the FULL result (your normal Telegram reply path).\n`
+    + `Optionally, ONLY if the Echo speak-back is set up, you may ALSO announce a short result on the Echo by running: `
+    + `bash ${speakSh} "<your concise result>" — but this is optional/secondary; the macOS notification + Telegram are the required callbacks. `
     + `(Manual CLI test injection from the alexa-bridge extension.)`;
 
   inject({ content })

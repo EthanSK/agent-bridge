@@ -11,10 +11,13 @@
 //       file write — see src/inject.mjs).
 //     → We return a fast spoken ack ("On it — I'll let you know when it's
 //       done.") WELL within Alexa's ~8-second response deadline.
-//     → The Mini's Claude agent works as long as it needs, then runs
-//       speak.sh "<result>" to ANNOUNCE the result on the Echo (via the
-//       unofficial alexa_remote_control.sh API, which has NO 8s limit), with a
-//       Telegram fallback if Echo auth has lapsed.
+//     → The Mini's Claude agent works as long as it needs, then reports the
+//       result back over TWO RELIABLE callbacks (NO unofficial-API fragility):
+//         (1) a native macOS NOTIFICATION on the Mac Ethan is at, via the
+//             `agent-bridge notify <target> …` CLI (v4.8.0), and
+//         (2) a TELEGRAM message with the full result.
+//       Announcing on the Echo via speak.sh is now OPTIONAL/secondary — the loop
+//       works fully without the (fragile) Amazon cookie auth.
 //
 // ── THE 8-SECOND CONSTRAINT (the central design driver) ─────────────────────
 //   Alexa custom skills MUST return an HTTP response within ~8 seconds or Alexa
@@ -77,6 +80,13 @@ const PORT = Number(process.env.ALEXA_BRIDGE_PORT || 8787);
 const TARGET = process.env.ALEXA_BRIDGE_TARGET || 'claude-code/default';
 // TTL stamped on the injected message (the watcher consumes within ~2s anyway).
 const TTL_SECONDS = Number(process.env.ALEXA_BRIDGE_TTL || 86400);
+// Which machine to pop a native macOS notification on when the agent finishes
+// the Alexa-initiated task. This is the PRIMARY, reliable callback (the agent
+// runs `agent-bridge notify <target> …`, which SSHes to that Mac and renders a
+// banner there). Defaults to MacBookPro = the Mac Ethan is usually sitting at.
+// The resolved name is baked into the injected prompt so the agent knows exactly
+// which machine to notify.
+const NOTIFY_TARGET = process.env.ALEXA_BRIDGE_NOTIFY_TARGET || 'MacBookPro';
 // Optional shared secret (see SECURITY POSTURE above). Empty = no check.
 const SECRET = process.env.ALEXA_BRIDGE_SECRET || '';
 // Cap request body size to avoid abuse / memory blowups. Alexa bodies are tiny
@@ -183,16 +193,31 @@ function extractTaskText(body) {
 }
 
 // ── Build the fire-and-forget prompt we inject into Claude Code ──────────────
-// This is the message the running agent session SEES. It contains:
-//   1. The freeform task (prefixed [alexa] so the agent knows the source).
-//   2. An explicit instruction to speak the result back via speak.sh, including
-//      the absolute path, AND the note that speak.sh auto-falls-back to Telegram
-//      so the agent should ALWAYS run it (never skip the result report).
+// This is the message the running agent session SEES. The CALLBACK design here
+// was deliberately chosen to AVOID the fragile unofficial Echo speak-back as the
+// primary path. Instead the agent reports its result over TWO RELIABLE channels
+// (both shipped in agent-bridge v4.8.0 / dot-claude):
+//   1. A native macOS NOTIFICATION on the Mac Ethan is at, via the
+//      `agent-bridge notify <target> …` CLI verb. This SSHes to <target> and
+//      renders a banner there — zero unofficial-API fragility. We bake the
+//      resolved NOTIFY_TARGET (default MacBookPro, env-overridable) into the
+//      prompt so the agent knows exactly which machine to notify.
+//   2. A TELEGRAM message with the FULL result (same Telegram path speak.sh's
+//      fallback uses — always available).
+//   3. OPTIONAL/secondary: if the Echo is set up (Amazon cookie auth done), the
+//      agent MAY also run speak.sh to announce on the Echo — but this is a nicety,
+//      NOT required, and the loop works fully without it. That's why the cookie
+//      auth is no longer a blocker.
+// The prompt is prefixed [alexa] so the agent knows the source/trigger.
 function buildInjectContent(taskText) {
   return (
-    `[alexa] ${taskText} — when done, speak the result back to the Echo by running: `
-    + `bash ${SPEAK_SH} "<your concise result>". `
-    + `If the Echo speak-back fails it auto-falls-back to Telegram, so always run it.`
+    `[alexa] ${taskText}\n\n`
+    + `When you finish this task, report the result back to me over BOTH of these reliable channels (do BOTH, do not skip either):\n`
+    + `1. Pop a native macOS notification on the Mac I'm at by running: `
+    + `agent-bridge notify ${NOTIFY_TARGET} --title "Alexa task done" --message "<your concise one-line result>" --sound default\n`
+    + `2. Send me a Telegram message with the FULL result (your normal Telegram reply path).\n`
+    + `Optionally, ONLY if the Echo speak-back is set up, you may ALSO announce a short result on the Echo by running: `
+    + `bash ${SPEAK_SH} "<your concise result>" — but this is optional/secondary; the macOS notification + Telegram are the required callbacks.`
   );
 }
 
@@ -361,7 +386,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   log(`listening on http://0.0.0.0:${PORT}`);
   log(`  inject target: ${TARGET}`);
-  log(`  speak.sh:      ${SPEAK_SH}`);
+  log(`  notify target: ${NOTIFY_TARGET}  (macOS banner via 'agent-bridge notify' — PRIMARY callback)`);
+  log(`  speak.sh:      ${SPEAK_SH}  (Echo speak-back — OPTIONAL/secondary)`);
   log(`  secret gate:   ${SECRET ? 'ENABLED (?secret= or x-alexa-bridge-secret)' : 'disabled'}`);
   log(`  Alexa endpoint path: POST /alexa   (point your skill here, behind the public HTTPS tunnel)`);
 });

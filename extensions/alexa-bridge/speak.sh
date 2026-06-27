@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================================
-# speak.sh — the SPEAK-BACK leg of the Alexa fire-and-forget loop.
+# speak.sh — the OPTIONAL/SECONDARY Echo speak-back leg of the Alexa loop.
 #
 # Usage:  speak.sh "<text to announce on the Echo>"
 #
-# The Alexa receiver (src/server.mjs) injects a task into Claude Code and acks
-# fast. When the agent FINISHES the task, it runs THIS script to ANNOUNCE the
-# result on the Echo out-of-band — there is NO 8-second limit here because we
-# talk to Amazon's UNOFFICIAL voice/announcement API directly, not through the
-# Alexa skill request/response cycle.
+# ── IMPORTANT: this is NOT on the critical path. ─────────────────────────────
+# The PRIMARY result callbacks are reliable and live in src/server.mjs's injected
+# prompt: (1) a native macOS notification via `agent-bridge notify`, and (2) a
+# Telegram message with the full result. The whole loop works WITHOUT this script
+# and WITHOUT the Amazon cookie auth. This script is a nice-to-have that ALSO
+# announces the result on the Echo, for when the (fragile, unofficial) Echo
+# speak-back happens to be set up.
+#
+# When invoked, it ANNOUNCES the result on the Echo out-of-band — there is NO
+# 8-second limit here because we talk to Amazon's UNOFFICIAL voice/announcement
+# API directly, not through the Alexa skill request/response cycle.
 #
 # ── HOW THE SPEAK-BACK WORKS (external system: unofficial Amazon API) ────────
 #   We wrap thorsten-gehrig's `alexa_remote_control.sh`
