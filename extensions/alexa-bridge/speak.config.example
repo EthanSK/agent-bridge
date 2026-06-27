@@ -1,0 +1,13 @@
+# speak.config.example — copy to `speak.config` and fill in your values.
+#
+# speak.config is git-ignored (it names your specific Echo). speak.sh sources
+# this file (KEY="value" shell syntax) to resolve the speak-back target + tool
+# path. Env vars of the same name OVERRIDE these. See speak.sh for details.
+
+# The NAME of the Echo you want results announced on, exactly as it appears in
+# the Alexa app (Devices → your Echo). e.g. "Office", "Kitchen", "Echo Dot".
+ALEXA_DEVICE="Office"
+
+# Absolute path to thorsten-gehrig's alexa_remote_control.sh. The installer puts
+# it here by default; change only if you installed it elsewhere.
+ALEXA_REMOTE_CONTROL_SH="$HOME/.config/alexa_remote_control/alexa_remote_control.sh"

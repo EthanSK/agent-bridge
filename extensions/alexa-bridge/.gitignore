@@ -1,0 +1,4 @@
+node_modules/
+package-lock.json
+# Local-only: names your specific Echo device (do not commit).
+speak.config

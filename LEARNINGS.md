@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-27T21:48:27Z
+**Trigger:** alexa fire-and-forget agent loop build 2026-06-27
+**Symptom:** Want to speak a freeform task to an Amazon Echo and have an agent do it + report back, but Alexa custom skills must respond within ~8s while agent work takes minutes
+**Root cause:** N/A new feature. KEY DESIGN: fire-and-forget split — the Alexa request can ONLY ack (8s deadline), so inject the task via agent-bridge sendLocalMessage (fast atomic file write, does NOT await agent work) and return the ack immediately; the long result comes back on a SEPARATE leg (speak.sh) not bound by 8s. speak-back uses Amazon's UNOFFICIAL API (alexa_remote_control.sh) which is fragile (cookie expires ~2wk, Amazon can break it) so Telegram fallback is the guarantee. AMAZON.SearchQuery slots cannot be the entire utterance — need carrier words in samples.
+**Fix:** extensions/alexa-bridge: src/server.mjs (Node-stdlib HTTP receiver, POST /alexa fire-and-forget inject + fast ack, GET /health, optional ?secret= gate); src/inject.mjs (reuses build/inbox.js sendLocalMessage, robust path resolution, never raw-writes inbox); speak.sh (alexa_remote_control.sh -e speak: with auth-lapse detection + Telegram fallback); skill.json (interaction model); launchd KeepAlive agent + install.sh
+**Commit:** dcd645c
+**Guard:** Verified locally: /health 200, mock IntentRequest returns ack AND writes msg into inbox/claude-code/default via sendLocalMessage (log: delivered locally), speak.sh falls back to Telegram when arc.sh absent. inject failures caught -> graceful ack never an Alexa error. README documents speak-back fragility + Ethan-only Amazon cookie auth.
+---
+
+---
 **Date:** 2026-06-27T20:00:00Z
 **Trigger:** bridge_notify macOS-notify design build 2026-06-27
 **Symptom:** Needed a way to pop a native macOS notification on any paired Mac (tell the user an agent finished a task on whichever Mac they're at)

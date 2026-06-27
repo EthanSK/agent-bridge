@@ -1,0 +1,42 @@
+{
+  "//": "Alexa custom-skill INTERACTION MODEL. Paste this into the Alexa Developer Console → Build → Custom → Interaction Model → JSON Editor, then Save Model + Build Model. Invocation name 'my agent' → 'Alexa, ask my agent to <task>'. The freeform task is captured in an AMAZON.SearchQuery slot named 'query' and POSTed to the receiver, which extracts request.intent.slots.query.value (see src/server.mjs extractTaskText). NOTE: AMAZON.SearchQuery slots may ONLY be used in samples where they are NOT the entire utterance and are preceded by carrier words (Amazon constraint) — so the bare '{query}' catch-all is intentionally omitted; use a carrier phrase like 'ask my agent to ...'.",
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "my agent",
+      "intents": [
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "DelegateTaskIntent",
+          "slots": [
+            {
+              "name": "query",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "samples": [
+            "to {query}",
+            "{query}",
+            "ask my agent to {query}",
+            "tell my agent to {query}",
+            "have my agent {query}",
+            "get my agent to {query}",
+            "my agent should {query}",
+            "to please {query}"
+          ]
+        }
+      ],
+      "types": []
+    }
+  }
+}
