@@ -1,0 +1,23 @@
+{
+  "name": "agent-bridge-google-home-matter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Google Nest / Gemini-for-Home → agent-bridge bridge. Exposes config-driven virtual Matter devices (OnOff + dimmer); toggling/dimming one injects a routed message into the local machine's running Claude Code session via agent-bridge sendLocalMessage().",
+  "main": "src/server.mjs",
+  "bin": {
+    "agent-bridge-ghm": "src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "inject": "node src/inject.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@matter/main": "^0.17.3"
+  },
+  "author": "EthanSK",
+  "license": "MIT"
+}

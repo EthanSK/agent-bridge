@@ -1,0 +1,56 @@
+{
+  "//": "===================================================================",
+  "//1": "CONFIG-DRIVEN VIRTUAL MATTER DEVICES for the Google-Home → agent-bridge bridge.",
+  "//2": "Each entry becomes ONE virtual Matter device that shows up in the Google Home",
+  "//3": "app after commissioning. Saying 'Hey Google, turn on <name>' (or 'set <name> to",
+  "//4": "40%') flips that device's OnOff / LevelControl cluster, which fires a handler",
+  "//5": "that injects a message into the local machine's running Claude Code session.",
+  "//6": "EDIT THIS FILE to tune the trigger names + the prompts they inject. Restart the",
+  "//7": "Matter server after editing (LaunchAgent: `launchctl kickstart -k ...`). NOTE:",
+  "//8": "changing `name` or adding/removing devices changes the Matter node shape — Google",
+  "//9": "Home may need a re-sync (it usually picks up renames automatically; a brand new",
+  "//10": "device entry just appears as a new sub-device on the same bridge).",
+  "//11": "===================================================================",
+
+  "target": "claude-code/default",
+  "//target": "agent-bridge target the injected messages are delivered to on THIS machine. 'claude-code/default' = the default Claude Code persona's inbox (inbox/claude-code/default/). Change only if you run a non-default persona on the Mini.",
+
+  "ttlSeconds": 86400,
+  "//ttlSeconds": "TTL on each injected agent-bridge message. 86400 = 1 day; the watcher consumes it within ~2s anyway, so this is just a safety expiry.",
+
+  "fabricLabel": "agent-bridge-ghm",
+  "//fabricLabel": "Human-readable label Google shows for the Matter fabric/bridge.",
+
+  "devices": [
+    {
+      "name": "Claude",
+      "//name": "Spoken trigger name. 'Hey Google, turn on Claude'.",
+      "dimmable": true,
+      "//dimmable": "true = expose a LevelControl (dimmer) cluster so brightness 0-100% becomes an argument. false = plain on/off switch.",
+      "onTemplate": "[google-home] trigger=Claude state=on brightness={brightnessPct}. Brightness preset: {preset}. Interpret as a voice command routed from the Nest speaker. Preset 'A' (1-33%) = give me a current fleet status report. Preset 'B' (34-66%) = summarize what's currently running across my subagents. Preset 'C' (67-100%) = full deep status: fleet + subagents + any blockers needing my input. Act on the preset matching brightness {brightnessPct}%.",
+      "//onTemplate": "Prompt injected when the device is turned ON (or its level is set while on). Placeholders below are substituted at fire time.",
+      "offTemplate": "[google-home] trigger=Claude state=off. Interpret as a voice command routed from the Nest speaker = stand down / pause the current Claude preset task.",
+      "//offTemplate": "Prompt injected when the device is turned OFF. Omit to inject nothing on off.",
+      "presets": {
+        "//": "Optional brightness→label map. Used to fill the {preset} placeholder. Ranges are inclusive percentages. First matching range wins.",
+        "A": [1, 33],
+        "B": [34, 66],
+        "C": [67, 100]
+      }
+    },
+    {
+      "name": "Backup",
+      "dimmable": false,
+      "onTemplate": "[google-home] trigger=Backup state=on. Interpret as a voice command routed from the Nest speaker = kick off the Engineering Dopamine → Google Drive backup now.",
+      "offTemplate": ""
+    },
+    {
+      "name": "Standup",
+      "dimmable": false,
+      "onTemplate": "[google-home] trigger=Standup state=on. Interpret as a voice command routed from the Nest speaker = post a short daily status summary to my Telegram.",
+      "offTemplate": ""
+    }
+  ],
+
+  "//placeholders": "Template placeholders available in onTemplate/offTemplate: {name} = device name, {state} = on|off, {brightness} = raw Matter level 0-254, {brightnessPct} = 0-100, {preset} = matched preset label (or '' if none/not dimmable)."
+}

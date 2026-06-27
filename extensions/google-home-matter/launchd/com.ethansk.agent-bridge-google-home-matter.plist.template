@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent template for the agent-bridge google-home-matter Matter server.
+
+  This keeps the virtual Matter device server running on the Mini and brings it
+  back automatically after a crash or reboot, so the device stays advertised on
+  the LAN and reachable by Google Home without manual restarts.
+
+  Placeholders are filled in by install.sh:
+    __NODE_BIN__      → absolute path to node (e.g. /opt/homebrew/bin/node)
+    __SERVER_JS__     → absolute path to src/server.mjs in the checked-out repo
+    __WORKDIR__       → the extension dir (working directory)
+    __STORAGE_DIR__   → persistent Matter storage dir (commissioning state)
+    __LOG_DIR__       → where stdout/stderr logs go
+
+  KeepAlive + RunAtLoad = always-on supervisor. Matter commissioning state lives
+  in __STORAGE_DIR__ (a stable, persistent path) so a restart does NOT lose the
+  Google Home pairing — the node comes back already commissioned and just
+  resumes advertising over mDNS (_matter._tcp).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ethansk.agent-bridge-google-home-matter</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__NODE_BIN__</string>
+        <string>__SERVER_JS__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__WORKDIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Stable storage path = commissioning survives restarts/reboots. -->
+        <key>AGENT_BRIDGE_GHM_STORAGE</key>
+        <string>__STORAGE_DIR__</string>
+        <!-- Ensure node + any spawned tooling can find Homebrew binaries. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Start at login and keep it alive: respawn on crash, on reboot. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Matter needs LAN multicast/mDNS; Aqua session is fine for a user agent. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/google-home-matter.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/google-home-matter.err.log</string>
+</dict>
+</plist>
