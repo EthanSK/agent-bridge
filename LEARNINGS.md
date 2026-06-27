@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-27T22:05:13Z
+**Trigger:** alexa-bridge callback refinement (teammate session) 2026-06-27
+**Symptom:** Alexa fire-and-forget result callback should not depend on the fragile unofficial Echo speak-back
+**Root cause:** Design refinement. Echo speak-back (alexa_remote_control.sh) is unofficial + cookie expires ~2wk. The reliable replacement is agent-bridge v4.8.0's notify verb (native macOS banner, SSHes to target Mac) + a Telegram message. Both are official/reliable paths.
+**Fix:** src/server.mjs: NOTIFY_TARGET env (default MacBookPro) baked into buildInjectContent prompt -> agent runs 'agent-bridge notify <target> --title ... --message ... --sound default' AND Telegram, with speak.sh Echo demoted to optional. inject.mjs CLI mirrors it; speak.sh + README reframed (Echo optional, cookie auth not a blocker).
+**Commit:** da567a7
+**Guard:** Boot log prints notify target; injected prompt verified on Mini to carry notify+telegram-required + speak.sh-optional; agent-bridge notify confirmed present (v4.8.0). NOTE: a parallel teammate session pushed da567a7 on top of my 0f0f81a (which had the real source changes) — da567a7 only touched package-lock; final origin/main state correct. Watch for fast-forward races when two sessions ship the same refinement.
+---
+
+---
 **Date:** 2026-06-27T21:48:27Z
 **Trigger:** alexa fire-and-forget agent loop build 2026-06-27
 **Symptom:** Want to speak a freeform task to an Amazon Echo and have an agent do it + report back, but Alexa custom skills must respond within ~8s while agent work takes minutes
