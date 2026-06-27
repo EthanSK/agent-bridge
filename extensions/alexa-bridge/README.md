@@ -122,6 +122,16 @@ The Alexa endpoint is then `https://<host>.ts.net/alexa`.
 > permissions/attribute message, enable those in the admin console
 > (https://login.tailscale.com/admin) → DNS (MagicDNS + HTTPS certs) and ACLs
 > (`nodeAttrs` granting `funnel` to this node), then retry.
+>
+> **On Ethan's Mac Mini specifically:** `tailscaled` runs in
+> userspace-networking mode with a NON-default socket, so the CLI needs an
+> explicit `--socket` flag:
+> `tailscale --socket=/Users/ethansk/.local/share/tailscale/tailscaled.sock funnel --bg 8787`.
+> As of this deploy Funnel is **NOT yet enabled** on the tailnet — running it
+> printed: *"Funnel is not enabled on your tailnet. To enable, visit:
+> https://login.tailscale.com/f/funnel?node=nE3XVFaGcG11CNTRL"*. Ethan must open
+> that URL (one click, signed in) to grant the node Funnel; then the Mini's
+> stable endpoint becomes `https://mac-mini.tail52aa3c.ts.net/alexa`.
 
 ### Option B — cloudflared (fallback)
 
@@ -133,6 +143,15 @@ cloudflared tunnel --url http://localhost:8787
 This prints a `https://<random>.trycloudflare.com` URL (ephemeral — changes each
 run; for a stable URL set up a **named tunnel** with a Cloudflare account). The
 Alexa endpoint is `https://<random>.trycloudflare.com/alexa`.
+
+> ⚠️ **The quick tunnel is ephemeral and not supervised** — a `nohup
+> cloudflared …` started from a shell dies when that shell tree tears down, and
+> the URL changes on every restart (so you'd have to re-paste it into the Alexa
+> console each time). For a durable setup either (a) enable Tailscale Funnel
+> (preferred — stable URL, no extra service), or (b) create a cloudflared
+> **named tunnel** and run it under its own LaunchAgent (`brew services start
+> cloudflared` with a `~/.cloudflared/config.yml`). The quick tunnel is fine for
+> testing only.
 
 Confirm end-to-end: `curl -s https://<public-host>/health` should return the
 health JSON.
@@ -161,31 +180,40 @@ health JSON.
 logged-in Amazon **cookie**. Generating it requires **Ethan's Amazon login +
 2FA (OTP)** — no agent can complete this.
 
-The installer downloads the script to
-`~/.config/alexa_remote_control/alexa_remote_control.sh`. To authenticate:
+The installer (deploy step) already downloaded the script to
+`~/.config/alexa_remote_control/alexa_remote_control.sh` on the Mini (this is
+**v0.23**, which uses Amazon's modern **refresh-token** auth, not the old
+email/password cookie). To authenticate:
 
 ```bash
-# 1) Open the script and set your Amazon credentials + Alexa domain at the top
-#    (EMAIL=, PASSWORD=, AMAZON=amazon.co.uk / .com, ALEXA=alexa.amazon.co.uk):
-$EDITOR ~/.config/alexa_remote_control/alexa_remote_control.sh
+ARC=~/.config/alexa_remote_control/alexa_remote_control.sh
 
-# 2) Trigger a login — first invocation generates the cookie (it will prompt for
-#    your OTP / 2FA code if MFA is on):
-bash ~/.config/alexa_remote_control/alexa_remote_control.sh -a    # list devices
+# 1) Set your Amazon region domains near the top of the script. For a UK account:
+#       SET_AMAZON='amazon.co.uk'
+#       SET_ALEXA='alexa.amazon.co.uk'
+#    (defaults are the German .de domains — change them.)
+$EDITOR "$ARC"
 
-# 3) Confirm your Echo's name appears, then put it in speak.config:
+# 2) Generate the refresh token. v0.23 supports a guided login:
+bash "$ARC" -login
+#    Follow the prompts — this is where your Amazon EMAIL + PASSWORD + OTP/2FA
+#    are entered (only YOU can complete the 2FA). It writes the refresh token /
+#    cookie into ~/.alexa.* so subsequent runs are non-interactive.
+#    (Alternative: paste a SET_REFRESH_TOKEN='...' value into the script if you
+#    already have one from the alexa-cookie-cli / browser flow.)
+
+# 3) Confirm it works + see your Echo's exact name:
+bash "$ARC" -a            # list available devices
+
+# 4) Put that name into speak.config:
+cd ~/Projects/agent-bridge/extensions/alexa-bridge
 cp speak.config.example speak.config
-$EDITOR speak.config        # set ALEXA_DEVICE="<your Echo name>"
+$EDITOR speak.config       # set ALEXA_DEVICE="<your Echo name from step 3>"
 ```
 
-The cookie lives at `~/.alexa.cookie` (or `${TMP}/.alexa.cookie`) and
-**re-auths periodically (~every couple of weeks)** — when speak-back stops
-working, re-run step 2. Until then, results fall back to **Telegram**
-automatically.
-
-> Prefer the env-file approach? Some versions of `alexa_remote_control.sh` read
-> `EMAIL`/`PASSWORD` from the environment or a config file rather than inline —
-> check the header comments of the downloaded script for the exact variables.
+The token/cookie lives under `~/.alexa.*` and **re-auths periodically (~every
+couple of weeks)** — when speak-back stops working, re-run step 2. Until then,
+results fall back to **Telegram** automatically (so you never lose a result).
 
 ## Telegram fallback
 
