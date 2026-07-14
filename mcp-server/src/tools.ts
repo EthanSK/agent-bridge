@@ -26,7 +26,7 @@ import {
   DEFAULT_TTL_SECONDS,
   isValidTarget,
 } from './config.js';
-import { sshExec, sshPingDetailed } from './ssh.js';
+import { sshExec, sshExecWithEndpointFallback, sshPingDetailed } from './ssh.js';
 import {
   createMessage,
   sendMessage,
@@ -711,15 +711,25 @@ export function registerTools(server: McpServer): void {
       // Sequential (not Promise.all) on purpose: peers share the local SSH
       // client and the store is low-write-rate; simple + readable beats a few
       // hundred ms here. Failures collect into `failedPeers`, never throw.
+      //
+      // 4.9.1 — uses sshExecWithEndpointFallback (NOT plain sshExec): each
+      // peer has two addresses (LAN host + Tailscale internet_host) and either
+      // can be individually dead (stale LAN IP, flaky tailnet). Replication is
+      // an idempotent side-effect write (ingest dedupes by id), so trying the
+      // alternate address on a connection failure is strictly safe and fixed
+      // the real Mini↔MBP replication failures of 2026-07-14. See the helper's
+      // header in ssh.ts for the full rationale.
       const okPeers: string[] = [];
       const failedPeers: string[] = [];
       if (!no_push) {
         const remoteCmd = buildRemoteIngestCommand(entry);
         for (const m of loadConfig()) {
           try {
-            const res = await sshExec(m, remoteCmd, 15000);
+            const res = await sshExecWithEndpointFallback(m, remoteCmd, 15000);
             if (res.exitCode === 0) {
-              okPeers.push(m.name);
+              okPeers.push(
+                res.endpointUsed === 'fallback' ? `${m.name} (via LAN fallback)` : m.name,
+              );
             } else {
               failedPeers.push(`${m.name} (exit ${res.exitCode})`);
             }

@@ -363,6 +363,106 @@ export async function sshExec(
   return finalResult;
 }
 
+/** Result shape for sshExecWithEndpointFallback — SSHResult plus which endpoint won. */
+export interface SSHFallbackResult extends SSHResult {
+  /**
+   * Which endpoint actually served the command:
+   *   'preferred' — the normal 3.4.2+ single-endpoint choice worked.
+   *   'fallback'  — the preferred endpoint had a CONNECTION-layer failure and
+   *                 the alternate endpoint (the other of internet/LAN) served
+   *                 the command instead.
+   * Absent when both endpoints failed (result carries the LAST failure).
+   */
+  endpointUsed?: 'preferred' | 'fallback';
+}
+
+/**
+ * sshExecWithEndpointFallback — sshExec plus a one-shot ALTERNATE-ENDPOINT
+ * fallback for peer side-effect operations (4.9.1).
+ *
+ * WHY THIS EXISTS (real incident, 2026-07-14): learnings replication between
+ * the Mini and the MBP failed intermittently because each machine's config
+ * carries TWO addresses per peer — LAN `host` and Tailscale `internet_host` —
+ * and either one can be individually dead at any moment (stale LAN IP that
+ * nobody refreshes, e.g. MBP's advertised 192.168.1.208 going stale, or a
+ * flaky tailnet path when tailscaled is mid-flap / userspace-SOCKS is down).
+ * The 3.4.2+ single-endpoint policy ("Tailscale when configured, else LAN, no
+ * fallback") is the right default for STATUS checks — a probe should report
+ * the canonical path's real health, not mask it — but it is the WRONG policy
+ * for idempotent side-effect writes like learnings replication, where the
+ * caller only cares that the entry lands and dedupe-by-id makes double
+ * delivery harmless. This helper gives those callers "try the other address
+ * before giving up" semantics without changing the global policy for
+ * everything else.
+ *
+ * Discrimination is deliberately conservative: we fall back ONLY on an
+ * ssh-client CONNECTION failure (exit 255 + isConnectionFailure stderr
+ * sniffing) — never on a remote-command failure, which means the command
+ * already ran on the target and retrying it elsewhere would be wrong (and
+ * for non-idempotent callers, dangerous). Both attempts reuse sshExec's
+ * existing per-endpoint transient-retry loop.
+ */
+export async function sshExecWithEndpointFallback(
+  machine: MachineConfig,
+  command: string,
+  timeoutMs: number = 30000,
+): Promise<SSHFallbackResult> {
+  const preferredKind = preferredEndpointKind(machine);
+  const first = await sshExec(machine, command, timeoutMs);
+  if (first.exitCode === 0 || !(first.exitCode === 255 && isConnectionFailure(first.stderr))) {
+    // Success, or a REMOTE failure (command ran and failed on the target) —
+    // either way the preferred endpoint answered; no fallback.
+    return { ...first, endpointUsed: 'preferred' };
+  }
+
+  // Preferred endpoint is connection-dead. Compute the alternate endpoint:
+  // preferred can only be 'internet' when internetHost is configured, so the
+  // alternate is the LAN host — and vice versa is impossible by construction
+  // (no internetHost ⇒ preferred is already LAN ⇒ nothing to fall back to).
+  if (preferredKind !== 'internet') {
+    return first; // LAN-only peer: no second address exists.
+  }
+  const altHost = machine.host;
+  const altPort = machine.port;
+  if (!altHost || altHost === machine.internetHost) {
+    return first; // No distinct alternate — nothing sensible to try.
+  }
+
+  logWarn(
+    `SSH to ${machine.name} via internet (${machine.internetHost}) is connection-dead; `
+    + `falling back to LAN ${altHost}:${altPort} (endpoint-fallback path, 4.9.1)`,
+  );
+  // Mirror sshExec's transient-retry loop against the alternate endpoint.
+  let result: SSHResult | undefined;
+  for (let attempt = 0; attempt < RETRY_BACKOFFS_MS.length; attempt++) {
+    const backoff = RETRY_BACKOFFS_MS[attempt];
+    if (backoff > 0) await sleep(backoff);
+    result = await sshExecSingle(
+      machine, altHost, altPort, LAN_CONNECT_TIMEOUT_S, command, timeoutMs,
+    );
+    if (
+      result.exitCode === 255 &&
+      isConnectionFailure(result.stderr) &&
+      isTransientClientFailure(result.stderr) &&
+      attempt < RETRY_BACKOFFS_MS.length - 1
+    ) {
+      continue;
+    }
+    break;
+  }
+  const alt = result!;
+  if (alt.exitCode === 255 && isConnectionFailure(alt.stderr)) {
+    // Both endpoints dead — return the alternate's failure (most recent),
+    // with the preferred failure appended for diagnosis.
+    return {
+      ...alt,
+      stderr: `${alt.stderr}\n[endpoint-fallback] preferred (internet) also failed: ${first.stderr.trim().split('\n').pop() ?? ''}`,
+    };
+  }
+  try { writePathCache(machine.name, 'lan'); } catch { /* best effort */ }
+  return { ...alt, endpointUsed: 'fallback' };
+}
+
 /** Result of `sshPingDetailed` — reachability plus which path was used. */
 export interface SSHPingResult {
   reachable: boolean;
