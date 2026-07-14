@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-14T20:06:33Z
+**Trigger:** Coordinator relay of Mini Claude bridge msg-932bde33, 2026-07-14
+**Symptom:** learnings replication intermittently failed between Mini and MBP while bridge messaging worked across the same pair (Mini bridge report msg-932bde33, right after the 4.9.0 rollout)
+**Root cause:** Peer configs carry TWO addresses (LAN host= + Tailscale internet_host=) and either can be individually dead — stale LAN IP (NO self-heal exists for stale host= values; only manual 'agent-bridge config <m> --internet-host') or a flaky tailnet path. Replication picked ONE address (Tailscale-first, 3.4.2 no-fallback policy) and stranded when that address was down. Diagnostic wrinkle: an .lan alias section without internet_host is LAN-only forever, which is what made replication look 'LAN-only' in the Mini's investigation.
+**Fix:** 4.9.1: shared endpoint-fallback helper, mirrored bash/TS — sshExecWithEndpointFallback (mcp-server/src/ssh.ts) + fallback inside _learnings_remote_exec (bash), inherited by add push-on-write / sync / remove --fleet / bridge_learnings_add. Falls back internet→LAN ONLY on ssh connection-layer failure (exit 255; TS also sniffs stderr phrases), never on remote-command failure. Single-endpoint policy deliberately unchanged for status probes. PR #6, merge 4f3c157. E2E: Mini post-upgrade add auto-landed on MBP with no manual sync (garnet-77-meridian probe).
+**Commit:** 4f3c157
+**Guard:** mcp-server/test/ssh-endpoint-fallback.test.mjs (PATH-stubbed ssh: fallback on dead tailnet, no fallback on remote-cmd failure or healthy preferred, both-dead diagnostics) + test/cli-learnings.sh cases 11-12; meta-learning also recorded IN the shared store itself (id 3aea6717)
+---
+
+---
 **Date:** 2026-07-14T19:34:44Z
 **Trigger:** Ethan voice: global agent bridge shared context feature build 2026-07-14
 **Symptom:** Needed a fleet-wide SHARED CONTEXT store: learnings/findings any agent on any paired machine can search + must contribute globally-applicable learnings to (the missing layer above per-repo LEARNINGS.md and per-harness memory)
