@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-14T20:43:06Z
+**Trigger:** Ethan voice via coordinator, 2026-07-14: brain is an ADDITION, not a replacement — agents must not put memories there instead of their original location
+**Symptom:** Shipped 4.9.0 shared-context wording could be misread as memory ROUTING (either shared store OR native memory) — Ethan flagged the danger: agents might skip harness-native memory writes because they wrote to the shared store
+**Root cause:** The scope-discipline line ('project-local fixes belong in LEARNINGS.md; harness-private notes belong in harness memory') framed destinations as either/or without stating the store is strictly additive. Nothing anywhere said 'never skip the native write'.
+**Fix:** 4.9.2 (PR #7): explicit ADDITIVE-ONLY paragraph on every instruction surface — mcp-server/src/index.ts SHARED CONTEXT section (right after the MUST-record line), bridge_learnings_add/search tool text, CLI learnings help, README callout, INSTRUCTIONS.md, AGENTS.md, skills/bridge, skills/openclaw, site card. Scope lines rephrased from routing to copy-on-top ('stays there; the store adds a fleet-wide COPY on top'). Principle also seeded INTO the shared store itself (id 0192270c). Wording-only, no code paths.
+**Commit:** a872f20
+**Guard:** The rule now lives in the MCP instructions every connected agent reads at session start + the store entry 0192270c that any agent searching 'memory' will hit; future wording edits should preserve the ADDITIVE ONLY paragraph verbatim
+---
+
+---
 **Date:** 2026-07-14T20:06:33Z
 **Trigger:** Coordinator relay of Mini Claude bridge msg-932bde33, 2026-07-14
 **Symptom:** learnings replication intermittently failed between Mini and MBP while bridge messaging worked across the same pair (Mini bridge report msg-932bde33, right after the 4.9.0 rollout)
