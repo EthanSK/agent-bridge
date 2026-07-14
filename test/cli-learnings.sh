@@ -134,4 +134,53 @@ grep -qF 'learnings\ ingest\ --json' "$TMP/ssh-args.txt" || { echo "FAIL: push d
 grep -q "test@192.0.2.1" "$TMP/ssh-args.txt" || { echo "FAIL: push did not target the peer"; exit 1; }
 echo "ok 10 - push-on-write"
 
+# --- 11. (4.9.1) coordinator scenario: dead LAN host + working internet_host --
+# Tailscale-first preference: with internet_host configured, the (dead) LAN
+# host must never even be tried — the push goes straight to the tailnet addr.
+cat >"$TMP/.agent-bridge/config" <<CFG
+[TailnetPeer]
+host=192.0.2.66
+user=test
+port=22
+internet_host=100.66.0.6
+CFG
+# Smarter ssh stub for the endpoint tests: succeed/fail by target host token,
+# emitting client-style connection-failure text + exit 255 for dead endpoints
+# (mirrors real ssh, which the bash fallback discriminates on via exit code).
+cat >"$TMP/bin/ssh" <<SSH
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in test@*) target="\$a";; esac; done
+printf '%s\n' "\$target" >> "$TMP/ssh-targets.txt"
+case "\$target" in
+  test@100.66.0.6) exit 0 ;;                                                        # healthy tailnet
+  test@192.0.2.77) exit 0 ;;                                                        # healthy LAN
+  *) echo "ssh: connect to host \$target port 22: Operation timed out" >&2; exit 255 ;;  # dead
+esac
+SSH
+chmod +x "$TMP/bin/ssh"
+rm -f "$TMP/ssh-targets.txt"
+OUT="$(run_cli learnings add --title "tailnet-first push" --body "b" 2>&1)"
+printf '%s' "$OUT" | grep -q "replicated to TailnetPeer" || { echo "FAIL: push should succeed via internet_host: $OUT"; exit 1; }
+grep -q "test@100.66.0.6" "$TMP/ssh-targets.txt" || { echo "FAIL: internet endpoint not used"; exit 1; }
+grep -q "test@192.0.2.66" "$TMP/ssh-targets.txt" && { echo "FAIL: dead LAN host should not be tried when internet works"; exit 1; }
+echo "ok 11 - dead LAN + working internet (tailnet-first, no LAN attempt)"
+
+# --- 12. (4.9.1) endpoint FALLBACK: dead internet_host → retry via LAN -------
+# The inverse failure (real 2026-07-14 incident shape): the preferred tailnet
+# endpoint is connection-dead (exit 255) but the LAN address works — the push
+# must fall back and land instead of stranding until a manual sync.
+cat >"$TMP/.agent-bridge/config" <<CFG
+[FlakyTailnetPeer]
+host=192.0.2.77
+user=test
+port=22
+internet_host=100.99.99.9
+CFG
+rm -f "$TMP/ssh-targets.txt"
+OUT="$(run_cli learnings add --title "fallback push" --body "b" 2>&1)"
+printf '%s' "$OUT" | grep -q "replicated to FlakyTailnetPeer" || { echo "FAIL: push should succeed via LAN fallback: $OUT"; exit 1; }
+grep -q "test@100.99.99.9" "$TMP/ssh-targets.txt" || { echo "FAIL: preferred internet endpoint was not tried first"; exit 1; }
+grep -q "test@192.0.2.77" "$TMP/ssh-targets.txt" || { echo "FAIL: LAN fallback endpoint was not tried"; exit 1; }
+echo "ok 12 - internet dead → LAN fallback lands the push"
+
 echo "ALL cli-learnings tests passed"

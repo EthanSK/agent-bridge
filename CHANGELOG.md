@@ -1,5 +1,15 @@
 # Changelog
 
+## agent-bridge 4.9.1 — 2026-07-14
+
+Real bug found by Mini Claude minutes after the 4.9.0 rollout: learnings replication between peers failed when the single configured endpoint it tried was dead, even though the OTHER address for the same peer worked (each peer carries a LAN `host` plus a Tailscale `internet_host`, and either can be individually dead — a stale LAN IP nobody refreshes, or a flaky tailnet path). Bridge messaging kept working across the same pair, which made replication the odd one out.
+
+- **Endpoint fallback for learnings replication.** New shared helper `sshExecWithEndpointFallback` (mcp-server/src/ssh.ts) — runs the normal Tailscale-first preferred endpoint, and on an ssh CONNECTION-layer failure (exit 255 + client-emitted failure phrases) retries once against the distinct alternate address (internet → LAN). Never falls back on a remote-command failure (the command already ran on the peer). The bash twin lives inside `_learnings_remote_exec` (exit-255 discrimination — our remote CLI never exits 255) so `add` push-on-write, `sync`, and `remove --fleet` all inherit it. Safe because every learnings peer op is idempotent by entry id.
+- **Scope discipline:** the 3.4.2+ single-endpoint policy is unchanged for everything else (status probes should report the canonical path's real health, not mask it); only learnings replication opts into fallback.
+- **Stale LAN `host=` self-heal:** confirmed none exists (manual `agent-bridge config <m> --internet-host` is the only lever) — deliberately NOT building one; the fallback makes it moot for replication.
+- **Tests.** `mcp-server/test/ssh-endpoint-fallback.test.mjs` (PATH-stubbed ssh: fallback on dead tailnet, no fallback when preferred works or when the remote command itself fails, both-dead diagnostics, coordinator's dead-LAN+working-internet scenario) + `test/cli-learnings.sh` cases 11–12 (tailnet-first skips dead LAN; dead internet falls back to LAN and the push lands).
+- **Version bumps.** CLI / MCP server / plugin metadata → `4.9.1` lockstep. No wire-format changes.
+
 ## agent-bridge 4.9.0 — 2026-07-14
 
 SHARED CONTEXT: a fleet-wide learnings store. The fleet already had per-repo institutional memory (each repo's `LEARNINGS.md`) and per-harness memory (Claude Code auto-memory, OpenClaw workspace rules); this adds the missing GLOBAL layer — learnings/findings that apply to ANY agent on ANY machine (OS gotchas, infra fix recipes, auth/API quirks, cross-machine workflows), searchable and contributable from every harness.

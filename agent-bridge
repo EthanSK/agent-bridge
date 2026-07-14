@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.9.0"
+VERSION="4.9.1"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -2365,9 +2365,31 @@ _learnings_render() {
 }
 
 # _learnings_remote_exec <machine> <inner-cmd> [<stdin-file>]
-# Run the PEER's own agent-bridge CLI over SSH. Endpoint selection mirrors
-# cmd_notify/cmd_run exactly: Tailscale-first (internet_host), else LAN, no
-# fallback. The inner command gets the PATH-prepend wrap because the SSH
+# Run the PEER's own agent-bridge CLI over SSH — THE shared transport helper
+# for every learnings peer op (add's push-on-write, sync's pull+push, and
+# remove --fleet all go through here, so endpoint behavior stays uniform).
+#
+# ENDPOINT SELECTION + FALLBACK (4.9.1): preferred endpoint mirrors the
+# messaging layer's Tailscale-first policy (internet_host when configured,
+# else LAN host). NEW in 4.9.1: if the preferred endpoint has a CONNECTION-
+# layer failure (ssh exit 255), we retry ONCE against the alternate address
+# (internet preferred → LAN fallback). Rationale (real incident 2026-07-14):
+# each peer carries TWO addresses and either can be individually dead — a
+# stale LAN host= nobody refreshes (there is NO self-heal for stale LAN IPs;
+# only manual `agent-bridge config <m> --internet-host`), or a flaky tailnet
+# path. Learnings ops are idempotent side-effect writes (ingest dedupes by
+# id), so trying the other address is strictly safe. This mirrors
+# sshExecWithEndpointFallback in mcp-server/src/ssh.ts — keep the two
+# behaviorally identical.
+#
+# 255-DISCRIMINATION NOTE: exit 255 is ssh's own failure code. The remote
+# agent-bridge CLI never exits 255 (die → exit 1, ingest → 0/1), so 255 here
+# reliably means "connection failed", not "remote command failed" — we never
+# re-run a command that actually reached the peer. (The TS twin additionally
+# sniffs stderr; bash keeps the simpler exit-code contract because the remote
+# command set is our own CLI with known exit codes.)
+#
+# The inner command gets the PATH-prepend wrap because the SSH
 # non-interactive shell has a minimal PATH that misses ~/.local/bin and
 # /opt/homebrew/bin (a login shell does NOT help — zsh sets PATH in ~/.zshrc
 # which `sh -lc` never sources); without it: exit 127 despite agent-bridge
@@ -2384,29 +2406,55 @@ _learnings_remote_exec() {
   internet_host="$(cfg_get "$machine_name" internet_host 2>/dev/null || true)"
   internet_port="$(cfg_get "$machine_name" internet_port 2>/dev/null || printf '22')"
 
-  local try_host try_port
+  # Preferred endpoint (Tailscale-first) + the alternate for 255-fallback.
+  # alt_host stays empty when there is no DISTINCT second address (LAN-only
+  # peer, or internet_host mistakenly set to the same IP) — no fallback then.
+  local try_host try_port alt_host alt_port
   if [ -n "$internet_host" ]; then
     try_host="$internet_host"; try_port="$internet_port"
+    if [ -n "$host" ] && [ "$host" != "$internet_host" ]; then
+      alt_host="$host"; alt_port="$port"
+    else
+      alt_host=""; alt_port=""
+    fi
   else
     try_host="$host"; try_port="$port"
+    alt_host=""; alt_port=""   # no internet_host ⇒ nothing to fall back to
   fi
 
   local with_path remote_cmd
   with_path="export PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\"; $inner_cmd"
   remote_cmd="sh -c $(qq "$with_path")"
 
-  local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "ConnectTimeout=10" "-p" "$try_port" "-o" "LogLevel=ERROR")
-  if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
-    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
-  fi
-  args+=("${user}@${try_host}" "$remote_cmd")
+  # _learnings_ssh_once <host> <port> — one attempt against one endpoint.
+  # stdout streams through to the caller (sync's pull captures it); a failed
+  # connection writes nothing to stdout, so a fallback retry can't pollute
+  # the captured output of the eventual success.
+  _learnings_ssh_once() {
+    local h="$1" p="$2"
+    local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "ConnectTimeout=10" "-p" "$p" "-o" "LogLevel=ERROR")
+    if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
+      args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
+    fi
+    args+=("${user}@${h}" "$remote_cmd")
+    if [ -n "$stdin_file" ]; then
+      ssh "${args[@]}" < "$stdin_file"
+    else
+      # </dev/null so ssh can't eat the caller's stdin inside while-read loops.
+      ssh "${args[@]}" </dev/null
+    fi
+  }
 
-  if [ -n "$stdin_file" ]; then
-    ssh "${args[@]}" < "$stdin_file"
-  else
-    # </dev/null so ssh can't eat the caller's stdin inside while-read loops.
-    ssh "${args[@]}" </dev/null
+  local rc=0
+  _learnings_ssh_once "$try_host" "$try_port" || rc=$?
+  # Fallback ONLY on ssh's own connection-failure code (see header) and only
+  # when a distinct alternate address exists.
+  if [ "$rc" -eq 255 ] && [ -n "$alt_host" ]; then
+    log_event warn "cli.learnings.endpoint_fallback" "preferred endpoint dead, retrying via LAN" "{\"machine\":\"$machine_name\",\"preferred\":\"$try_host\",\"fallback\":\"$alt_host\"}"
+    rc=0
+    _learnings_ssh_once "$alt_host" "$alt_port" || rc=$?
   fi
+  return "$rc"
 }
 
 _learnings_add() {
