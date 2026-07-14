@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.8.0"
+VERSION="4.9.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -125,6 +125,12 @@ CONFIG_DIR="${AGENT_BRIDGE_CONFIG_DIR_OVERRIDE:-$HOME/.agent-bridge}"
 CONFIG_FILE="$CONFIG_DIR/config"
 KEYS_DIR="$CONFIG_DIR/keys"
 PATH_CACHE_FILE="$CONFIG_DIR/path-cache.json"
+# 4.9.0 SHARED CONTEXT — fleet-wide learnings store (append-only NDJSON, one
+# JSON object per line, deduped by lowercase-uuid `id`). Every machine holds a
+# full replica; see `cmd_learnings` for the add/search/sync verbs and the
+# mcp-server's learnings.ts for the mirrored TS implementation + full design
+# rationale (push-on-write over sshExec + pull-reconcile via `learnings sync`).
+LEARNINGS_FILE="$CONFIG_DIR/shared-context/learnings.ndjson"
 
 # Legacy cache TTL. 3.4.2+ endpoint selection does not use this cache.
 PATH_CACHE_TTL_SECS="${AGENT_BRIDGE_PATH_CACHE_TTL:-3600}"
@@ -2270,6 +2276,505 @@ cmd_notify_help() {
   printf '  agent-bridge notify Ethans-Mac-mini --title "Done" --message "task finished" --sound default\n'
 }
 
+# =============================================================================
+# learnings — SHARED CONTEXT: the fleet-wide learnings store (4.9.0+)
+# =============================================================================
+#
+# A GLOBAL layer of institutional memory on top of the existing per-repo
+# LEARNINGS.md files and per-harness memories: learnings that apply to ANY
+# agent on ANY machine (OS gotchas, infra fix recipes, auth quirks, tool
+# behaviors) live here and replicate across every paired machine.
+#
+# STORAGE: $LEARNINGS_FILE — append-only NDJSON (same style as the unified
+# event log). Entry fields: id (LOWERCASE uuid — mirrors the bridge-message
+# convention where uppercase ids get quarantined), ts, machine, harness,
+# title, body, tags[], scope="global", v=1.
+#
+# REPLICATION MODEL (idempotent by id, mirrors bridge_notify's architecture):
+#   • `add` appends locally then best-effort SSHes each paired peer and runs
+#     the PEER's own `agent-bridge learnings ingest --json '<entry>'` — the
+#     remote owns its store writes/dedupe; we never touch its file directly.
+#     A replica write is a SIDE EFFECT, not an agent message, so it must NOT
+#     ride the inbox/watcher path (that needs a live remote channel-owner).
+#   • Offline peers just miss the push; `sync` reconciles bidirectionally on
+#     next contact (fetch remote lines, union by id both ways). Because
+#     ingest dedupes by id, replays are always harmless.
+#
+# The store logic is MIRRORED in mcp-server/src/learnings.ts (used by the
+# bridge_learnings_* MCP tools for local ops). Keep validation/merge semantics
+# in the two implementations behaviorally identical — same contract as the
+# notify renderer pair (_render_local_notification / renderLocalNotification).
+# =============================================================================
+
+# jq is required for all learnings verbs (JSON validation/normalization).
+# The core bridge verbs stay jq-optional; learnings is a power feature and
+# every fleet machine has jq, so a clear die beats a fragile sed fallback.
+_learnings_require_jq() {
+  command -v jq >/dev/null 2>&1 || die "learnings requires jq (brew install jq)"
+}
+
+# Print all existing entry ids, one per line (empty when no store yet).
+_learnings_ids() {
+  [ -f "$LEARNINGS_FILE" ] || return 0
+  jq -r '.id // empty' "$LEARNINGS_FILE" 2>/dev/null || true
+}
+
+# _learnings_append_line <json-line>
+# Validate + normalize + dedupe + append ONE entry. This is THE single write
+# path for every ingest source (add / ingest --json / ingest --stdin / sync)
+# so validation can't be bypassed. Echoes one of: ingested / duplicate /
+# invalid — callers count these for their summaries. Never dies on a bad
+# entry (a bad line in a batch must not abort the rest of the batch).
+_learnings_append_line() {
+  local raw="$1" norm id
+  # Normalize to one compact line + enforce required fields + lowercase the id
+  # defensively (hand-crafted uppercase ids would break cross-machine dedupe
+  # the same way uppercase bridge-message ids break routing).
+  norm="$(printf '%s' "$raw" | jq -c '
+    if (type == "object") and (.id | type == "string") and (.id != "")
+       and (.title | type == "string") and (.title != "")
+       and (.body | type == "string")
+    then .id |= ascii_downcase
+       | .tags = ((.tags // []) | map(ascii_downcase))
+       | .scope = (.scope // "global")
+       | .v = (.v // 1)
+    else error("missing required fields")
+    end' 2>/dev/null)" || { printf 'invalid\n'; return 0; }
+  [ -n "$norm" ] || { printf 'invalid\n'; return 0; }
+  id="$(printf '%s' "$norm" | jq -r '.id')"
+  # Dedupe BEFORE appending — what makes replication replays idempotent.
+  if _learnings_ids | grep -qxF "$id"; then
+    printf 'duplicate\n'
+    return 0
+  fi
+  mkdir -p "$(dirname "$LEARNINGS_FILE")"
+  # Single-line append — atomic enough at this size/write-rate; the read
+  # paths (jq with 2>/dev/null || true) skip corrupt lines defensively.
+  printf '%s\n' "$norm" >> "$LEARNINGS_FILE"
+  printf 'ingested\n'
+}
+
+# _learnings_render — pretty-print NDJSON entries from stdin, one block per
+# entry. Layout intentionally matches formatLearning() in learnings.ts so CLI
+# and MCP-tool output look the same to agents.
+_learnings_render() {
+  jq -r '"— " + .title + "\n  " + .ts + "  ·  " + .machine + "/" + .harness
+         + "  ·  id: " + .id
+         + (if ((.tags // []) | length) > 0 then "  tags: " + ((.tags // []) | join(", ")) else "" end)
+         + "\n" + ((.body // "") | split("\n") | map("  " + .) | join("\n")) + "\n"' 2>/dev/null || true
+}
+
+# _learnings_remote_exec <machine> <inner-cmd> [<stdin-file>]
+# Run the PEER's own agent-bridge CLI over SSH. Endpoint selection mirrors
+# cmd_notify/cmd_run exactly: Tailscale-first (internet_host), else LAN, no
+# fallback. The inner command gets the PATH-prepend wrap because the SSH
+# non-interactive shell has a minimal PATH that misses ~/.local/bin and
+# /opt/homebrew/bin (a login shell does NOT help — zsh sets PATH in ~/.zshrc
+# which `sh -lc` never sources); without it: exit 127 despite agent-bridge
+# being installed. Optional stdin-file is streamed to the remote command
+# (used by sync's batch push into `learnings ingest --stdin`).
+_learnings_remote_exec() {
+  local machine_name="$1" inner_cmd="$2" stdin_file="${3:-}"
+
+  local host user port keypath internet_host internet_port
+  host="$(cfg_get "$machine_name" host)"
+  user="$(cfg_get "$machine_name" user)"
+  port="$(cfg_get "$machine_name" port 2>/dev/null || printf '22')"
+  keypath="$(cfg_identity_file "$machine_name")"
+  internet_host="$(cfg_get "$machine_name" internet_host 2>/dev/null || true)"
+  internet_port="$(cfg_get "$machine_name" internet_port 2>/dev/null || printf '22')"
+
+  local try_host try_port
+  if [ -n "$internet_host" ]; then
+    try_host="$internet_host"; try_port="$internet_port"
+  else
+    try_host="$host"; try_port="$port"
+  fi
+
+  local with_path remote_cmd
+  with_path="export PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\"; $inner_cmd"
+  remote_cmd="sh -c $(qq "$with_path")"
+
+  local args=("-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=/dev/null" "-o" "ConnectTimeout=10" "-p" "$try_port" "-o" "LogLevel=ERROR")
+  if [ -n "$keypath" ] && [ "$keypath" != "(system default)" ]; then
+    args+=("-i" "$keypath" "-o" "IdentitiesOnly=yes")
+  fi
+  args+=("${user}@${try_host}" "$remote_cmd")
+
+  if [ -n "$stdin_file" ]; then
+    ssh "${args[@]}" < "$stdin_file"
+  else
+    # </dev/null so ssh can't eat the caller's stdin inside while-read loops.
+    ssh "${args[@]}" </dev/null
+  fi
+}
+
+_learnings_add() {
+  local title="" body="" tags="" harness="" no_push=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title)     title="$2"; shift 2 ;;
+      --title=*)   title="${1#*=}"; shift ;;
+      --body)      body="$2"; shift 2 ;;
+      --body=*)    body="${1#*=}"; shift ;;
+      --tags)      tags="$2"; shift 2 ;;
+      --tags=*)    tags="${1#*=}"; shift ;;
+      --harness)   harness="$2"; shift 2 ;;
+      --harness=*) harness="${1#*=}"; shift ;;
+      --no-push)   no_push=1; shift ;;
+      --help|-h)   cmd_learnings_help; exit 0 ;;
+      *)           die "Unknown option: $1 (try: agent-bridge learnings --help)" ;;
+    esac
+  done
+  [ -n "$title" ] || die "--title is required. Usage: agent-bridge learnings add --title <t> --body <b> [--tags a,b] [--harness h] [--no-push]"
+  [ -n "$body" ]  || die "--body is required. Usage: agent-bridge learnings add --title <t> --body <b> [--tags a,b] [--harness h] [--no-push]"
+
+  # Harness attribution: explicit flag > AGENT_BRIDGE_HARNESS env (set by
+  # harness wrappers) > "cli" (a human or unlabelled agent at a shell).
+  [ -n "$harness" ] || harness="${AGENT_BRIDGE_HARNESS:-cli}"
+
+  # LOWERCASE uuid — mirrors the bridge-message id convention (uppercase ids
+  # get quarantined there; here they'd silently break cross-machine dedupe).
+  local id ts machine entry
+  id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  machine="$(get_machine_name)"
+  # jq -n builds the entry so free-form title/body/tags are JSON-escaped
+  # correctly no matter what characters they contain.
+  entry="$(jq -nc \
+    --arg id "$id" --arg ts "$ts" --arg machine "$machine" \
+    --arg harness "$harness" --arg title "$title" --arg body "$body" \
+    --arg tags "$tags" \
+    '{id: $id, ts: $ts, machine: $machine, harness: $harness,
+      title: $title, body: $body,
+      tags: ($tags | if . == "" then [] else split(",") | map(ascii_downcase | gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))
+                     | reduce .[] as $t ([]; if index($t) then . else . + [$t] end) end),
+      scope: "global", v: 1}')"
+
+  local result
+  result="$(_learnings_append_line "$entry")"
+  [ "$result" = "ingested" ] || die "internal error: freshly-created entry was $result"
+  ok "learning recorded (id: $id)"
+  log_event info "cli.learnings.add" "learning recorded" "{\"learning_id\":\"$id\"}"
+
+  # -- push-on-write to every paired peer (best-effort, never fatal) ---------
+  if [ "$no_push" -eq 1 ]; then
+    dim "replication skipped (--no-push). Peers will catch up via 'learnings sync'."
+    exit 0
+  fi
+  local names name push_fail=0
+  names="$(cfg_list_names)"
+  if [ -z "$names" ]; then
+    dim "no paired machines to replicate to."
+    exit 0
+  fi
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    printf "${DIM}  replicating to %s...${RESET}\n" "$name"
+    # The entry JSON is qq-quoted (printf %q) — free-form body text survives
+    # the remote shell re-parse intact. Same rule as notify: quote EVERY
+    # free-form field that enters an SSH command string.
+    if _learnings_remote_exec "$name" "agent-bridge learnings ingest --json $(qq "$entry")" >/dev/null 2>&1; then
+      ok "replicated to $name"
+    else
+      # Not fatal: peer offline or running a pre-4.9.0 CLI without the verb.
+      # Either way `learnings sync` heals it later (idempotent by id).
+      printf "${YELLOW}  could not replicate to %s (offline or pre-4.9.0 CLI) — will catch up via 'learnings sync'.${RESET}\n" "$name"
+      push_fail=1
+      log_event warn "cli.learnings.push_failed" "learning push failed" "{\"learning_id\":\"$id\",\"machine\":\"$name\"}"
+    fi
+  done <<< "$names"
+  # Exit 0 even on partial push — the local write (source of truth for this
+  # entry) succeeded, and sync reconciles the rest. Callers who care already
+  # saw the per-peer lines.
+  exit 0
+}
+
+_learnings_search() {
+  _learnings_require_jq
+  local query="" tag="" limit=20 as_json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tag)     tag="$2"; shift 2 ;;
+      --tag=*)   tag="${1#*=}"; shift ;;
+      --limit)   limit="$2"; shift 2 ;;
+      --limit=*) limit="${1#*=}"; shift ;;
+      --json)    as_json=1; shift ;;
+      --help|-h) cmd_learnings_help; exit 0 ;;
+      -*)        die "Unknown option: $1 (try: agent-bridge learnings --help)" ;;
+      *)         if [ -z "$query" ]; then query="$1"; else query="$query $1"; fi; shift ;;
+    esac
+  done
+  case "$limit" in ''|*[!0-9]*) die "--limit must be a positive integer" ;; esac
+  if [ ! -f "$LEARNINGS_FILE" ]; then
+    dim "no shared-context learnings recorded yet (store: $LEARNINGS_FILE)"
+    exit 0
+  fi
+  # Filter: case-insensitive substring across title/body/tags, optional exact
+  # tag match — identical semantics to searchLearnings() in learnings.ts.
+  # `-s` slurps so we can reverse to newest-first + apply the limit.
+  local out
+  out="$(jq -cs --arg q "$query" --arg tag "$tag" --argjson limit "$limit" '
+    [ .[]
+      | select(($tag == "") or ((.tags // []) | index($tag) != null))
+      | select(($q == "") or
+          ((.title + "\n" + .body + "\n" + ((.tags // []) | join(" "))) | ascii_downcase | contains($q | ascii_downcase)))
+    ] | reverse | .[:$limit] | .[]' "$LEARNINGS_FILE" 2>/dev/null || true)"
+  if [ -z "$out" ]; then
+    dim "no matching shared-context learnings${query:+ for \"$query\"}."
+    dim "if you solve this yourself and it applies fleet-wide, record it: agent-bridge learnings add"
+    exit 0
+  fi
+  if [ "$as_json" -eq 1 ]; then
+    printf '%s\n' "$out"
+  else
+    printf '%s\n' "$out" | _learnings_render
+  fi
+}
+
+_learnings_list() {
+  # list = search with no query. --json prints RAW store lines (oldest-first
+  # file order) because sync uses it as the bulk-fetch endpoint and wants the
+  # unmodified NDJSON; the human view goes through the same newest-first path
+  # as search.
+  local as_json=0 rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      *)      rest+=("$1"); shift ;;
+    esac
+  done
+  if [ "$as_json" -eq 1 ]; then
+    [ -f "$LEARNINGS_FILE" ] && cat "$LEARNINGS_FILE"
+    exit 0
+  fi
+  _learnings_search --limit 1000 ${rest[@]+"${rest[@]}"}
+}
+
+_learnings_show() {
+  _learnings_require_jq
+  local id="${1:-}"
+  [ -n "$id" ] || die "Usage: agent-bridge learnings show <id>"
+  [ -f "$LEARNINGS_FILE" ] || die "no learnings store at $LEARNINGS_FILE"
+  local line
+  # `|| true` guards set -e/pipefail: head -1 closing the pipe early SIGPIPEs
+  # jq, which would otherwise fail the assignment and kill the script.
+  line="$(jq -c --arg id "$id" 'select(.id == ($id | ascii_downcase))' "$LEARNINGS_FILE" 2>/dev/null | head -1 || true)"
+  [ -n "$line" ] || die "no learning with id $id"
+  printf '%s\n' "$line" | _learnings_render
+}
+
+_learnings_ingest() {
+  _learnings_require_jq
+  local json="" use_stdin=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json)    json="$2"; shift 2 ;;
+      --json=*)  json="${1#*=}"; shift ;;
+      --stdin)   use_stdin=1; shift ;;
+      --help|-h) cmd_learnings_help; exit 0 ;;
+      *)         die "Unknown option: $1 (try: agent-bridge learnings --help)" ;;
+    esac
+  done
+  [ -n "$json" ] || [ "$use_stdin" -eq 1 ] || die "Usage: agent-bridge learnings ingest --json '<entry>' | --stdin"
+
+  # Counters summarize the batch; individual bad lines never abort it (a peer
+  # replaying a mixed batch must land everything it can).
+  local ingested=0 duplicate=0 invalid=0 line result
+  process_line() {
+    result="$(_learnings_append_line "$1")"
+    case "$result" in
+      ingested)  ingested=$((ingested + 1)) ;;
+      duplicate) duplicate=$((duplicate + 1)) ;;
+      *)         invalid=$((invalid + 1)) ;;
+    esac
+  }
+  if [ -n "$json" ]; then
+    process_line "$json"
+  fi
+  if [ "$use_stdin" -eq 1 ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -z "$line" ] && continue
+      process_line "$line"
+    done
+  fi
+  printf 'ingested=%d duplicate=%d invalid=%d\n' "$ingested" "$duplicate" "$invalid"
+  log_event info "cli.learnings.ingest" "learnings ingest" "{\"ingested\":$ingested,\"duplicate\":$duplicate,\"invalid\":$invalid}"
+  # Exit non-zero only when NOTHING useful happened AND something was invalid
+  # — so push/sync callers notice a totally-rejected payload, while pure
+  # duplicates (the normal replay case) stay exit 0.
+  if [ "$ingested" -eq 0 ] && [ "$duplicate" -eq 0 ] && [ "$invalid" -gt 0 ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+_learnings_sync() {
+  _learnings_require_jq
+  local machine_name="${1:-}" names name
+  if [ -n "$machine_name" ] && [ "$machine_name" != "--all" ]; then
+    cfg_exists "$machine_name" || die "Machine \"$machine_name\" not found. Run 'agent-bridge list'."
+    names="$(cfg_real_name "$machine_name")"
+  else
+    names="$(cfg_list_names)"
+    [ -n "$names" ] || die "no paired machines to sync with"
+  fi
+
+  local total_pulled=0 total_pushed=0 failed=0
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    printf "${DIM}  syncing with %s...${RESET}\n" "$name"
+
+    # -- PULL: fetch the peer's raw store via ITS own CLI ---------------------
+    # `list --json` (not a raw `cat`) so the peer's own path resolution
+    # (sandboxed-HOME etc.) applies. A pre-4.9.0 peer errors here → skip it.
+    local remote_lines
+    if ! remote_lines="$(_learnings_remote_exec "$name" "agent-bridge learnings list --json" 2>/dev/null)"; then
+      printf "${YELLOW}  %s unreachable or pre-4.9.0 CLI — skipped.${RESET}\n" "$name"
+      failed=1
+      continue
+    fi
+
+    # Union remote→local: append every remote line; dedupe-by-id no-ops the
+    # ones we already have. Count only genuinely new ones.
+    local pulled=0 line result
+    if [ -n "$remote_lines" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        result="$(_learnings_append_line "$line")"
+        [ "$result" = "ingested" ] && pulled=$((pulled + 1))
+      done <<< "$remote_lines"
+    fi
+
+    # -- PUSH: send the peer every local entry it lacks -----------------------
+    # Batch over stdin into the peer's `ingest --stdin` (one SSH hop instead
+    # of N). Compute the missing set by id-diff against what we just pulled.
+    local pushed=0
+    if [ -f "$LEARNINGS_FILE" ]; then
+      local remote_ids missing tmp
+      remote_ids="$(printf '%s\n' "$remote_lines" | jq -r '.id // empty' 2>/dev/null || true)"
+      tmp="$(mktemp)"
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] && continue
+        local lid
+        # `|| true`: a corrupt local line must not kill sync under set -e.
+        lid="$(printf '%s' "$line" | jq -r '.id // empty' 2>/dev/null || true)"
+        [ -n "$lid" ] || continue
+        if ! printf '%s\n' "$remote_ids" | grep -qxF "$lid"; then
+          printf '%s\n' "$line" >> "$tmp"
+          pushed=$((pushed + 1))
+        fi
+      done < "$LEARNINGS_FILE"
+      if [ "$pushed" -gt 0 ]; then
+        if ! _learnings_remote_exec "$name" "agent-bridge learnings ingest --stdin" "$tmp" >/dev/null 2>&1; then
+          printf "${YELLOW}  push to %s failed — it will catch up on ITS next sync.${RESET}\n" "$name"
+          pushed=0
+          failed=1
+        fi
+      fi
+      rm -f "$tmp"
+    fi
+
+    ok "$name: pulled $pulled, pushed $pushed"
+    total_pulled=$((total_pulled + pulled))
+    total_pushed=$((total_pushed + pushed))
+    log_event info "cli.learnings.sync" "learnings sync with $name" "{\"machine\":\"$name\",\"pulled\":$pulled,\"pushed\":$pushed}"
+  done <<< "$names"
+
+  dim "sync complete: pulled $total_pulled, pushed $total_pushed."
+  # Non-zero when any peer failed so cron/automation callers can alert.
+  exit "$failed"
+}
+
+_learnings_remove() {
+  _learnings_require_jq
+  local id="" fleet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fleet)   fleet=1; shift ;;
+      --help|-h) cmd_learnings_help; exit 0 ;;
+      -*)        die "Unknown option: $1 (try: agent-bridge learnings --help)" ;;
+      *)         [ -z "$id" ] && id="$1" || die "Unexpected argument: $1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || die "Usage: agent-bridge learnings remove <id> [--fleet]"
+  id="$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')"
+  [ -f "$LEARNINGS_FILE" ] || die "no learnings store at $LEARNINGS_FILE"
+  _learnings_ids | grep -qxF "$id" || die "no learning with id $id"
+
+  # Rewrite-without-the-line via tmp + mv (atomic on same fs) — never sed -i
+  # the live file a concurrent append might be targeting.
+  local tmp
+  tmp="$(mktemp)"
+  jq -c --arg id "$id" 'select(.id != $id)' "$LEARNINGS_FILE" > "$tmp"
+  mv "$tmp" "$LEARNINGS_FILE"
+  ok "removed learning $id locally"
+  log_event info "cli.learnings.remove" "learning removed" "{\"learning_id\":\"$id\",\"fleet\":$fleet}"
+
+  # NOTE: plain remove is LOCAL-ONLY — a later `sync` with a peer that still
+  # has the entry will resurrect it (no tombstones by design; the store is
+  # append-mostly). For a true fleet-wide delete use --fleet, which repeats
+  # the removal on every paired peer before anyone can re-sync it back.
+  if [ "$fleet" -eq 1 ]; then
+    local names name
+    names="$(cfg_list_names)"
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      if _learnings_remote_exec "$name" "agent-bridge learnings remove $(qq "$id")" >/dev/null 2>&1; then
+        ok "removed on $name"
+      else
+        printf "${YELLOW}  could not remove on %s (offline, pre-4.9.0, or entry absent) — a future sync may resurrect this entry; re-run remove --fleet when it is reachable.${RESET}\n" "$name"
+      fi
+    done <<< "$names"
+  else
+    dim "(local only — use --fleet to also remove on every paired machine, else sync may resurrect it)"
+  fi
+  exit 0
+}
+
+cmd_learnings() {
+  _learnings_require_jq
+  local sub="${1:-list}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    add)     _learnings_add "$@" ;;
+    search)  _learnings_search "$@" ;;
+    list)    _learnings_list "$@" ;;
+    show)    _learnings_show "$@" ;;
+    ingest)  _learnings_ingest "$@" ;;
+    sync)    _learnings_sync "$@" ;;
+    remove)  _learnings_remove "$@" ;;
+    help|--help|-h) cmd_learnings_help ;;
+    *)       die "Unknown learnings subcommand: $sub. Try: agent-bridge learnings help" ;;
+  esac
+}
+
+cmd_learnings_help() {
+  printf 'Usage:\n'
+  printf '  agent-bridge learnings add --title <t> --body <b> [--tags a,b] [--harness <h>] [--no-push]\n'
+  printf '  agent-bridge learnings search <keyword> [--tag <t>] [--limit <n>] [--json]\n'
+  printf '  agent-bridge learnings list [--json]\n'
+  printf '  agent-bridge learnings show <id>\n'
+  printf '  agent-bridge learnings sync [<machine>|--all]\n'
+  printf '  agent-bridge learnings remove <id> [--fleet]\n'
+  printf '  agent-bridge learnings ingest --json '"'"'<entry>'"'"' | --stdin   (replication endpoint)\n\n'
+  printf 'SHARED CONTEXT — a fleet-wide store of learnings/findings that any agent\n'
+  printf 'on any paired machine can search and should contribute to. For learnings\n'
+  printf 'that apply GLOBALLY (OS gotchas, infra fix recipes, tool behaviors) — NOT\n'
+  printf 'project-local fixes (those go in the repo'"'"'s LEARNINGS.md) or private\n'
+  printf 'harness memory.\n\n'
+  printf 'Store: ~/.agent-bridge/shared-context/learnings.ndjson (full replica per\n'
+  printf 'machine). `add` pushes to all paired peers best-effort; offline peers\n'
+  printf 'reconcile later via `sync`. Everything is idempotent by entry id.\n\n'
+  printf 'Body style: symptom/cause/fix/guard prose for bug-shaped learnings;\n'
+  printf 'free-form recipes/findings welcome too.\n\n'
+  printf 'Examples:\n'
+  printf '  agent-bridge learnings add --title "Surfshark IKEv2 dialog loop" \\\n'
+  printf '      --body "Symptom: ... Cause: ... Fix: ... Guard: ..." --tags macos,vpn\n'
+  printf '  agent-bridge learnings search surfshark\n'
+  printf '  agent-bridge learnings sync --all\n'
+}
+
 cmd_chime() {
   local resolved script_dir repo_root chime_cli
   resolved="$0"
@@ -2680,6 +3185,7 @@ cmd_help() {
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
   printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
   printf '  notify <machine>   Pop a native macOS notification on a Mac (local or remote); --local renders here\n'
+  printf '  learnings <sub>    SHARED CONTEXT: fleet-wide learnings store (add|search|list|show|sync|remove|ingest)\n'
   printf '  plugin-registry-rewire  Self-heal stale plugin-registry entries (Claude Code + OpenClaw)\n'
   printf '  install-periodic-update Install harness-independent 10min auto-updater (LaunchAgent / Scheduled Task)\n'
   printf '  mcp-incident-report     Post-mortem report of MCP disconnect events around a timestamp\n'
@@ -2732,6 +3238,7 @@ main() {
     config)   cmd_config "$@" ;;
     chime)    cmd_chime "$@" ;;
     notify)   cmd_notify "$@" ;;
+    learnings) cmd_learnings "$@" ;;
     plugin-registry-rewire) cmd_plugin_registry_rewire "$@" ;;
     install-periodic-update) cmd_install_periodic_update "$@" ;;
     mcp-incident-report) cmd_mcp_incident_report "$@" ;;

@@ -141,6 +141,31 @@ bridge_notify({ machine: "Ethans-Mac-mini", title: "Done",       message: "task 
 
 > **This is a fire-and-forget side effect — it does NOT wake or message the remote agent and writes NO inbox file.** For agent-to-agent messaging use `bridge_send_message`. Routing: a *local* machine renders in-process; a *remote* machine is reached via `sshExec` running the remote's own `agent-bridge notify --local …`, so each machine decides terminal-notifier-vs-osascript by what it has installed. Sound: omit or `none` = silent; `default` = system default; a named sound (e.g. `Glass`, `Ping`) passes through. On the osascript fallback (no subtitle field) the subtitle is folded into the title as `"title — subtitle"`.
 
+### Shared context — fleet-wide learnings (4.9.0+)
+
+The fleet keeps a GLOBAL shared store of learnings/findings at `~/.agent-bridge/shared-context/learnings.ndjson`, replicated to every paired machine. Any agent on any machine — Claude Code, OpenClaw, Codex, any harness — can search it and contributes to it.
+
+**You CAN (and should) search it** when debugging or starting unfamiliar work — another agent on another machine may have already solved your exact problem:
+
+```bash
+agent-bridge learnings search <keyword>       # substring across title/body/tags
+agent-bridge learnings search --tag vpn       # exact tag filter
+```
+
+MCP tool form: `bridge_learnings_search({ query: "surfshark" })`.
+
+**You MUST record any learning that could apply fleet-wide** — OS/tool gotchas, infra fix recipes, auth/API quirks, cross-machine workflows. Not project-local fixes (those go in that repo's `LEARNINGS.md`) and not machine/harness-private notes (harness memory):
+
+```bash
+agent-bridge learnings add --title "<one-line title>" \
+  --body $'Symptom: ...\nCause: ...\nFix: ...\nGuard: ...' \
+  --tags macos,vpn --harness claude-code/default
+```
+
+MCP tool form: `bridge_learnings_add({ title, body, tags, harness })`.
+
+`add` pushes the entry to every paired machine best-effort (the peer's own CLI validates/dedupes/appends); offline peers reconcile later via `agent-bridge learnings sync [machine|--all]`. Entries are deduped by lowercase-uuid id so pushes/syncs/replays are idempotent. `remove <id>` is local-only (sync can resurrect from a peer); `remove <id> --fleet` deletes everywhere.
+
 ### Same-machine delivery (3.5.0+)
 
 `bridge_send_message` accepts the **local machine name** (or one of the reserved aliases `local`, `self`, `localhost`) as its `machine` parameter. The message JSON is written directly to `~/.agent-bridge/inbox/<target>/<id>.json` — no SSH hop, no loopback round-trip:

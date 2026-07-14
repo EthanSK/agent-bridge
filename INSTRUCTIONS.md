@@ -11,6 +11,7 @@ agent-bridge list                               # List paired machines
 agent-bridge status [machine]                   # Check reachability
 agent-bridge run <machine> "command"            # Run a PLAIN shell command remotely (diagnostics only)
 agent-bridge notify <machine|--local> --title T --message M   # Pop a native macOS notification on a Mac (4.8.0+)
+agent-bridge learnings add|search|list|show|sync|remove       # SHARED CONTEXT: fleet-wide learnings store (4.9.0+)
 agent-bridge relay-expand <id>                  # Expand a compact OpenClaw relay notice by expand id
 agent-bridge connect <machine>                  # Open interactive SSH session
 agent-bridge unpair <machine>                   # Remove a pairing
@@ -133,6 +134,8 @@ The MCP server provides the shared `bridge_*` tools for EXISTING running agent s
 | `bridge_status` | Check if a machine is reachable via SSH |
 | `bridge_send_message` | Send a message to another machine's running agent |
 | `bridge_notify` | Pop a native macOS notification on a chosen Mac (local in-process, or remote via `sshExec` running the remote's own `agent-bridge notify --local`). Fire-and-forget side effect — does NOT wake/message the remote agent (4.8.0+). |
+| `bridge_learnings_add` | SHARED CONTEXT: record a fleet-wide learning in `~/.agent-bridge/shared-context/learnings.ndjson` and replicate it to every paired machine (best-effort push over SSH; offline peers reconcile via `learnings sync`) (4.9.0+). |
+| `bridge_learnings_search` | SHARED CONTEXT: search the fleet-wide learnings store (local replica — no network). Substring match across title/body/tags, optional exact-tag filter, newest first (4.9.0+). |
 | `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox. 3.8.0+ supports long-poll via `wait: true, timeout_seconds: 30` (capped at 60 s) for subagents that can't receive parent-only channel pushes. |
 | `bridge_run_command` | Run a shell command on a remote machine |
 | `bridge_clear_inbox` | Clear the local inbox |
@@ -153,6 +156,18 @@ agent-bridge notify Ethans-Mac-mini --title "Done" --message "task finished" --s
 ```
 
 Use it for "task finished / build done / audio switched" style banners. For anything the remote AGENT must act on, use `bridge_send_message` instead.
+
+#### Shared context — fleet-wide learnings (4.9.0+)
+
+A GLOBAL store of learnings/findings shared by every agent on every paired machine, at `~/.agent-bridge/shared-context/learnings.ndjson` (append-only NDJSON, full replica per machine).
+
+**The rule of the road for agents:**
+
+- **You CAN search it** — and should, when debugging or starting unfamiliar work. Another agent on another machine may have already solved your exact problem. `bridge_learnings_search({ query: "surfshark" })` or `agent-bridge learnings search surfshark`.
+- **You MUST record** any learning you make that could apply fleet-wide: OS/tool gotchas, infra fix recipes, auth/API quirks, cross-machine workflows. `bridge_learnings_add({ title, body, tags })` or `agent-bridge learnings add --title ... --body ... --tags ...`. Symptom/cause/fix/guard prose is the house style for bug-shaped learnings.
+- **Scope discipline:** GLOBAL learnings only. Project-local fixes go in that repo's `LEARNINGS.md`; machine/harness-private notes go in the harness's own memory.
+
+**Mechanics:** entries carry a lowercase-uuid `id` (same convention as bridge-message ids — uppercase ids break cross-machine dedupe), `ts`, `machine`, `harness`, `title`, `body`, `tags[]`, `scope: "global"`. `add` replicates to every paired peer by SSHing the peer's own `agent-bridge learnings ingest` (the peer validates + dedupes + appends its own store). Offline peers reconcile bidirectionally with `agent-bridge learnings sync [machine|--all]`. Everything is idempotent by id. `remove <id>` is local-only (a later sync can resurrect the entry from a peer); use `remove <id> --fleet` for a true fleet-wide delete.
 
 ### Claude Code unified plugin (3.7.0+)
 
