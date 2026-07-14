@@ -34,7 +34,7 @@ import { randomUUID } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexPath = join(__dirname, '..', 'build', 'index.js');
-const EXPECTED_VERSION = '4.9.1';
+const EXPECTED_VERSION = '4.9.2';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

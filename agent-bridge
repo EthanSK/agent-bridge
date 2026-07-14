@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.9.1"
+VERSION="4.9.2"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -2811,6 +2811,13 @@ cmd_learnings_help() {
   printf 'that apply GLOBALLY (OS gotchas, infra fix recipes, tool behaviors) — NOT\n'
   printf 'project-local fixes (those go in the repo'"'"'s LEARNINGS.md) or private\n'
   printf 'harness memory.\n\n'
+  printf 'ADDITIVE ONLY: this store never replaces or reroutes harness-native\n'
+  printf 'memory. Record everything where you would have recorded it anyway\n'
+  printf '(harness memory, repo LEARNINGS.md, workspace rules), THEN also add a\n'
+  printf 'copy of the fleet-wide-applicable subset here. Never skip or relocate a\n'
+  printf 'native memory write because the shared store has the content; never\n'
+  printf 'import existing harness memories here as a migration. If unsure, write\n'
+  printf 'both.\n\n'
   printf 'Store: ~/.agent-bridge/shared-context/learnings.ndjson (full replica per\n'
   printf 'machine). `add` pushes to all paired peers best-effort; offline peers\n'
   printf 'reconcile later via `sync`. Everything is idempotent by entry id.\n\n'

@@ -154,7 +154,9 @@ agent-bridge learnings search --tag vpn       # exact tag filter
 
 MCP tool form: `bridge_learnings_search({ query: "surfshark" })`.
 
-**You MUST record any learning that could apply fleet-wide** — OS/tool gotchas, infra fix recipes, auth/API quirks, cross-machine workflows. Not project-local fixes (those go in that repo's `LEARNINGS.md`) and not machine/harness-private notes (harness memory):
+**You MUST record any learning that could apply fleet-wide** — OS/tool gotchas, infra fix recipes, auth/API quirks, cross-machine workflows. Not project-local fixes (those go in that repo's `LEARNINGS.md`) and not machine/harness-private notes (harness memory).
+
+**ADDITIVE ONLY — never a replacement.** The shared context never replaces or reroutes your harness-native memory. Keep recording everything exactly where you would have recorded it anyway (harness memory, repo `LEARNINGS.md`, workspace rules); THEN also add a copy of the fleet-wide-applicable subset to the shared store. Never skip or relocate a native memory write because the shared store has the content, and never import existing harness memories into the store as a migration. If unsure, write both:
 
 ```bash
 agent-bridge learnings add --title "<one-line title>" \

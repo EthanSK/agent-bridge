@@ -140,6 +140,8 @@ agent-bridge learnings add --title "<title>" --body $'Symptom: ...\nCause: ...\n
 # or: bridge_learnings_add({ title, body, tags })
 ```
 
+- **ADDITIVE ONLY — never a replacement for your normal memory.** The shared context never replaces or reroutes harness-native memory. Keep recording everything exactly where you would have recorded it anyway (your harness memory system, the repo's LEARNINGS.md, workspace rules/notes); THEN also add a copy of the fleet-wide-applicable subset here. Never skip or relocate a native memory write because the shared store has the content, and never import existing harness memories into the store as a migration. If unsure, write both.
+
 `add` replicates to all paired peers automatically (offline peers catch up via `agent-bridge learnings sync`); everything is idempotent by entry id.
 
 ## Pairing from a photo

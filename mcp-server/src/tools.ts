@@ -653,6 +653,9 @@ export function registerTools(server: McpServer): void {
         'Record a GLOBALLY-applicable learning in the fleet-wide shared-context store and replicate it to every paired machine. '
         + 'Use for learnings that ANY agent on ANY machine could benefit from: OS/tool gotchas, infra fix recipes, cross-machine workflows, API/auth quirks. '
         + 'Do NOT use for project-local learnings — those belong in the repo\'s LEARNINGS.md — or machine/harness-private notes (harness memory).\n\n'
+        + 'ADDITIVE ONLY: this store never replaces or reroutes your harness-native memory. Record everything where you would have recorded it anyway '
+        + '(harness memory, repo LEARNINGS.md, workspace rules), THEN also add a copy of the fleet-wide-applicable subset here. '
+        + 'Never skip a native memory write because you wrote here. If unsure, write both.\n\n'
         + 'Write the body in symptom/cause/fix/guard prose when the learning is bug-shaped; free-form recipe text is fine otherwise. '
         + 'Replication is best-effort: unreachable peers are listed in the result and will catch up via `agent-bridge learnings sync` (dedupe by id makes replays harmless).',
       inputSchema: {
@@ -816,7 +819,8 @@ export function registerTools(server: McpServer): void {
               type: 'text' as const,
               text:
                 `No shared-context learnings matched${query ? ` "${query}"` : ''}${tag ? ` (tag: ${tag})` : ''}. `
-                + 'If you solve this yourself and the fix could apply fleet-wide, record it with bridge_learnings_add.',
+                + 'If you solve this yourself and the fix could apply fleet-wide, record it with bridge_learnings_add '
+                + '(in ADDITION to its normal home — harness memory / repo LEARNINGS.md — never instead of it).',
             },
           ],
         };
