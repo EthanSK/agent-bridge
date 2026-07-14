@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-07-14T19:34:44Z
+**Trigger:** Ethan voice: global agent bridge shared context feature build 2026-07-14
+**Symptom:** Needed a fleet-wide SHARED CONTEXT store: learnings/findings any agent on any paired machine can search + must contribute globally-applicable learnings to (the missing layer above per-repo LEARNINGS.md and per-harness memory)
+**Root cause:** N/A new feature (4.9.0). KEY DESIGN: replication rides the sshExec SIDE-EFFECT path (like bridge_notify), NEVER the inbox/watcher path — a replica write must not depend on a live remote channel-owner. Store = append-only NDJSON full replica per machine (~/.agent-bridge/shared-context/learnings.ndjson), deduped by LOWERCASE-uuid id so push-on-write + sync reconciliation + replays are all idempotent. remove is local-only by design (no tombstones); remove --fleet repeats it everywhere.
+**Fix:** mcp-server/src/learnings.ts (store ops + buildRemoteIngestCommand) + bridge_learnings_add/search in tools.ts + SHARED CONTEXT section in index.ts server instructions; cmd_learnings verbs (add/search/list/show/ingest/sync/remove) in the bash CLI — mirrored bash/TS pair like the notify renderer. GOTCHAS HIT: (1) bash add was not deduping tags while TS was — caught by parity tests; (2) test/cli-learnings.sh MUST pin AGENT_BRIDGE_HOME because the 4.4.0 sandboxed-HOME fallback silently repoints an empty $TMP sandbox at the REAL user store (it wrote 2 test entries into the live store before the pin); (3) jq-in-assignment under set -e/pipefail needs '|| true' guards (head -1 SIGPIPEs jq); (4) grep for printf-%q-escaped ssh argv with grep -qF 'learnings\ ingest' not plain spaces; (5) Mini→MBP push failed because Mini cannot SSH to MBP (LAN 192.168.1.208 timeout, pre-existing asymmetry) — sync FROM the reachable side is the designed workaround and worked. E2E verified both directions across MBP/Mac-Mini/OldMacBookPro; SHITTYWINDOWS is an SSH-endpoint-only peer with no agent-bridge CLI so learnings replication to it always no-ops gracefully. PR #5, merge commit 17723d9.
+**Commit:** 17723d9
+**Guard:** mcp-server/test/learnings-store.test.mjs (real-shell hostile-body round-trip vs stubbed remote CLI, dedupe idempotency, corrupt-line resilience) + test/cli-learnings.sh (10 cases incl. push-on-write over stubbed ssh, uppercase-id normalization)
+---
+
+---
 **Date:** 2026-06-27T22:05:13Z
 **Trigger:** alexa-bridge callback refinement (teammate session) 2026-06-27
 **Symptom:** Alexa fire-and-forget result callback should not depend on the fragile unofficial Echo speak-back
