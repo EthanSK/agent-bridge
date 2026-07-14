@@ -1,5 +1,14 @@
 # Changelog
 
+## agent-bridge 4.9.2 — 2026-07-14
+
+Ethan directive: the shared context is an ADDITION to each harness's existing memory systems, never a replacement — and the shipped wording had to say so explicitly, because the 4.9.0 scope-discipline line ("project-local fixes belong in LEARNINGS.md; harness-private notes belong in harness memory") read as an either/or ROUTING rule and left the dangerous misreading open: an agent skipping its native memory write because it wrote to the shared store.
+
+- **ADDITIVE-ONLY wording on every surface.** New explicit paragraph — "the shared context NEVER replaces or reroutes your harness-native memory; keep recording everything exactly where you would have recorded it anyway, THEN also add a copy of the fleet-wide-applicable subset here; never skip or relocate a native memory write; never import existing harness memories as a migration; if unsure, write both" — added to: the MCP server instructions SHARED CONTEXT section (index.ts, placed right after the MUST-record line), the `bridge_learnings_add` tool description and the `bridge_learnings_search` no-match hint (tools.ts), the CLI `learnings help` text, README ("Additive only — never a replacement" callout), INSTRUCTIONS.md, AGENTS.md, both bundled skills, and the site feature card ("strictly additive to each harness's own memory").
+- **Scope-discipline lines rephrased** from routing ("belongs in X") to copy-on-top ("stays in X; the store adds a fleet-wide COPY on top — not a routing destination that takes over").
+- **Sanity check:** no CLI/MCP/doc text implies importing or migrating harness memories into the store; `ingest` remains documented strictly as the machine-to-machine replication endpoint.
+- **Version bumps.** CLI / MCP server / plugin metadata → `4.9.2` lockstep. No code-path changes; running sessions need a full harness restart to see the updated MCP instructions text.
+
 ## agent-bridge 4.9.1 — 2026-07-14
 
 Real bug found by Mini Claude minutes after the 4.9.0 rollout: learnings replication between peers failed when the single configured endpoint it tried was dead, even though the OTHER address for the same peer worked (each peer carries a LAN `host` plus a Tailscale `internet_host`, and either can be individually dead — a stale LAN IP nobody refreshes, or a flaky tailnet path). Bridge messaging kept working across the same pair, which made replication the odd one out.

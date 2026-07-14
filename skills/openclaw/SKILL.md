@@ -54,7 +54,7 @@ agent-bridge learnings add|search|sync          # SHARED CONTEXT: fleet-wide lea
 
 > To talk to the running agent on another machine, use `bridge_send_message` (see MCP tools below). `agent-bridge run` is shell-only. The `--claude`, `--codex`, and `--agent` flags were removed in 3.0.0.
 
-**Shared context (4.9.0+):** the fleet keeps a GLOBAL learnings store at `~/.agent-bridge/shared-context/learnings.ndjson`, replicated across all paired machines. SEARCH it before debugging something unfamiliar (`agent-bridge learnings search <keyword>` — another agent may have already solved it), and RECORD any learning that could apply fleet-wide (`agent-bridge learnings add --title ... --body ... --tags ... --harness openclaw/<account>`). Project-local fixes stay in that repo's LEARNINGS.md; only globally-applicable learnings go here.
+**Shared context (4.9.0+):** the fleet keeps a GLOBAL learnings store at `~/.agent-bridge/shared-context/learnings.ndjson`, replicated across all paired machines. SEARCH it before debugging something unfamiliar (`agent-bridge learnings search <keyword>` — another agent may have already solved it), and RECORD any learning that could apply fleet-wide (`agent-bridge learnings add --title ... --body ... --tags ... --harness openclaw/<account>`). Project-local fixes stay in that repo's LEARNINGS.md; only globally-applicable learnings go here. **ADDITIVE ONLY:** the store never replaces or reroutes your native memory (OpenClaw workspace rules/memory, repo LEARNINGS.md) — keep writing those exactly as before, THEN also copy the fleet-wide-applicable subset here. Never skip a native memory write because you wrote to the shared store; if unsure, write both.
 
 ## MCP tools (if MCP server is configured)
 

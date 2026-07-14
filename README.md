@@ -125,11 +125,13 @@ The MCP equivalent is the `bridge_notify` tool (see [INSTRUCTIONS.md](INSTRUCTIO
 
 Your fleet develops institutional memory. agent-bridge keeps a **global shared-context store of learnings and findings** that ANY agent on ANY paired machine — Claude Code, OpenClaw, Codex, whatever harness — can search before re-deriving a fix, and must contribute to when it discovers something globally useful.
 
-Think of it as the fleet-wide layer above the memory you already have:
+Think of it as the fleet-wide layer **on top of** the memory you already have:
 
 - **Per-repo** institutional memory → the repo's `LEARNINGS.md` (project-local fixes stay there).
 - **Per-harness** memory → Claude Code auto-memory, OpenClaw workspace rules (machine/agent-private notes stay there).
 - **Fleet-wide** → this store. OS gotchas, infra fix recipes, auth/API quirks, cross-machine workflows — anything a *different* agent on a *different* machine would benefit from.
+
+> **Additive only — never a replacement.** The shared context is an ADDITION to each harness's existing memory systems, not a new home for them. Agents keep recording everything exactly where they would have recorded it anyway (harness memory, repo `LEARNINGS.md`, workspace rules), and *then* also add a copy of the fleet-wide-applicable subset to the shared store. An agent must never skip or relocate a native memory write because the shared store has the content, and must never import existing harness memories into the store as a migration. When unsure: write both.
 
 **How it works:**
 
