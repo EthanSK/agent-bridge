@@ -122,6 +122,26 @@ agent-bridge pair
 agent-bridge unpair MacBook-Pro
 ```
 
+### Shared context — fleet-wide learnings (4.9.0+)
+
+A GLOBAL store of learnings/findings shared across every paired machine (`~/.agent-bridge/shared-context/learnings.ndjson`, full replica per machine). Any agent on any machine can search it and should contribute to it.
+
+- **Search it BEFORE debugging something unfamiliar** — another agent on another machine may have already recorded the fix:
+
+```bash
+agent-bridge learnings search <keyword>     # or: bridge_learnings_search({ query })
+agent-bridge learnings search --tag vpn
+```
+
+- **Record any learning that could apply fleet-wide** (OS/tool gotchas, infra fix recipes, auth quirks — NOT project-local fixes, those go in the repo's LEARNINGS.md):
+
+```bash
+agent-bridge learnings add --title "<title>" --body $'Symptom: ...\nCause: ...\nFix: ...\nGuard: ...' --tags macos,vpn
+# or: bridge_learnings_add({ title, body, tags })
+```
+
+`add` replicates to all paired peers automatically (offline peers catch up via `agent-bridge learnings sync`); everything is idempotent by entry id.
+
 ## Pairing from a photo
 
 When the user sends a photo of another machine's pairing screen:

@@ -200,6 +200,10 @@
             <h3>Hardened against zombies</h3>
             <p>The Claude Code channel-owner MCP child is hardened against benign stdin/stderr/SIGTERM closure, exits on real parent/stdout death, and replays undelivered messages on startup. OpenClaw is hosted separately by the gateway plugin. No shadow <code>~/.agent-bridge/inbox</code> directories, no fresh remote agent processes.</p>
           </div>
+          <div class="card" data-tag="05">
+            <h3>Shared context: fleet-wide learnings</h3>
+            <p>Your fleet develops institutional memory. Any agent on any machine records globally-useful learnings (<code>agent-bridge learnings add</code> / <code>bridge_learnings_add</code>) and searches what every other agent already figured out (<code>learnings search</code> / <code>bridge_learnings_search</code>). Full NDJSON replica per machine, replicated peer-to-peer over the same SSH transport, idempotent by entry id &mdash; offline peers reconcile with <code>learnings sync</code>.</p>
+          </div>
         </div>
       </section>
 

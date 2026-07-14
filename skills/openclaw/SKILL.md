@@ -49,9 +49,12 @@ agent-bridge run <machine> "command"            # Run a PLAIN shell command remo
 agent-bridge connect <machine>                  # Open interactive SSH session
 agent-bridge pair                               # Pair with another machine
 agent-bridge unpair <machine>                   # Remove a pairing
+agent-bridge learnings add|search|sync          # SHARED CONTEXT: fleet-wide learnings store (4.9.0+)
 ```
 
 > To talk to the running agent on another machine, use `bridge_send_message` (see MCP tools below). `agent-bridge run` is shell-only. The `--claude`, `--codex`, and `--agent` flags were removed in 3.0.0.
+
+**Shared context (4.9.0+):** the fleet keeps a GLOBAL learnings store at `~/.agent-bridge/shared-context/learnings.ndjson`, replicated across all paired machines. SEARCH it before debugging something unfamiliar (`agent-bridge learnings search <keyword>` — another agent may have already solved it), and RECORD any learning that could apply fleet-wide (`agent-bridge learnings add --title ... --body ... --tags ... --harness openclaw/<account>`). Project-local fixes stay in that repo's LEARNINGS.md; only globally-applicable learnings go here.
 
 ## MCP tools (if MCP server is configured)
 
@@ -62,6 +65,8 @@ If the agent-bridge MCP server is registered, these tools are available directly
 | `bridge_list_machines` | List paired machines and connection details |
 | `bridge_status` | Check if a machine is reachable via SSH |
 | `bridge_send_message` | Send a message to another machine's running agent |
+| `bridge_learnings_add` | SHARED CONTEXT: record a fleet-wide learning + replicate to all paired machines (4.9.0+) |
+| `bridge_learnings_search` | SHARED CONTEXT: search the fleet-wide learnings store (local replica, no network) (4.9.0+) |
 | `bridge_receive_messages` | Check for and consume incoming messages (call periodically) |
 | `bridge_run_command` | Run a shell command on a remote machine |
 | `bridge_clear_inbox` | Clear the local inbox |

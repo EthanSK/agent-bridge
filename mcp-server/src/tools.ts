@@ -6,6 +6,8 @@
  * - bridge_status: Check if a machine is reachable
  * - bridge_send_message: Send a message to a remote machine's running agent
  * - bridge_notify: Pop a native macOS notification on a chosen Mac (local or remote)
+ * - bridge_learnings_add: Record a fleet-wide learning in the shared-context store (+ replicate to peers)
+ * - bridge_learnings_search: Search the fleet-wide shared-context learnings store
  * - bridge_receive_messages: Check for and consume incoming messages
  * - bridge_run_command: Run a shell command on a remote machine
  * - bridge_clear_inbox: Clear all messages from the local inbox
@@ -44,6 +46,14 @@ import {
   buildRemoteNotifyCommand,
   DEFAULT_NOTIFY_GROUP,
 } from './notify.js';
+import {
+  createLearningEntry,
+  appendLearningLocal,
+  searchLearnings,
+  formatLearning,
+  buildRemoteIngestCommand,
+  learningsFilePath,
+} from './learnings.js';
 
 // 3.8.0 — long-poll bounds for `bridge_receive_messages`. The default 30 s
 // keeps pollers reasonably tight while the 60 s cap ensures we never park an
@@ -614,6 +624,202 @@ export function registerTools(server: McpServer): void {
           isError: true,
         };
       }
+    },
+  );
+
+  // -- bridge_learnings_add ----------------------------------------------------
+  //
+  // 4.9.0 — SHARED CONTEXT: fleet-wide learnings store.
+  //
+  // Records a GLOBALLY-applicable learning (fix recipe, gotcha, "how X really
+  // works" finding) into ~/.agent-bridge/shared-context/learnings.ndjson and
+  // best-effort replicates it to every paired machine.
+  //
+  // REPLICATION ROUTING (see learnings.ts header for the full rationale):
+  //   • local append — in-process via appendLearningLocal (dedupe by id).
+  //   • each paired peer — sshExec(m, "agent-bridge learnings ingest --json …")
+  //     so the REMOTE machine's own CLI validates + dedupes + appends into ITS
+  //     store. Same side-effect path as bridge_notify: a replica write is NOT
+  //     an agent message, so it must not ride the inbox/watcher path (that
+  //     would require a live remote channel-owner just to store a line).
+  //   • offline peers are reported, not fatal — `agent-bridge learnings sync`
+  //     reconciles on next contact, and ingest's dedupe-by-id makes any replay
+  //     idempotent.
+  server.registerTool(
+    'bridge_learnings_add',
+    {
+      title: 'Add Shared-Context Learning (fleet-wide)',
+      description:
+        'Record a GLOBALLY-applicable learning in the fleet-wide shared-context store and replicate it to every paired machine. '
+        + 'Use for learnings that ANY agent on ANY machine could benefit from: OS/tool gotchas, infra fix recipes, cross-machine workflows, API/auth quirks. '
+        + 'Do NOT use for project-local learnings — those belong in the repo\'s LEARNINGS.md — or machine/harness-private notes (harness memory).\n\n'
+        + 'Write the body in symptom/cause/fix/guard prose when the learning is bug-shaped; free-form recipe text is fine otherwise. '
+        + 'Replication is best-effort: unreachable peers are listed in the result and will catch up via `agent-bridge learnings sync` (dedupe by id makes replays harmless).',
+      inputSchema: {
+        title: z.string().describe('Short one-line title (what you would scan for in a list).'),
+        body: z
+          .string()
+          .describe('Full learning text. Symptom/cause/fix/guard style encouraged for bug-shaped learnings.'),
+        tags: z
+          .array(z.string())
+          .optional()
+          .describe('Lowercase keyword tags for later filtering, e.g. ["macos","vpn","surfshark"].'),
+        harness: z
+          .string()
+          .optional()
+          .describe('Which agent is recording this, e.g. "claude-code/default", "openclaw/clawdiboi2", "codex". Defaults to the active claude-code persona target.'),
+        no_push: z
+          .boolean()
+          .optional()
+          .describe('Skip replication to paired machines (local append only). Default false — push everywhere.'),
+      },
+    },
+    async ({ title, body, tags, harness, no_push }) => {
+      // Default the harness label to the active claude-code persona target so
+      // entries recorded via the MCP tool are attributable without the agent
+      // having to know its own persona string.
+      const harnessLabel =
+        harness && harness.trim() !== ''
+          ? harness.trim()
+          : getActiveClaudeCodeTargetOrDefault();
+      const entry = createLearningEntry({ title, body, tags, harness: harnessLabel });
+
+      let appended: boolean;
+      try {
+        appended = appendLearningLocal(entry);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logError(`learnings: local append failed: ${errMsg}`);
+        logEvent({
+          event: 'tool.bridge_learnings_add.failed',
+          level: 'error',
+          msg: 'Local learnings append failed',
+          context: { learning_id: entry.id, error: errMsg },
+        });
+        return {
+          content: [{ type: 'text' as const, text: `Failed to write learning locally: ${errMsg}` }],
+          isError: true,
+        };
+      }
+      logEvent({
+        event: 'tool.bridge_learnings_add',
+        msg: `Learning recorded locally (${appended ? 'new' : 'duplicate id, no-op'})`,
+        context: { learning_id: entry.id, title: entry.title, tags: entry.tags },
+      });
+
+      // -- REPLICATION LEG: best-effort push to every paired machine ---------
+      // Sequential (not Promise.all) on purpose: peers share the local SSH
+      // client and the store is low-write-rate; simple + readable beats a few
+      // hundred ms here. Failures collect into `failedPeers`, never throw.
+      const okPeers: string[] = [];
+      const failedPeers: string[] = [];
+      if (!no_push) {
+        const remoteCmd = buildRemoteIngestCommand(entry);
+        for (const m of loadConfig()) {
+          try {
+            const res = await sshExec(m, remoteCmd, 15000);
+            if (res.exitCode === 0) {
+              okPeers.push(m.name);
+            } else {
+              failedPeers.push(`${m.name} (exit ${res.exitCode})`);
+            }
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            failedPeers.push(`${m.name} (${errMsg})`);
+          }
+        }
+        if (failedPeers.length > 0) {
+          logEvent({
+            event: 'tool.bridge_learnings_add.push_incomplete',
+            level: 'warn',
+            msg: 'Learning replicated to some peers only',
+            context: { learning_id: entry.id, ok: okPeers, failed: failedPeers },
+          });
+        }
+      }
+
+      const lines = [
+        appended
+          ? `Learning recorded (id: ${entry.id}) in ${learningsFilePath()}.`
+          : `Learning id ${entry.id} already existed locally (no-op).`,
+      ];
+      if (no_push) {
+        lines.push('Replication skipped (no_push=true).');
+      } else if (okPeers.length === 0 && failedPeers.length === 0) {
+        lines.push('No paired machines to replicate to.');
+      } else {
+        if (okPeers.length > 0) lines.push(`Replicated to: ${okPeers.join(', ')}.`);
+        if (failedPeers.length > 0) {
+          lines.push(
+            `Could not reach: ${failedPeers.join(', ')}. They will catch up via \`agent-bridge learnings sync\` (idempotent by id).`,
+          );
+        }
+      }
+      return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+    },
+  );
+
+  // -- bridge_learnings_search -------------------------------------------------
+  //
+  // 4.9.0 — read side of the shared-context store. Pure local read: every
+  // machine holds a full replica, so searching never needs the network. This
+  // is the tool agents should reach for when starting to debug something —
+  // another agent on another machine may have already solved it.
+  server.registerTool(
+    'bridge_learnings_search',
+    {
+      title: 'Search Shared-Context Learnings (fleet-wide)',
+      description:
+        'Search the fleet-wide shared-context learnings store (contributed by agents on ALL paired machines). '
+        + 'Case-insensitive substring match across title, body and tags; omit the query to list everything (newest first). '
+        + 'Check here when debugging or starting unfamiliar work — another agent on another machine may have already recorded the fix. '
+        + 'Reads the local replica only (no network); run `agent-bridge learnings sync` first if you suspect this machine is stale.',
+      inputSchema: {
+        query: z
+          .string()
+          .optional()
+          .describe('Keyword/substring to match (case-insensitive) across title, body and tags. Omit to list all.'),
+        tag: z.string().optional().describe('Exact tag filter (lowercase), e.g. "vpn".'),
+        limit: z.number().optional().describe('Max entries to return (newest first). Default 20.'),
+      },
+    },
+    async ({ query, tag, limit }) => {
+      let results;
+      try {
+        results = searchLearnings({ query, tag, limit: limit ?? 20 });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: 'text' as const, text: `Failed to read learnings store: ${errMsg}` }],
+          isError: true,
+        };
+      }
+      logEvent({
+        event: 'tool.bridge_learnings_search',
+        msg: `Learnings search returned ${results.length} entr${results.length === 1 ? 'y' : 'ies'}`,
+        context: { query: query ?? '', tag: tag ?? '', count: results.length },
+      });
+      if (results.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `No shared-context learnings matched${query ? ` "${query}"` : ''}${tag ? ` (tag: ${tag})` : ''}. `
+                + 'If you solve this yourself and the fix could apply fleet-wide, record it with bridge_learnings_add.',
+            },
+          ],
+        };
+      }
+      const header = `${results.length} shared-context learning(s)${query ? ` matching "${query}"` : ''}${tag ? ` (tag: ${tag})` : ''}, newest first:\n`;
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: header + '\n' + results.map(formatLearning).join('\n\n'),
+          },
+        ],
+      };
     },
   );
 

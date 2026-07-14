@@ -17,6 +17,7 @@ agent-bridge connects running AI agent harness sessions across your own computer
 - **Works across harnesses** — Claude Code and OpenClaw are tested end-to-end, with the same bridge tools shared through MCP.
 - **Remote diagnostics when needed** — run plain shell commands on a paired machine for status checks, logs, tests, and one-off troubleshooting.
 - **Explicit routing** — target Claude Code personas, OpenClaw accounts, or other named sessions directly instead of relying on fuzzy defaults.
+- **Shared context** — a fleet-wide learnings store every agent on every machine can search and contribute to, replicated peer-to-peer over the same SSH transport.
 
 ## What works today
 
@@ -117,6 +118,46 @@ agent-bridge notify --local --title "T" --message "M" --subtitle "S" --sound "Gl
 ```
 
 The MCP equivalent is the `bridge_notify` tool (see [INSTRUCTIONS.md](INSTRUCTIONS.md#mcp-tools)) — same local/remote semantics, callable directly by an agent. Note: the running MCP child only exposes the `bridge_notify` tool after a full Claude Code restart; the `agent-bridge notify` CLI verb works immediately after build.
+
+---
+
+## Shared context — fleet-wide learnings (4.9.0+)
+
+Your fleet develops institutional memory. agent-bridge keeps a **global shared-context store of learnings and findings** that ANY agent on ANY paired machine — Claude Code, OpenClaw, Codex, whatever harness — can search before re-deriving a fix, and must contribute to when it discovers something globally useful.
+
+Think of it as the fleet-wide layer above the memory you already have:
+
+- **Per-repo** institutional memory → the repo's `LEARNINGS.md` (project-local fixes stay there).
+- **Per-harness** memory → Claude Code auto-memory, OpenClaw workspace rules (machine/agent-private notes stay there).
+- **Fleet-wide** → this store. OS gotchas, infra fix recipes, auth/API quirks, cross-machine workflows — anything a *different* agent on a *different* machine would benefit from.
+
+**How it works:**
+
+- Every machine holds a **full replica** at `~/.agent-bridge/shared-context/learnings.ndjson` (append-only NDJSON — greppable, jq-able, mergeable). Searches are pure local reads: no network, no latency.
+- `learnings add` appends locally, then **pushes to every paired machine** over the same SSH side-effect path notifications use (the remote's own CLI validates + dedupes + appends — your machine never writes a peer's file directly).
+- Offline peers just miss the push and **reconcile later** with `agent-bridge learnings sync` (bidirectional union). Every entry has a lowercase-uuid id, and ingest dedupes by id, so pushes, syncs, and replays are all idempotent.
+
+```bash
+# Record a learning that applies fleet-wide (pushes to all paired machines)
+agent-bridge learnings add \
+  --title "Surfshark IKEv2 password-dialog loop" \
+  --body $'Symptom: recurring macOS VPN password dialog\nCause: stale IKEv2 keychain credential\nFix: switch protocol to WireGuard\nGuard: ...' \
+  --tags macos,vpn,surfshark
+
+# Search before debugging — another agent may have already solved it
+agent-bridge learnings search surfshark
+agent-bridge learnings search --tag vpn
+
+# Reconcile with peers that were offline during a push
+agent-bridge learnings sync --all
+
+# Housekeeping
+agent-bridge learnings list
+agent-bridge learnings show <id>
+agent-bridge learnings remove <id> --fleet   # plain remove is local-only; sync could resurrect it
+```
+
+The MCP equivalents are **`bridge_learnings_add`** and **`bridge_learnings_search`** — and the MCP server's instructions tell every connected agent the rule of the road: *search the shared context when starting to debug something (an agent on another machine may already have the answer), and record any learning that could apply fleet-wide.* Same restart caveat as other new tools: running MCP children expose the new tools only after a full harness restart; the CLI verbs work immediately.
 
 ---
 
@@ -1095,6 +1136,7 @@ Subsequent devices can join with `tailscale up --auth-key=$key --hostname=<name>
 | `agent-bridge run <machine> "cmd"` | Run a PLAIN shell command on a paired machine (diagnostics only — no agent wrapping). |
 | `agent-bridge reset-path <machine>` | Compatibility command for clearing old path-cache files. It no longer changes endpoint selection in 3.4.2+. |
 | `agent-bridge relay-expand <id>` | Print the full locally stored message for a compact OpenClaw relay notice (`expand id: NN`). Use `--json` for raw metadata. |
+| `agent-bridge learnings <sub>` | SHARED CONTEXT: fleet-wide learnings store — `add` (records + replicates to all peers), `search`/`list`/`show`, `sync` (reconcile with offline peers), `remove [--fleet]`, `ingest` (replication endpoint, called by peers over SSH). |
 | `agent-bridge unpair <machine>` | Remove a pairing. |
 
 > To talk to the **running agent** on the other machine, use the channel plugin's `bridge_send_message` MCP tool. `agent-bridge run` does not spawn agents. The old `--claude` / `--codex` / `--agent` flags were removed in 3.0.0.
