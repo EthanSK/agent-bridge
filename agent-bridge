@@ -9,7 +9,7 @@ set -euo pipefail
 
 INVOKED_AS="$(basename "$0")"
 
-VERSION="4.9.2"
+VERSION="4.10.0"
 
 # -- Colours (ANSI) ----------------------------------------------------------
 RED='\033[0;31m'
@@ -82,17 +82,96 @@ _ab_expand_user_path() {
   case "$path" in
     "~") printf '%s' "$HOME" ;;
     "~/"*) printf '%s/%s' "$HOME" "${path#~/}" ;;
+    "~\\"*)
+      path="${path#~\\}"
+      printf '%s/%s' "$HOME" "${path//\\//}"
+      ;;
+    # install.ps1 and Windows users naturally provide a native drive path in
+    # AGENT_BRIDGE_HOME. The CLI itself runs under Git Bash, where that string
+    # is not a filesystem path until cygpath translates it. Convert only for
+    # path resolution inside this bash process; leave AGENT_BRIDGE_HOME itself
+    # untouched so the Windows Node runtime inherits its native form.
+    [A-Za-z]:[\\/]*)
+      if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$path"
+      else
+        printf '%s\n' 'agent-bridge: native Windows AGENT_BRIDGE_HOME requires cygpath (Git Bash)' >&2
+        return 2
+      fi
+      ;;
+    \\\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$path"
+      else
+        printf '%s\n' 'agent-bridge: native Windows UNC AGENT_BRIDGE_HOME requires cygpath (Git Bash)' >&2
+        return 2
+      fi
+      ;;
     *) printf '%s' "$path" ;;
   esac
 }
 
+_ab_is_complete_unc_path() {
+  local normalized="${1//\\//}" server rest share
+  case "$normalized" in
+    //*) ;;
+    *) return 1 ;;
+  esac
+  normalized="${normalized#//}"
+  server="${normalized%%/*}"
+  [ "$server" != "$normalized" ] || return 1
+  rest="${normalized#*/}"
+  share="${rest%%/*}"
+  [ -n "$server" ] && [ -n "$share" ]
+}
+
+_ab_is_absolute_bridge_path() {
+  case "$1" in
+    [A-Za-z]:[\\/]*) return 0 ;;
+    //*) _ab_is_complete_unc_path "$1"; return ;;
+    \\\\*) _ab_is_complete_unc_path "$1"; return ;;
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _ab_normalize_bridge_home_override() {
-  local raw="$1" expanded
-  expanded="$(_ab_expand_user_path "$raw")"
+  local raw="$1" expanded leaf leaf_lower windows_semantics=0
+  case "$raw" in
+    [A-Za-z]:[\\/]*) windows_semantics=1 ;;
+  esac
+  case "${OSTYPE:-}" in
+    cygwin*|msys*|win32*) windows_semantics=1 ;;
+  esac
+  case "$raw" in
+    "~"|"~/"*|"~\\"*) ;;
+    *)
+      if ! _ab_is_absolute_bridge_path "$raw"; then
+        printf 'agent-bridge: AGENT_BRIDGE_HOME must be an absolute path: %s\n' "$raw" >&2
+        return 2
+      fi
+      ;;
+  esac
+  if ! expanded="$(_ab_expand_user_path "$raw")"; then return 2; fi
+  if ! _ab_is_absolute_bridge_path "$expanded"; then
+    printf 'agent-bridge: AGENT_BRIDGE_HOME must resolve to an absolute path: %s\n' "$raw" >&2
+    return 2
+  fi
+  while [ "$expanded" != "/" ]; do
+    case "$expanded" in
+      */|*\\) expanded="${expanded%?}" ;;
+      *) break ;;
+    esac
+  done
+  leaf="${expanded##*/}"
+  leaf="${leaf##*\\}"
+  leaf_lower="$(printf '%s' "$leaf" | tr '[:upper:]' '[:lower:]')"
   # Preferred existing meaning: AGENT_BRIDGE_HOME is the state dir containing
   # config/keys/inbox/logs. Accept parent home dirs too so callers can pass the
   # same path they would otherwise assign to HOME.
-  if [ -f "$expanded/config" ] || [ -d "$expanded/keys" ] || [ "$(basename "$expanded")" = ".agent-bridge" ]; then
+  if [ -f "$expanded/config" ] || [ -d "$expanded/keys" ] \
+     || [ "$leaf" = ".agent-bridge" ] \
+     || { [ "$windows_semantics" = "1" ] && [ "$leaf_lower" = ".agent-bridge" ]; }; then
     printf '%s' "$expanded"
   else
     printf '%s/.agent-bridge' "$expanded"
@@ -101,8 +180,10 @@ _ab_normalize_bridge_home_override() {
 
 AGENT_BRIDGE_CONFIG_DIR_OVERRIDE=""
 if [ -n "${AGENT_BRIDGE_HOME:-}" ]; then
-  # Explicit state-dir override wins. Trust it.
-  AGENT_BRIDGE_CONFIG_DIR_OVERRIDE="$(_ab_normalize_bridge_home_override "$AGENT_BRIDGE_HOME")"
+  # Explicit state-dir override wins after fail-closed absolute-path validation.
+  if ! AGENT_BRIDGE_CONFIG_DIR_OVERRIDE="$(_ab_normalize_bridge_home_override "$AGENT_BRIDGE_HOME")"; then
+    exit 2
+  fi
 elif [ ! -f "$HOME/.agent-bridge/config" ]; then
   _ab_real_home="$(_real_user_home 2>/dev/null || true)"
   if [ -n "$_ab_real_home" ] && [ "$_ab_real_home" != "$HOME" ] \
@@ -2845,6 +2926,57 @@ cmd_chime() {
   node "$chime_cli" "$@"
 }
 
+cmd_codex() {
+  # [CODEX-CHANNEL 4.10.0] First-class Codex support. Thin dispatcher into
+  # codex-channel/bin/codex-channel.mjs (bind/rebind/unbind/enable/disable/
+  # list/status/doctor/send/service). All logic lives in the node CLI so it
+  # is testable and shared with the codex-channel daemon.
+  #
+  # Resolution mirrors cmd_plugin_registry_rewire: dev-clone layout first
+  # (symlinked CLI on macOS/Linux), then known dev-clone paths for installed
+  # bin-copy layouts (Windows install.ps1 copies the CLI instead of
+  # symlinking, so $0 does not live inside the repo there).
+  local resolved script_dir repo_root codex_cli candidate
+  resolved="$0"
+  while [ -h "$resolved" ]; do
+    script_dir="$(cd -P "$(dirname "$resolved")" && pwd)"
+    resolved="$(readlink "$resolved")"
+    [[ "$resolved" != /* ]] && resolved="$script_dir/$resolved"
+  done
+  repo_root="$(cd -P "$(dirname "$resolved")" && pwd)"
+
+  # Resolution order:
+  #   0. AGENT_BRIDGE_SOURCE_DIR (explicit override — always honored)
+  #   1. dev-clone layout next to this (symlinked) CLI
+  #   2. installed self-contained runtime dropped by install.sh / install.ps1
+  #   3. well-known dev-clone locations (macOS/Linux + Windows Git Bash)
+  codex_cli=""
+  for candidate in \
+    ${AGENT_BRIDGE_SOURCE_DIR:+"$AGENT_BRIDGE_SOURCE_DIR/codex-channel/bin/codex-channel.mjs"} \
+    "$repo_root/codex-channel/bin/codex-channel.mjs" \
+    "$CONFIG_DIR/runtime/codex-channel/bin/codex-channel.mjs" \
+    "$HOME/Projects/agent-bridge/codex-channel/bin/codex-channel.mjs" \
+    "$HOME/.openclaw/workspace/agent-bridge/codex-channel/bin/codex-channel.mjs" \
+    "${USERPROFILE:-$HOME}/Projects/agent-bridge/codex-channel/bin/codex-channel.mjs" \
+    "${USERPROFILE:-$HOME}/.openclaw/workspace/agent-bridge/codex-channel/bin/codex-channel.mjs"; do
+    if [ -f "$candidate" ]; then
+      codex_cli="$candidate"
+      break
+    fi
+  done
+
+  [ -n "$codex_cli" ] || die "codex-channel runtime not found (searched: \$AGENT_BRIDGE_SOURCE_DIR, $repo_root/codex-channel/, $CONFIG_DIR/runtime/codex-channel/, $HOME/Projects/agent-bridge/, $HOME/.openclaw/workspace/agent-bridge/). Re-run install.sh / install.ps1 (which installs the self-contained runtime), clone the agent-bridge repo, or set AGENT_BRIDGE_SOURCE_DIR to a checkout."
+  command -v node >/dev/null 2>&1 || die "node is required for 'agent-bridge codex'"
+  exec node "$codex_cli" "$@"
+}
+
+cmd_codex_help() {
+  printf '\nagent-bridge codex — first-class Codex support (bind tasks, push delivery, doctor)\n\n'
+  printf 'Usage:\n  agent-bridge codex <bind|rebind|unbind|enable|disable|list|status|doctor|send|service|help> [options]\n\n'
+  printf 'Run `agent-bridge codex help` for full per-verb documentation.\n'
+  printf 'Docs: codex-channel/README.md\n\n'
+}
+
 cmd_plugin_registry_rewire() {
   # [PLUGIN-REGISTRY-REWIRE 2026-05-01] Manual on-demand invocation of the
   # self-healing harness-side plugin-registry validator. Same code path as the
@@ -3239,6 +3371,7 @@ cmd_help() {
   printf '  pair               Pair with another machine (interactive or flags)\n'
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
   printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
+  printf '  codex <sub>        First-class Codex: bind tasks to codex/<alias> targets, push delivery, doctor (bind|list|status|send|service|...)\n'
   printf '  notify <machine>   Pop a native macOS notification on a Mac (local or remote); --local renders here\n'
   printf '  learnings <sub>    SHARED CONTEXT: fleet-wide learnings store (add|search|list|show|sync|remove|ingest)\n'
   printf '  plugin-registry-rewire  Self-heal stale plugin-registry entries (Claude Code + OpenClaw)\n'
@@ -3292,6 +3425,7 @@ main() {
     pair)     cmd_pair "$@" ;;
     config)   cmd_config "$@" ;;
     chime)    cmd_chime "$@" ;;
+    codex)    cmd_codex "$@" ;;
     notify)   cmd_notify "$@" ;;
     learnings) cmd_learnings "$@" ;;
     plugin-registry-rewire) cmd_plugin_registry_rewire "$@" ;;

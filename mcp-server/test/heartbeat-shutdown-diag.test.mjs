@@ -106,6 +106,12 @@ test('server.shutdown_diag dumps active handles and request counts on shutdown',
     // exceed any fixed-sleep budget on slow CI.
     const startingEvt = await waitForEvent(home, 'server.starting', 8000);
     assert.ok(startingEvt, 'expected server.starting event before shutdown');
+    // server.starting and server.ready are both emitted before the signal
+    // handlers are installed. Under full-suite load a signal in that startup
+    // window takes Node's default termination path and cannot emit shutdown
+    // diagnostics. Wait for the exact handler-registration boundary.
+    const handlersReadyEvt = await waitForEvent(home, 'server.signal_handlers_ready', 8000);
+    assert.ok(handlersReadyEvt, 'expected signal handlers before sending shutdown signal');
     const shutdownSignal = process.platform === 'win32' ? 'SIGINT' : 'SIGTERM';
     server.child.kill(shutdownSignal);
     await new Promise((resolve) => server.child.once('exit', resolve));

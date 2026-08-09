@@ -8,6 +8,39 @@
 
 $ErrorActionPreference = 'Stop'
 
+function Test-AgentBridgeAbsolutePath {
+    param([string]$Path)
+    if ($Path -match '^[A-Za-z]:[\\/]') { return $true }
+    # A stable UNC root requires both server and share. Root-relative paths,
+    # drive-relative C:state, and \\server without a share are cwd-dependent.
+    if ($Path -match '^[\\/]{2}[^\\/]+[\\/]+[^\\/]+(?:[\\/]|$)') { return $true }
+    return $false
+}
+
+function Resolve-AgentBridgeHome {
+    $raw = [string]$env:AGENT_BRIDGE_HOME
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return (Join-Path $env:USERPROFILE '.agent-bridge')
+    }
+    $raw = $raw.Trim()
+    if ($raw -eq '~') {
+        $raw = $env:USERPROFILE
+    } elseif ($raw.StartsWith('~/') -or $raw.StartsWith('~\')) {
+        $raw = Join-Path $env:USERPROFILE $raw.Substring(2)
+    }
+    $trimmed = $raw.TrimEnd([char[]]@('\', '/'))
+    if (($trimmed -match '^[A-Za-z]:$') -and ($raw -match '^[A-Za-z]:[\\/]+$')) { $trimmed += '\' }
+    if (-not (Test-AgentBridgeAbsolutePath $trimmed)) {
+        throw "AGENT_BRIDGE_HOME must resolve to an absolute path: $raw"
+    }
+    if ((Split-Path -Leaf $trimmed) -ieq '.agent-bridge') {
+        return $trimmed
+    }
+    return (Join-Path $trimmed '.agent-bridge')
+}
+
+$BridgeHome = Resolve-AgentBridgeHome
+
 $Repo        = 'https://raw.githubusercontent.com/EthanSK/agent-bridge/main'
 $InstallDir  = Join-Path $env:LOCALAPPDATA 'agent-bridge\bin'
 $ScriptPath  = Join-Path $InstallDir 'agent-bridge'
@@ -42,6 +75,104 @@ try {
     Invoke-WebRequest -Uri "$Repo/scripts/plugin-registry-rewire.mjs" -OutFile $RewireScriptPath -UseBasicParsing
 } catch {
     Write-Host '  (note: could not fetch plugin-registry-rewire.mjs; CLI will fall back to dev-clone search)' -ForegroundColor DarkGray
+}
+
+# --------------------------------------------------------------------------
+# Self-contained codex-channel runtime (4.10.0). `agent-bridge codex ...`
+# needs the codex-channel package; the CLI prefers AGENT_BRIDGE_SOURCE_DIR /
+# a local clone, and otherwise uses this snapshot at
+# <resolved-bridge-home>\runtime\codex-channel\. The package is fully
+# self-contained (vendored shared modules, zero npm deps). Non-fatal.
+# --------------------------------------------------------------------------
+$RuntimeDir  = Join-Path $BridgeHome 'runtime'
+$ZipUrl      = 'https://codeload.github.com/EthanSK/agent-bridge/zip/refs/heads/main'
+$CodexRuntimeOk = $false
+try {
+    $TmpZipDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ab-codex-runtime-" + [System.Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $TmpZipDir -Force | Out-Null
+    $ZipPath = Join-Path $TmpZipDir 'repo.zip'
+    Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath -UseBasicParsing
+    Expand-Archive -Path $ZipPath -DestinationPath $TmpZipDir -Force
+    $SrcDir = Get-ChildItem -Path $TmpZipDir -Directory |
+        Where-Object { Test-Path (Join-Path $_.FullName 'codex-channel\bin\codex-channel.mjs') } |
+        Select-Object -First 1
+    if ($null -ne $SrcDir) {
+        New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null
+        $Dest    = Join-Path $RuntimeDir 'codex-channel'
+        $DestNew = Join-Path $RuntimeDir 'codex-channel.new'
+        $DestOld = Join-Path $RuntimeDir 'codex-channel.old'
+        # Stage next to the live dir, then swap with rollback — no
+        # remove-then-empty gap for a daemon restarting mid-install.
+        if (Test-Path $DestNew) { Remove-Item -Path $DestNew -Recurse -Force }
+        if (Test-Path $DestOld) { Remove-Item -Path $DestOld -Recurse -Force }
+        Copy-Item -Path (Join-Path $SrcDir.FullName 'codex-channel') -Destination $DestNew -Recurse -Force
+        if (-not (Test-Path (Join-Path $DestNew 'bin\codex-channel.mjs'))) {
+            throw 'staged codex-channel payload is incomplete'
+        }
+        if (Test-Path $Dest) { Move-Item -Path $Dest -Destination $DestOld -Force }
+        try {
+            Move-Item -Path $DestNew -Destination $Dest -Force
+            if (Test-Path $DestOld) { Remove-Item -Path $DestOld -Recurse -Force }
+        } catch {
+            if (Test-Path $DestOld) { Move-Item -Path $DestOld -Destination $Dest -Force -ErrorAction SilentlyContinue }
+            throw
+        }
+        $CodexRuntimeOk = $true
+        Write-Host "  [ok] codex-channel runtime installed to $Dest" -ForegroundColor Green
+    } else {
+        Write-Host '  [warn] Codex support NOT installed: codex-channel not present in the repo zip.' -ForegroundColor Yellow
+        Write-Host '         agent-bridge codex needs the runtime: clone the repo, set AGENT_BRIDGE_SOURCE_DIR, or re-run install.ps1 with network access.' -ForegroundColor DarkGray
+    }
+    Remove-Item -Path $TmpZipDir -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    Write-Host "  [warn] Codex support NOT installed: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host '         agent-bridge codex needs the runtime: clone the repo, set AGENT_BRIDGE_SOURCE_DIR, or re-run install.ps1 with network access.' -ForegroundColor DarkGray
+}
+
+function Test-CodexRecoveryWork {
+    $bindingsPath = Join-Path $BridgeHome 'codex\bindings.json'
+    if (Test-Path $bindingsPath) {
+        try {
+            $registry = Get-Content -Raw -Path $bindingsPath -Encoding UTF8 | ConvertFrom-Json
+            if ($registry.bindings) {
+                foreach ($property in $registry.bindings.PSObject.Properties) {
+                    $binding = $property.Value
+                    if (($null -ne $binding) -and ($binding.enabled -ne $false)) { return $true }
+                }
+            }
+        } catch { }
+    }
+    $pendingDir = Join-Path $BridgeHome 'codex\pending-settings'
+    return @(Get-ChildItem -Path $pendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count -gt 0
+}
+
+# Re-running the installer updates the runtime. If delivery or crash-recovery
+# work exists, run the version-aware ensure path from the newly swapped copy.
+if ($CodexRuntimeOk) {
+    if ($env:AGENT_BRIDGE_CODEX_NO_ENSURE -eq '1') {
+        Write-Host '  [skip] AGENT_BRIDGE_CODEX_NO_ENSURE=1 — codex-channel service not ensured.' -ForegroundColor DarkGray
+    } elseif ((Get-Command node -ErrorAction SilentlyContinue) -and (Test-CodexRecoveryWork)) {
+        # The override may have arrived as a parent dir or tilde form. Ensure
+        # the child runtime sees the exact normalized state dir used above.
+        $PreviousBridgeHome = [Environment]::GetEnvironmentVariable('AGENT_BRIDGE_HOME', 'Process')
+        $EnsureExitCode = 1
+        try {
+            $env:AGENT_BRIDGE_HOME = $BridgeHome
+            & node (Join-Path $RuntimeDir 'codex-channel\service.mjs') --ensure 2>$null | Out-Null
+            $EnsureExitCode = $LASTEXITCODE
+        } finally {
+            if ($null -eq $PreviousBridgeHome) {
+                Remove-Item Env:AGENT_BRIDGE_HOME -ErrorAction SilentlyContinue
+            } else {
+                $env:AGENT_BRIDGE_HOME = $PreviousBridgeHome
+            }
+        }
+        if ($EnsureExitCode -eq 0) {
+            Write-Host '  [ok] codex-channel service ensured from the installed runtime' -ForegroundColor Green
+        } else {
+            Write-Host "  [warn] codex-channel runtime installed, but service ensure exited with code $EnsureExitCode; run 'agent-bridge codex service ensure'." -ForegroundColor Yellow
+        }
+    }
 }
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

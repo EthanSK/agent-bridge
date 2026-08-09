@@ -22,6 +22,11 @@
  * install" + `agent-bridge plugin-registry-rewire`).
  */
 
+// 4.10.0 [CODEX-CHANNEL packaging]: re-export the PACKAGE-LOCAL vendor
+// snapshot (mcp-server/vendor/, refreshed from lib/ by the npm `prebuild`
+// sync + parity-tested) instead of `../../lib/…`, so the marketplace/cache
+// artifact — which contains the mcp-server directory ALONE — is
+// self-contained and never fails to load outside a full repo checkout.
 export {
   DEFAULT_RELAY_EXPAND_TTL_MS,
   DEFAULT_RELAY_EXPAND_MAX_ENTRIES,
@@ -32,11 +37,11 @@ export {
   storeRelayExpandMessage,
   readRelayExpandEntry,
   formatRelayExpandEntry,
-} from '../../lib/relay-expand-store.js';
+} from '../vendor/relay-expand-store.js';
 
 export type {
   RelayExpandBridgeMessage,
   RelayExpandMetadata,
   RelayExpandStoreOpts,
   RelayExpandRecord,
-} from '../../lib/relay-expand-store.js';
+} from '../vendor/relay-expand-store.js';

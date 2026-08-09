@@ -12,8 +12,8 @@
 //
 // Critical invariants tested:
 //   - Stale missing-installPath triggers the right action
-//   - Strategy A (rewire) — when no marketplace entry
-//   - Strategy B (remove) — when directory-source marketplace entry exists
+//   - Stale registrations are rewired whether or not a marketplace exists
+//   - Missing enabled registration is restored when the marketplace exists
 //   - Multiple entries (user + project scope) handled per-entry
 //   - OpenClaw plugins.load.paths rewired
 //   - Idempotent re-run is a no-op
@@ -112,7 +112,7 @@ function teardown(...paths) {
 
 // ---------- Tests -----------------------------------------------------------
 
-test('Strategy B: removes stale entry when directory-source marketplace exists', () => {
+test('rewires stale entry when directory-source marketplace exists', () => {
   const home = makeSandbox();
   const repo = fakeRepoRoot();
   try {
@@ -149,15 +149,17 @@ test('Strategy B: removes stale entry when directory-source marketplace exists',
     assert.equal(res.status, 0, `script failed: ${res.stderr}`);
 
     const after = readJson(installedPath);
-    assert.equal(after.plugins['agent-bridge@agent-bridge'], undefined,
-      'agent-bridge entry should have been removed (Strategy B)');
+    const entries = after.plugins['agent-bridge@agent-bridge'];
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].installPath, join(repo, 'mcp-server'),
+      'agent-bridge entry must remain installed and point at the live plugin root');
     assert.deepEqual(after.plugins['repost-with-agent@repost-with-agent'],
       [{ scope: 'user', installPath: '/some/repost/path', version: '4.1.0' }],
       'unrelated plugin entries must NEVER be touched');
 
     const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
-      (r) => r.context.action === 'removed' && r.context.harness === 'claude-code');
-    assert.ok(ev, 'expected removed-action event');
+      (r) => r.context.action === 'rewired' && r.context.harness === 'claude-code');
+    assert.ok(ev, 'expected rewired-action event');
     assert.equal(ev.context.plugin, 'agent-bridge');
     assert.equal(ev.context.reason, 'missing_install_path');
   } finally {
@@ -165,7 +167,7 @@ test('Strategy B: removes stale entry when directory-source marketplace exists',
   }
 });
 
-test('Strategy A: rewires installPath when no marketplace entry exists', () => {
+test('rewires installPath when no marketplace entry exists', () => {
   const home = makeSandbox();
   const repo = fakeRepoRoot();
   try {
@@ -217,8 +219,8 @@ test('multiple entries (user + project): each is handled per-entry', () => {
     const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
     const settingsPath = join(home, '.claude', 'settings.json');
 
-    // user-scope entry is stale; project-scope is current. Marketplace entry
-    // exists, so stale → removed; current → kept.
+    // user-scope entry is stale; project-scope is current. Both registrations
+    // must remain present after the stale one is rewired.
     writeJson(installedPath, {
       version: 2,
       plugins: {
@@ -248,9 +250,8 @@ test('multiple entries (user + project): each is handled per-entry', () => {
 
     const after = readJson(installedPath);
     const entries = after.plugins['agent-bridge@agent-bridge'];
-    assert.equal(entries.length, 1, 'one stale entry should be removed; one current entry kept');
-    assert.equal(entries[0].scope, 'project');
-    assert.equal(entries[0].installPath, join(repo, 'mcp-server'));
+    assert.equal(entries.length, 2, 'stale registration should be repaired, not removed');
+    assert.ok(entries.every((entry) => entry.installPath === join(repo, 'mcp-server')));
   } finally {
     teardown(home, repo);
   }
@@ -433,6 +434,150 @@ test('does not touch unrelated plugin keys', () => {
   }
 });
 
+test('restores a missing enabled entry when directory marketplace exists', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const settingsPath = join(home, '.claude', 'settings.json');
+
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'telegram@claude-plugins-official': [{ scope: 'user', installPath: '/telegram' }],
+      },
+    });
+    writeJson(settingsPath, {
+      enabledPlugins: { 'agent-bridge@agent-bridge': true },
+      extraKnownMarketplaces: {
+        'agent-bridge': { source: { source: 'directory', path: repo } },
+      },
+    });
+
+    const { res, log } = runRewire(home, repo);
+    assert.equal(res.status, 0, `script failed: ${res.stderr}`);
+
+    const after = readJson(installedPath);
+    const entries = after.plugins['agent-bridge@agent-bridge'];
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].scope, 'user');
+    assert.equal(entries[0].installPath, join(repo, 'mcp-server'));
+    assert.equal(entries[0].version, '3.14.0');
+    assert.deepEqual(after.plugins['telegram@claude-plugins-official'], [
+      { scope: 'user', installPath: '/telegram' },
+    ]);
+
+    const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
+      (r) => r.context.action === 'restored');
+    assert.ok(ev, 'expected missing installed entry to be restored');
+    assert.equal(ev.context.reason, 'enabled_plugin_entry_missing');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
+test('restores a missing enabled entry to the current installed cache when present', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const cachePath = join(home, '.claude', 'plugins', 'cache', 'agent-bridge', 'agent-bridge', '3.14.0');
+    mkdirSync(cachePath, { recursive: true });
+
+    writeJson(installedPath, { version: 2, plugins: {} });
+    writeJson(settingsPath, {
+      enabledPlugins: { 'agent-bridge@agent-bridge': true },
+      extraKnownMarketplaces: {
+        'agent-bridge': { source: { source: 'directory', path: repo } },
+      },
+    });
+
+    const { res } = runRewire(home, repo);
+    assert.equal(res.status, 0, `script failed: ${res.stderr}`);
+    const entries = readJson(installedPath).plugins['agent-bridge@agent-bridge'];
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].installPath, cachePath,
+      'official current-version cache is the preferred installed plugin root');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
+test('keeps a valid current-version installed cache instead of rewiring it to source', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const cachePath = join(home, '.claude', 'plugins', 'cache', 'agent-bridge', 'agent-bridge', '3.14.0');
+    mkdirSync(cachePath, { recursive: true });
+
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'agent-bridge@agent-bridge': [{
+          scope: 'user',
+          installPath: cachePath,
+          version: '3.14.0',
+        }],
+      },
+    });
+    writeJson(settingsPath, {
+      enabledPlugins: { 'agent-bridge@agent-bridge': true },
+      extraKnownMarketplaces: {
+        'agent-bridge': { source: { source: 'directory', path: repo } },
+      },
+    });
+
+    const before = readFileSync(installedPath, 'utf8');
+    const { res } = runRewire(home, repo);
+    assert.equal(res.status, 0, `script failed: ${res.stderr}`);
+    assert.equal(readFileSync(installedPath, 'utf8'), before,
+      'current official cache registration must remain byte-identical');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
+test('rewires source registration to the current installed cache when available', () => {
+  const home = makeSandbox();
+  const repo = fakeRepoRoot();
+  try {
+    const installedPath = join(home, '.claude', 'plugins', 'installed_plugins.json');
+    const settingsPath = join(home, '.claude', 'settings.json');
+    const cachePath = join(home, '.claude', 'plugins', 'cache', 'agent-bridge', 'agent-bridge', '3.14.0');
+    mkdirSync(cachePath, { recursive: true });
+
+    writeJson(installedPath, {
+      version: 2,
+      plugins: {
+        'agent-bridge@agent-bridge': [{
+          scope: 'user',
+          installPath: join(repo, 'mcp-server'),
+          version: '3.14.0',
+        }],
+      },
+    });
+    writeJson(settingsPath, {
+      enabledPlugins: { 'agent-bridge@agent-bridge': true },
+      extraKnownMarketplaces: {
+        'agent-bridge': { source: { source: 'directory', path: repo } },
+      },
+    });
+
+    const { res, log } = runRewire(home, repo);
+    assert.equal(res.status, 0, `script failed: ${res.stderr}`);
+    const entries = readJson(installedPath).plugins['agent-bridge@agent-bridge'];
+    assert.equal(entries[0].installPath, cachePath);
+    const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
+      (r) => r.context.reason === 'source_path_replaced_by_current_install_cache');
+    assert.ok(ev, 'expected source registration to move to official current cache');
+  } finally {
+    teardown(home, repo);
+  }
+});
+
 test('OpenClaw plugins.load.paths: existing path that does not match current is left alone (warn, no edit)', () => {
   const home = makeSandbox();
   const repo = fakeRepoRoot();
@@ -538,7 +683,7 @@ test('dry-run does not modify files but still emits log events', () => {
       'dry-run must NOT modify installed_plugins.json');
 
     const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
-      (r) => r.context.action === 'removed');
+      (r) => r.context.action === 'rewired');
     assert.ok(ev, 'dry-run still emits the rewired event');
     assert.equal(ev.context.dry_run, true);
   } finally {
@@ -575,12 +720,14 @@ test('cache-path entry that exists but does not match current dev-clone is rewir
     assert.equal(res.status, 0);
 
     const after = readJson(installedPath);
-    assert.equal(after.plugins['agent-bridge@agent-bridge'], undefined,
-      'stale cache-path entry should be removed (Strategy B + cache-path detection)');
+    const entries = after.plugins['agent-bridge@agent-bridge'];
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].installPath, join(repo, 'mcp-server'),
+      'stale cache-path entry should be rewired to the live plugin root');
 
     const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
-      (r) => r.context.reason === 'stale_cache_path_dev_clone_active');
-    assert.ok(ev, 'expected stale_cache_path_dev_clone_active reason event');
+      (r) => r.context.reason === 'stale_cache_path_not_current_install');
+    assert.ok(ev, 'expected stale_cache_path_not_current_install reason event');
   } finally {
     teardown(home, repo);
   }
@@ -636,10 +783,10 @@ test('codex-review v3.14.1: tolerates JSONC (line + block comments + trailing co
     assert.equal(res.status, 0,
       `JSONC settings.json should not abort: rc=${res.status} stderr=${res.stderr}`);
 
-    // Strategy B should have fired (marketplace was detected despite JSONC).
+    // Rewire should fire (marketplace was detected despite JSONC).
     const ev = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
-      (r) => r.context.action === 'removed' && r.context.harness === 'claude-code');
-    assert.ok(ev, 'Strategy B should fire — marketplace entry detected through JSONC tolerance');
+      (r) => r.context.action === 'rewired' && r.context.harness === 'claude-code');
+    assert.ok(ev, 'rewire should fire — marketplace entry detected through JSONC tolerance');
   } finally {
     teardown(home, repo);
   }
@@ -763,10 +910,10 @@ test('codex-review v3.14.1: non-array agent-bridge entry is normalized to array,
     assert.ok(ev, 'must emit warn that the entry was an object not array');
     assert.equal(ev.context.action, 'normalized_to_single_element_array');
 
-    // And the actual rewire (Strategy B) should still fire.
-    const removed = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
-      (r) => r.context.action === 'removed');
-    assert.ok(removed, 'Strategy B should still fire after normalizing object→array');
+    // And the actual rewire should still fire.
+    const rewired = findEvent(log, 'auto_update_runner.plugin_registry_rewired',
+      (r) => r.context.action === 'rewired');
+    assert.ok(rewired, 'rewire should still fire after normalizing object→array');
   } finally {
     teardown(home, repo);
   }

@@ -34,13 +34,13 @@ import { randomUUID } from 'node:crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexPath = join(__dirname, '..', 'build', 'index.js');
-const EXPECTED_VERSION = '4.9.2';
+const EXPECTED_VERSION = '4.10.0';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function startServer(home, env = {}) {
+function startServer(home, env = {}, onFrame = null) {
   const child = spawn(process.execPath, [indexPath], {
     env: {
       ...process.env,
@@ -63,7 +63,25 @@ function startServer(home, env = {}) {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   child.stderr.resume();
-  child.stdout.resume();
+  if (onFrame) {
+    let buffer = '';
+    child.stdout.on('data', (chunk) => {
+      buffer += String(chunk);
+      let idx;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        if (!line.trim()) continue;
+        try {
+          onFrame(JSON.parse(line));
+        } catch {
+          // Ignore non-JSON diagnostics; MCP frames are newline-delimited JSON.
+        }
+      }
+    });
+  } else {
+    child.stdout.resume();
+  }
   return child;
 }
 
@@ -484,6 +502,21 @@ test('4.0.0: persona resolution wires the parent-capability decision via persona
   );
 });
 
+test('initial offline replay waits for Claude to register channel handlers', async () => {
+  const indexSource = await readFile(
+    join(__dirname, '..', 'src', 'index.ts'),
+    'utf8',
+  );
+
+  assert.match(indexSource, /INITIAL_CHANNEL_REPLAY_DELAY_MS\s*=\s*5_000/,
+    'startup replay must include a readiness window after MCP connect');
+  assert.match(indexSource,
+    /setTimeout\(\(\) => \{[\s\S]*?replayUndeliveredMessages\(\)[\s\S]*?INITIAL_CHANNEL_REPLAY_DELAY_MS/,
+    'offline replay must be scheduled after the readiness window, not emitted inline');
+  assert.match(indexSource, /channel\.initial_replay_armed/,
+    'the delayed replay decision must be observable in the unified log');
+});
+
 // ─── Patch G — SIGTERM ignored when parent alive + watcher healthy ──────────
 test('Patch G: SIGTERM is ignored when parent is alive and channel-owner watcher is healthy', { timeout: 12_000 }, async (t) => {
   if (process.platform === 'win32') {
@@ -660,9 +693,10 @@ test('unified plugin: watcher detects new inbox file, pushes channel notificatio
   const inboxDir = join(home, '.agent-bridge', 'inbox', 'claude-code', 'default');
   const pendingAckDir = join(home, '.agent-bridge', 'inbox', '.pending-ack', 'claude-code', 'default');
 
+  const frames = [];
   const child = startServer(home, {
     // startServer already sets AGENT_BRIDGE_PERSONA=default.
-  });
+  }, (frame) => frames.push(frame));
   try {
     // Wait for plugin startup.
     await sleep(1500);
@@ -676,7 +710,9 @@ test('unified plugin: watcher detects new inbox file, pushes channel notificatio
       to: 'test-unified',
       type: 'message',
       content: 'hello from the unified-delivery test',
-      timestamp: new Date().toISOString(),
+      // Reproduce the legacy sender shape that Claude Code 2.1.226 rejects
+      // unless the channel adapter converts meta.ts to a string.
+      timestamp: Date.now(),
       replyTo: null,
       ttl: 600,
       target: 'claude-code/default',
@@ -731,6 +767,23 @@ test('unified plugin: watcher detects new inbox file, pushes channel notificatio
     assert.ok(pushed, 'expected message.pushed_to_channel event for delivered msg');
     const pending = events.find((e) => e.event === 'channel.pending_staged' && e.context?.msg_id === msgId);
     assert.ok(pending, 'expected channel.pending_staged event for delivered msg (3.9.0)');
+
+    const notification = frames.find(
+      (frame) =>
+        frame?.method === 'notifications/claude/channel'
+        && frame?.params?.meta?.message_id === msgId,
+    );
+    assert.ok(notification, 'expected the exact Claude channel JSON-RPC notification frame');
+    assert.equal(
+      typeof notification.params.meta.ts,
+      'string',
+      'Claude channel meta.ts must be a string even when the sender used an epoch number',
+    );
+    assert.equal(
+      notification.params.meta.ts,
+      new Date(msg.timestamp).toISOString(),
+      'numeric sender timestamps are preserved as canonical ISO text',
+    );
   } finally {
     try { child.kill('SIGTERM'); } catch {}
     try {

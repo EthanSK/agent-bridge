@@ -192,11 +192,34 @@ Targets decide which listener on the receiving machine picks up the message:
 - `"claude-code/default"` — the default Claude Code persona. Pre-4.0 senders may still address legacy `"claude-code"`; v4 receivers migrate that flat path into `claude-code/default/`.
 - `"claude-code/<persona>"` — a named Claude Code persona on the receiving machine, e.g. `"claude-code/yolo"`.
 - `"openclaw/<account>"` — injects into the OpenClaw Telegram session for `<account>`. If the openclaw side runs the openclaw-channel plugin ≥ 2.1.0, each account under `channels.telegram.accounts` is auto-discovered as a target, so you can address them directly without an extra `targets` block in `openclaw.json`. As of openclaw-channel v3.0+, the receiving OC agent decides where to reply via tool calls (`bridge_send_message` for the implicit bridge leg, plus the user-facing channel of its choice). Configure the user-facing hint via `channels["agent-bridge"].config.additionalReplyChannels` (default `["telegram"]` for telegram-bound targets, `[]` for headless targets). Pass `one_way: true` to suppress the bridge-reply expectation entirely.
+- `"codex/<alias>"` — a BOUND Codex task on the receiving machine (4.10.0+). The codex-channel daemon resumes the exact bound thread and starts a turn with the message; delivery queues while a turn is active. See "Codex targets" below.
 - `"<harness>/<name>"` — any other configured harness/subdir. Target names may contain Unicode letters / digits plus `_`, `.`, `-`, `/` (no `..`, no leading/trailing `/`, no `//`, ≤256 chars).
 
 For bidirectional flows across harnesses, set `fromTarget` (or MCP tool arg `from_target`) on outbound messages to your own target-id (e.g. `fromTarget: "<harness>/<account-alias>"`). The Claude Code MCP tool supplies the sender's active `from_target: "claude-code/<persona>"` by default (usually `claude-code/default`) unless `one_way: true` is set. The receiver copies that into `reply.target` so the reply round-trips back to the session that originated it. For OpenClaw-originated sends, always use the CURRENT Telegram account's target-id (e.g. `openclaw/default`, `openclaw/<your-account-alias>`, etc.) so replies stay isolated per account.
 
 The message is pushed into the running Claude session on MacBook-Pro as a `<channel source="agent-bridge" ...>` event. Its reply comes back the same way. This is the only supported agent-to-agent communication path.
+
+### Codex targets (4.10.0+)
+
+Codex tasks are first-class endpoints once BOUND. A task opts in from its own shell:
+
+```bash
+agent-bridge codex bind   # auto-discovers CODEX_THREAD_ID + task-name alias
+```
+
+When the user in a Codex task says “use Agent Bridge”, “connect this task to Agent Bridge”, or equivalent, run that zero-argument bind from the current task; do not make them invent an alias. It reads the user-facing task name without resuming it, derives a portable alias, adds a short task-id suffix only for a real collision, persists that first alias across later title changes, and ensures the daemon. `--alias release-review` remains an explicit override.
+
+That binds the generated `codex/<alias>` target to the exact persisted thread; the codex-channel daemon (auto-started; single lease per machine) then watches `inbox/codex/<alias>/` and delivers inbound messages by resuming THAT thread and starting a turn (`turn/start`, queued while a turn is active; `clientUserMessageId` = the bridge message id). The injected text carries the standard `<channel source="agent-bridge">` + `[BRIDGE-CONTEXT]` metadata, including the exact reply call with `from_target: "codex/<alias>"`.
+
+Key operational facts:
+
+- Send TO a Codex task = plain `bridge_send_message({ machine, target: "codex/<alias>", ... })`. Nothing new.
+- FROM a Codex task: use the bridge MCP tools (registered tools-only — never set `AGENT_BRIDGE_PERSONA` for Codex); set `AGENT_BRIDGE_FROM_TARGET="codex/<alias>"` in the MCP env for a default reply identity, or pass `from_target` per send. No-MCP fallback: `agent-bridge codex send --machine <m> --target <t> --from-alias <alias> --message "…"`.
+- Bridge-delivered turns NEVER auto-approve: approval/permission/user-input requests are declined with reasons; delivered-turn overrides use `approvalPolicy=never` and sandbox `workspace-write` (network off), then the pre-bridge thread settings are restored before release.
+- Trust boundary: the message fence labels and protects the prompt boundary; it is not tool isolation. A paired sender targeting a bound alias supplies a user prompt and can ask the model to use tools already exposed to the task. Codex 0.145 has no per-turn tool allowlist/isolation, so bind only for peers whose prompt/tool authority you accept.
+- Ownership safety: if another Codex client (TUI/Desktop) is actively writing the thread, delivery defers (`deferred_foreign_activity`) until it goes quiet, and running threads are hydrated as busy on resume; `thread_not_found` / `ownership_conflict` / `codex_unsupported` are surfaced, never worked around with a substitute thread. Honest limit: Codex thread locks are process-local, so independent clients share no cross-process lock — avoid manually driving a bound task during bridge delivery; ambiguous deliveries dead-letter rather than duplicate.
+- Debug with `agent-bridge codex status|doctor` and `jq -c 'select(.component == "codex-channel")' ~/.agent-bridge/logs/agent-bridge.log`. Dead letters land in `inbox/.failed/.exhausted/`.
+- Full docs: [`codex-channel/README.md`](codex-channel/README.md).
 
 ### Named target routing
 
@@ -289,7 +312,7 @@ agent-bridge run MacBook-Pro "ps aux | head -20 && df -h && free -h 2>/dev/null"
 
 ## v2: MCP Server (running agent-to-agent communication)
 
-If the agent-bridge MCP server is configured, you have direct access to these tools without needing the CLI. The MCP server provides the shared `bridge_*` tools for EXISTING running agent sessions -- it does NOT spawn new agent processes. Push delivery is host-specific: Claude Code uses the MCP server's experimental `claude/channel` stdio path, while OpenClaw uses the separate native `openclaw-channel/` plugin.
+If the agent-bridge MCP server is configured, you have direct access to these tools without needing the CLI. The MCP server provides the shared `bridge_*` tools for EXISTING running agent sessions -- it does NOT spawn new agent processes. Inbound delivery is host-specific: Claude Code uses the MCP server's experimental `claude/channel` stdio path, OpenClaw uses the separate native `openclaw-channel/` plugin, and the background `codex-channel` service resumes the exact bound Codex task through the App Server.
 
 ### MCP tools
 
@@ -298,16 +321,23 @@ If the agent-bridge MCP server is configured, you have direct access to these to
 | `bridge_list_machines` | List paired machines and their connection details |
 | `bridge_status` | Check if a machine is reachable via SSH |
 | `bridge_send_message` | Send a message to another machine's running agent |
+| `bridge_notify` | Show a native macOS notification locally or on a paired Mac without waking an agent |
+| `bridge_learnings_add` | Add and replicate a fleet-wide shared-context learning |
+| `bridge_learnings_search` | Search the local replica of fleet-wide shared-context learnings |
 | `bridge_receive_messages` | Manual inspection/consumption of the local Claude Code-target inbox. Supports long-poll via `wait: true, timeout_seconds: 30` for subagents that need to receive bridge replies (channel push only reaches the parent session). |
 | `bridge_run_command` | Run a shell command on a remote machine |
 | `bridge_clear_inbox` | Clear the local inbox |
 | `bridge_inbox_stats` | Get inbox statistics and watcher health |
+| `bridge_codex_bind` | Connect the current Codex task with an automatic stable alias (explicit alias optional) |
+| `bridge_codex_unbind` | Remove a Codex alias binding while preserving queued files for a future rebind |
+| `bridge_codex_status` | Inspect local Codex bindings, queues, dead letters, and daemon health |
+| `claude_code_channel_status` | Diagnostic Claude Code plugin process, lease, version, and watcher health |
 
 ### Claude Code unified plugin (3.7.0+)
 
 For Claude Code, agent-bridge ships **one unified plugin** at `mcp-server/`. It hosts both:
 
-- The 7 user-facing `bridge_*` tools (and the diagnostic `claude_code_channel_status` no-op tool).
+- The 13 user-facing `bridge_*` tools (and the diagnostic `claude_code_channel_status` no-op tool).
 - The long-lived inbox watcher that owns a persona-scoped lease such as `~/.agent-bridge/locks/claude-code__default.watcher-lock.json`, polls `inbox/claude-code/<persona>/`, and emits `notifications/claude/channel` back to the running session.
 
 Incoming messages are pushed directly into the conversation as:
@@ -326,7 +356,7 @@ For Claude Code push:
 3. Machine B's `agent-bridge` plugin watcher detects the new file and emits `notifications/claude/channel` into the running Claude session
 4. Machine B responds via `bridge_send_message` back to Machine A with an explicit `target`
 
-For OpenClaw push, the gateway loads `openclaw-channel/`, watches `inbox/openclaw/<target>/`, and injects inbound messages into the matching running OpenClaw/Telegram session. Codex/Gemini/Aider inbound receive/reply loops remain scaffolded until tested end-to-end; `bridge_receive_messages` is the manual Claude Code-target inbox fallback (now with long-poll support, 3.8.0+) — see "Subagent receive (long-poll)" below.
+For OpenClaw push, the gateway loads `openclaw-channel/`, watches `inbox/openclaw/<target>/`, and injects inbound messages into the matching running OpenClaw/Telegram session. For Codex (4.10.0+), the background codex-channel service watches bound `inbox/codex/<alias>/` targets and wakes the exact persisted task through the App Server — see "Codex targets" above. Gemini/Aider inbound receive/reply loops remain scaffolded until tested end-to-end; `bridge_receive_messages` is the manual Claude Code-target inbox fallback (now with long-poll support, 3.8.0+) — see "Subagent receive (long-poll)" below.
 
 ### Subagent receive (long-poll, 3.8.0+)
 

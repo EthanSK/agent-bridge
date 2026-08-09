@@ -29,14 +29,23 @@ test('CC index.ts imports storeRelayExpandMessage from the shared lib', () => {
   );
 });
 
-test('CC mcp-server has a relay-expand-store re-export shim pointing at lib/', () => {
+test('CC mcp-server relay-expand-store shim re-exports the PACKAGE-LOCAL vendor snapshot (self-contained artifact)', () => {
+  // 4.10.0 packaging: the marketplace/cache artifact is the mcp-server
+  // directory ALONE, so the shim must resolve inside the package. The vendor
+  // snapshot is byte-parity-locked to lib/ by the prebuild sync +
+  // codex-channel/test/vendor-parity.test.mjs; the canonical lib/ API keeps
+  // its own coverage below.
   const shimSrc = readFileSync(
     resolve(__dirname, '..', 'src', 'relay-expand-store.ts'),
     'utf8',
   );
   assert.ok(
-    shimSrc.includes("from '../../lib/relay-expand-store.js'"),
-    'relay-expand-store.ts must re-export from the shared lib path',
+    shimSrc.includes("from '../vendor/relay-expand-store.js'"),
+    'relay-expand-store.ts must re-export the package-local vendor snapshot',
+  );
+  assert.ok(
+    !shimSrc.includes("from '../../lib/relay-expand-store.js'"),
+    'shim must NOT reach outside the shippable package',
   );
   assert.ok(
     shimSrc.includes('storeRelayExpandMessage'),

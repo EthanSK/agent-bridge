@@ -31,17 +31,55 @@
 
 [CmdletBinding()]
 param(
-    [switch]$WithOpenclawMcpRepair  # accepted for parity; no-op on Windows
+    [switch]$WithOpenclawMcpRepair,  # accepted for parity; no-op on Windows
+    [string]$AgentBridgeHome,
+    [switch]$CodexNoEnsure
 )
 
 $ErrorActionPreference = 'Continue'
 
+if (-not [string]::IsNullOrWhiteSpace($AgentBridgeHome)) {
+    $env:AGENT_BRIDGE_HOME = $AgentBridgeHome
+}
+if ($CodexNoEnsure) {
+    $env:AGENT_BRIDGE_CODEX_NO_ENSURE = '1'
+}
+
+function Test-AgentBridgeAbsolutePath {
+    param([string]$Path)
+    if ($Path -match '^[A-Za-z]:[\\/]') { return $true }
+    if ($Path -match '^[\\/]{2}[^\\/]+[\\/]+[^\\/]+(?:[\\/]|$)') { return $true }
+    return $false
+}
+
+function Resolve-AgentBridgeHome {
+    $raw = [string]$env:AGENT_BRIDGE_HOME
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return (Join-Path $env:USERPROFILE '.agent-bridge')
+    }
+    $raw = $raw.Trim()
+    if ($raw -eq '~') {
+        $raw = $env:USERPROFILE
+    } elseif ($raw.StartsWith('~/') -or $raw.StartsWith('~\')) {
+        $raw = Join-Path $env:USERPROFILE $raw.Substring(2)
+    }
+    $trimmed = $raw.TrimEnd([char[]]@('\', '/'))
+    if (($trimmed -match '^[A-Za-z]:$') -and ($raw -match '^[A-Za-z]:[\\/]+$')) { $trimmed += '\' }
+    if (-not (Test-AgentBridgeAbsolutePath $trimmed)) {
+        throw "AGENT_BRIDGE_HOME must resolve to an absolute path: $raw"
+    }
+    if ((Split-Path -Leaf $trimmed) -ieq '.agent-bridge') { return $trimmed }
+    return (Join-Path $trimmed '.agent-bridge')
+}
+
 # ---------- Config / paths --------------------------------------------------
 
-$Repo     = if ($env:AGENT_BRIDGE_REPO) { $env:AGENT_BRIDGE_REPO } else { Join-Path $env:USERPROFILE 'Projects\agent-bridge' }
-$LogDir   = Join-Path $env:USERPROFILE '.agent-bridge\logs'
-$RunDir   = Join-Path $env:USERPROFILE '.agent-bridge\run'
-$StateDir = Join-Path $env:USERPROFILE '.agent-bridge\state'
+$Repo       = if ($env:AGENT_BRIDGE_REPO) { $env:AGENT_BRIDGE_REPO } else { Join-Path $env:USERPROFILE 'Projects\agent-bridge' }
+$BridgeHome = Resolve-AgentBridgeHome
+$env:AGENT_BRIDGE_HOME = $BridgeHome
+$LogDir     = Join-Path $BridgeHome 'logs'
+$RunDir     = Join-Path $BridgeHome 'run'
+$StateDir   = Join-Path $BridgeHome 'state'
 $LogFile  = Join-Path $LogDir 'periodic-update.log'
 $LockDir  = Join-Path $RunDir 'periodic-update.lock'
 $BuiltHeadFile = Join-Path $StateDir 'built-head.txt'
@@ -52,6 +90,23 @@ function Write-Log {
     param([string]$Message)
     $ts = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     Add-Content -Path $LogFile -Value "$ts $Message" -Encoding UTF8
+}
+
+function Test-CodexRecoveryWork {
+    $bindingsPath = Join-Path $BridgeHome 'codex\bindings.json'
+    if (Test-Path $bindingsPath) {
+        try {
+            $registry = Get-Content -Raw -Path $bindingsPath -Encoding UTF8 | ConvertFrom-Json
+            if ($registry.bindings) {
+                foreach ($property in $registry.bindings.PSObject.Properties) {
+                    $binding = $property.Value
+                    if (($null -ne $binding) -and ($binding.enabled -ne $false)) { return $true }
+                }
+            }
+        } catch { }
+    }
+    $pendingDir = Join-Path $BridgeHome 'codex\pending-settings'
+    return @(Get-ChildItem -Path $pendingDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count -gt 0
 }
 
 function Invoke-CaptureExit {
@@ -288,6 +343,25 @@ try {
             } catch {
                 Write-Log "ERROR: failed to refresh packaged CLI: $($_.Exception.Message)"
             }
+        }
+    }
+
+    # ---------- Step 6: codex-channel service refresh (4.10.0) --------------
+    # Enabled bindings need delivery; pending sticky-settings journals need
+    # crash recovery even after their binding was disabled or removed.
+    $CodexService  = Join-Path $Repo 'codex-channel\service.mjs'
+    if (Test-Path $CodexService) {
+        if ($env:AGENT_BRIDGE_CODEX_NO_ENSURE -eq '1') {
+            Write-Log 'codex-channel ensure skipped: AGENT_BRIDGE_CODEX_NO_ENSURE=1'
+        } elseif (Test-CodexRecoveryWork) {
+            & node $CodexService --ensure 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "codex-channel service ensured from $CodexService"
+            } else {
+                Write-Log "WARN: codex-channel service ensure exited with code $LASTEXITCODE (non-fatal)"
+            }
+        } else {
+            Write-Log 'codex-channel ensure skipped: no enabled bindings or pending settings journals'
         }
     }
 

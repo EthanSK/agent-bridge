@@ -5,10 +5,9 @@
  * 3.7.0 — Undo of the 3.6.0 split. The dedicated `claude-code-channel` plugin
  * has been merged BACK into this MCP server. We now host:
  *
- *   1. The 7 user-facing bridge tools (bridge_send_message, bridge_status,
- *      bridge_list_machines, bridge_run_command, bridge_inbox_stats,
- *      bridge_clear_inbox, bridge_receive_messages) — registered by
- *      `tools.ts::registerTools()`.
+ *   1. The 13 user-facing bridge tools (transport, notifications, shared
+ *      learnings, inbox operations, and Codex binding lifecycle) — registered
+ *      by `tools.ts::registerTools()`.
  *   2. The diagnostic no-op tool `claude_code_channel_status` originally
  *      added by 3.6.3 Patch H. Retained because it doubles as a useful
  *      health probe.
@@ -99,6 +98,9 @@ import { logInfo, logError, logWarn } from './logger.js';
 import { logEvent } from './log.js';
 import { formatRelayScaffold } from './relay-notice.js';
 import { storeRelayExpandMessage } from './relay-expand-store.js';
+// Lazy Codex discovery helpers ONLY (no static codex-channel dependency —
+// ./codex.js resolves the runtime at call time; see its packaging note).
+import { codexEnsureRequired, codexServiceScriptCandidates } from './codex.js';
 
 // 3.7.1 — version is sourced from config.ts (single source of truth shared
 // with watcher.ts so lease files carry our build version for Patch F's
@@ -776,19 +778,21 @@ async function main(): Promise<void> {
         '- bridge_list_machines: List paired machines and their connection details',
         '- bridge_status: Check if a machine is reachable via SSH',
         '- bridge_send_message: Send a message to a running agent on another machine',
+        '- bridge_notify: Show a native notification locally or on a paired Mac without waking an agent',
         '- bridge_learnings_search: Search the fleet-wide SHARED CONTEXT learnings store (see SHARED CONTEXT below)',
         '- bridge_learnings_add: Record a fleet-wide learning in the shared-context store (replicates to all paired machines)',
         '- bridge_receive_messages: Manually check for messages (usually not needed — channel pushes them)',
         '- bridge_run_command: Run a shell command on a remote machine',
         '- bridge_clear_inbox: Clear all messages from the local inbox',
         '- bridge_inbox_stats: Get inbox statistics and watcher health',
+        '- bridge_codex_bind / bridge_codex_unbind / bridge_codex_status: Codex task opt-in lifecycle (4.10.0+, see CODEX TARGETS below)',
         '- claude_code_channel_status: Diagnostic — returns plugin pid/uptime/lease/version (rarely called directly)',
         '',
         'Communication flow:',
-        '1. Machine A\'s Claude calls bridge_send_message to deliver a message to Machine B via SSH',
-        '2. Machine B\'s file watcher detects the new message file',
-        '3. Machine B\'s plugin pushes the message into the running Claude session',
-        '4. Machine B\'s Claude sees it and responds via bridge_send_message back to Machine A using the incoming from_target when present; Claude Code-originated sends include from_target=claude-code/<persona> by default',
+        '1. Machine A\'s agent calls bridge_send_message to deliver a message to Machine B via SSH',
+        '2. Machine B\'s matching harness receiver detects the new message file',
+        '3. Claude Code receives channel push, OpenClaw dispatches a native channel turn, or codex-channel resumes the exact bound Codex task',
+        '4. Machine B\'s agent responds via bridge_send_message using the incoming from_target when present; each harness supplies its own return-target identity',
         '',
         'All communication is authenticated via SSH keys (managed in ~/.agent-bridge/keys/).',
         'Messages have a TTL (default 1 day). Expired messages are auto-pruned.',
@@ -809,6 +813,12 @@ async function main(): Promise<void> {
         'ADDITIVE ONLY — the shared context NEVER replaces or reroutes your harness-native memory. Keep recording everything exactly where you would have recorded it anyway (your harness memory system, the repo\'s LEARNINGS.md, workspace rules/notes); THEN also add a copy of the fleet-wide-applicable subset here. Never skip or relocate a native memory write because the shared store has (or will have) the content, and never import/migrate existing harness memories into the store as a relocation. If unsure, write both.',
         'Scope discipline: GLOBAL learnings only. Project-local fixes belong in that repo\'s LEARNINGS.md (and stay there); machine- or harness-private notes belong in the harness\'s own memory (and stay there). If it would only ever help an agent inside one repo, it does not go here. The store adds a fleet-wide COPY on top of those systems — it is not a routing destination that takes over from them.',
         'Replication is automatic on add (best-effort push to every paired peer) and self-heals via `agent-bridge learnings sync` when a peer was offline. Entries are deduped by lowercase-uuid id, so replays are harmless.',
+        '',
+        'CODEX TARGETS (4.10.0+):',
+        'Codex tasks are first-class bridge endpoints via target "codex/<alias>". When a user in a Codex task asks to use or connect to Agent Bridge, run `agent-bridge codex bind` inside that task (or call bridge_codex_bind with alias omitted): it auto-discovers CODEX_THREAD_ID, derives a stable collision-safe alias from the task name, persists it across later renames, and ensures the service. Do not make the user invent an alias; `--alias <name>` is only an explicit override. The codex-channel daemon then watches inbox/codex/<alias>/ and delivers inbound messages by resuming THAT thread (thread/resume + turn/start; queued while a turn is active). Replies route back via the message metadata: the injected [BRIDGE-CONTEXT] block names the exact bridge_send_message call, with from_target="codex/<alias>".',
+        'Sending TO a Codex task from here is just bridge_send_message with target="codex/<alias>" — no new transport. `agent-bridge codex status|doctor` (or bridge_codex_status) shows binding, queue, and daemon health.',
+        'Bridge-delivered Codex turns never auto-approve anything: command/file/permission approval requests are declined with an explanatory reason, and safe defaults apply (approvalPolicy "never", sandbox "workspace-write").',
+        'Codex trust boundary: the message fence labels and protects the prompt boundary; it is NOT tool isolation. A paired sender targeting a bound alias supplies a user prompt and can ask the model to use tools already exposed to that task. Codex 0.145 has no per-turn tool allowlist/isolation, so bind only for peers whose prompt/tool authority you accept.',
         '',
         'RESUME THE USER-FACING THREAD AFTER PROCESSING BRIDGE MESSAGES:',
         'After you finish processing inbound bridge messages — especially flurries / multi-step exchanges with other agents — explicitly check whether you have an unfinished thread with the user on Telegram (or whichever user-facing channel is active) and resume it. Do not go silent on the user just because the bridge work is done. Pick up wherever the human-facing conversation last left off, address any user-asked question that is still pending, and post a status update if the bridge work changed anything user-relevant. Bridge processing is a side-channel; the user thread is the primary thread. Concretely: when a bridge round-trip ends and the most recent message in the user-facing channel was from the user (or from you mid-step), send a follow-up there before considering the turn complete.',
@@ -959,6 +969,7 @@ async function main(): Promise<void> {
   const bridgeRole = identity.mode; // 'channel-owner' | 'tools-only'
   const watcherDisabled = bridgeRole === 'tools-only';
   let watcherStarted = false;
+  let initialReplayTimer: NodeJS.Timeout | null = null;
   // Track the timestamp of the most recent channel push so signal evidence
   // logging can report how recently the channel was active.
   let lastNotificationAtMs: number | null = null;
@@ -1117,7 +1128,14 @@ async function main(): Promise<void> {
               ...(message.target ? { target: message.target } : {}),
               ...(message.fromTarget ? { from_target: message.fromTarget } : {}),
               type: message.type,
-              ts: message.timestamp,
+              // Claude Code's channel notification schema requires every
+              // meta value to be a string. Older/third-party Agent Bridge
+              // senders can still put an epoch number in `timestamp` even
+              // though BridgeMessage's canonical type is ISO text.
+              ts:
+                typeof message.timestamp === 'string'
+                  ? message.timestamp
+                  : new Date(message.timestamp).toISOString(),
               ...(message.replyTo ? { reply_to: message.replyTo } : {}),
               ...(message.ttl !== undefined ? { ttl: String(message.ttl) } : {}),
               authenticated: 'ssh-key',
@@ -1249,13 +1267,87 @@ async function main(): Promise<void> {
     }
   }
 
-  // Replay any messages that arrived while Claude was offline.
-  // This must happen AFTER server.connect() so channel notifications
-  // can actually be delivered to the client. Only the active watcher owner
-  // may replay; a standby or tools-only process must leave backlog ownership
-  // untouched for the real Claude session.
+  // 4.10.0 [CODEX-CHANNEL] — ensure the codex-channel push daemon when this
+  // machine has opted-in Codex bindings OR has a crash-recovery settings
+  // journal. Deliberately NOT gated on
+  // watcherDisabled: tools-only children (the mode Codex hosts run this MCP
+  // server in) are the primary trigger on Codex-first machines. Cheap no-op
+  // when neither signal exists, so Claude-only machines never spawn the
+  // daemon. Pending settings recovery remains actionable after a binding is
+  // disabled/removed. The ensure path itself is version-aware (it replaces
+  // an older-version daemon) and honors AGENT_BRIDGE_CODEX_NO_ENSURE=1.
+  (() => {
+    if (process.env.AGENT_BRIDGE_CODEX_NO_ENSURE === '1') return;
+    try {
+      // Env-aware discovery (AGENT_BRIDGE_HOME / HOME / USERPROFILE): the
+      // bindings gate and the daemon entrypoint both come from the SAME lazy
+      // candidate resolution as the codex tools (AGENT_BRIDGE_SOURCE_DIR
+      // override first, then the repo layout, then the INSTALLED
+      // ~/.agent-bridge/runtime/codex-channel/ snapshot, then dev clones) —
+      // so a no-checkout install still restarts its daemon after reboot.
+      // ./codex.js is the lazy loader module: importing it never statically
+      // pulls codex-channel into plugin startup.
+      if (!codexEnsureRequired(process.env)) return;
+      const codexScript = codexServiceScriptCandidates(process.env).find(candidate => existsSync(candidate)) ?? null;
+      if (!codexScript) {
+        logEvent({
+          event: 'codex.ensure_skipped',
+          msg: 'Skipped codex-channel service ensure: no runtime found (checkout, installed runtime, or AGENT_BRIDGE_SOURCE_DIR)',
+          context: {},
+        });
+        return;
+      }
+      const child = spawn(process.execPath, [codexScript, '--ensure'], {
+        stdio: 'ignore',
+        detached: false,
+        env: process.env,
+      });
+      child.on('error', (err) => {
+        logEvent({
+          event: 'codex.ensure_failed',
+          level: 'warn',
+          msg: 'Failed to ensure codex-channel service',
+          context: { error: String(err), script: codexScript },
+        });
+      });
+      child.on('exit', (code, signal) => {
+        if (code === 0) return;
+        logEvent({
+          event: 'codex.ensure_failed',
+          level: 'warn',
+          msg: 'codex-channel service ensure exited unsuccessfully',
+          context: { script: codexScript, exit_code: code, signal },
+        });
+      });
+    } catch (err) {
+      logEvent({
+        event: 'codex.ensure_failed',
+        level: 'warn',
+        msg: 'codex-channel ensure hook errored',
+        context: { error: String(err) },
+      });
+    }
+  })();
+
+  // Replay any messages that arrived while Claude was offline. server.connect()
+  // returning is not enough: Claude Code registers channel notification
+  // handlers asynchronously after the MCP connection is established. A replay
+  // in that startup gap writes successfully to stdio but is silently ignored
+  // by the host. Give the host a short readiness window before emitting the
+  // inherited backlog. Only the active watcher owner may replay; a standby or
+  // tools-only process must leave backlog ownership untouched.
   if (watcherStarted) {
-    void replayUndeliveredMessages();
+    const INITIAL_CHANNEL_REPLAY_DELAY_MS = 5_000;
+    initialReplayTimer = setTimeout(() => {
+      initialReplayTimer = null;
+      void replayUndeliveredMessages();
+    }, INITIAL_CHANNEL_REPLAY_DELAY_MS);
+    initialReplayTimer.unref?.();
+    logEvent({
+      event: 'channel.initial_replay_armed',
+      msg: `Initial offline replay armed for ${INITIAL_CHANNEL_REPLAY_DELAY_MS}ms after MCP connect`,
+      context: { delay_ms: INITIAL_CHANNEL_REPLAY_DELAY_MS },
+    });
   }
 
   // [AUTO-UPDATE-CHECK 2026-04-29] / [AUTO-UPDATE-RE-PROBE 2026-04-30] —
@@ -1536,6 +1628,10 @@ async function main(): Promise<void> {
     syncExitBreadcrumb('shutdown.enter', { reason, already_shutting_down: shuttingDown, watcherStarted, bridgeRole });
     if (shuttingDown) return;
     shuttingDown = true;
+    if (initialReplayTimer) {
+      clearTimeout(initialReplayTimer);
+      initialReplayTimer = null;
+    }
 
     // 3.14.4 — Make sure the epitaph carries the most precise reason we
     // know at shutdown time. If a more specific reason was already set in
@@ -1753,6 +1849,11 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => handleSignal('SIGINT'));
   process.on('SIGTERM', () => handleSignal('SIGTERM'));
   process.on('SIGHUP', () => handleSignal('SIGHUP'));
+  logEvent({
+    event: 'server.signal_handlers_ready',
+    msg: 'Shutdown signal handlers registered',
+    context: { pid: process.pid },
+  });
 
   // stdio lifecycle:
   // Claude Code's plugin host owns MCP child lifetime. EOF/close on stdin means
