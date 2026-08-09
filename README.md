@@ -381,6 +381,15 @@ curl -fsSL https://raw.githubusercontent.com/EthanSK/agent-bridge/main/agent-bri
 chmod +x /usr/local/bin/agent-bridge
 ```
 
+> **Distribution truth:** the supported public release surfaces are this GitHub
+> repository/source release, the one-line installers above, the Claude Code
+> local marketplace plugin, and the repo-loaded OpenClaw plugin. The npm package
+> named `agent-bridge-mcp-server` is a legacy 0.1.x artifact and is **not** the
+> current Agent Bridge release; `@agent-bridge/openclaw-channel` and
+> `@agent-bridge/codex-channel` are self-contained repository packaging units,
+> not published npm-registry products. Do not use `npm install
+> agent-bridge-mcp-server` as the 4.10.0 installation path.
+
 This downloads only the root transport CLI. It does **not** install the
 self-contained `codex-channel` runtime used by `agent-bridge codex …`. For
 standalone Codex support, use Option A; alternatively keep a clone available
