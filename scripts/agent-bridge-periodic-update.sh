@@ -76,10 +76,76 @@ done
 
 # ---------- Config / paths --------------------------------------------------
 
+bridge_home_is_complete_unc() {
+  local normalized="${1//\\//}" server rest share
+  case "$normalized" in //*) ;; *) return 1 ;; esac
+  normalized="${normalized#//}"
+  server="${normalized%%/*}"
+  [ "$server" != "$normalized" ] || return 1
+  rest="${normalized#*/}"
+  share="${rest%%/*}"
+  [ -n "$server" ] && [ -n "$share" ]
+}
+
+bridge_home_is_absolute() {
+  case "$1" in
+    [A-Za-z]:[\\/]*) return 0 ;;
+    //*) bridge_home_is_complete_unc "$1"; return ;;
+    \\*) bridge_home_is_complete_unc "$1"; return ;;
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_bridge_home() {
+  local raw="${AGENT_BRIDGE_HOME:-}"
+  if [[ -z "$raw" ]]; then
+    printf '%s' "$HOME/.agent-bridge"
+    return
+  fi
+  case "$raw" in
+    "~") raw="$HOME" ;;
+    "~/"*) raw="$HOME/${raw#~/}" ;;
+    "~\\"*)
+      raw="${raw#~\\}"
+      raw="$HOME/${raw//\\//}"
+      ;;
+  esac
+  if ! bridge_home_is_absolute "$raw"; then
+    printf 'periodic-update: AGENT_BRIDGE_HOME must resolve to an absolute path: %s\n' "$raw" >&2
+    return 2
+  fi
+  case "$raw" in
+    [A-Za-z]:[\\/]*|\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        raw="$(cygpath -u "$raw")"
+      else
+        printf 'periodic-update: native Windows AGENT_BRIDGE_HOME requires cygpath (Git Bash): %s\n' "$raw" >&2
+        return 2
+      fi
+      ;;
+  esac
+  while [[ "$raw" != "/" ]]; do
+    case "$raw" in
+      */|*\\) raw="${raw%?}" ;;
+      *) break ;;
+    esac
+  done
+  local leaf="${raw##*/}"
+  leaf="${leaf##*\\}"
+  if [[ "$leaf" == ".agent-bridge" ]]; then
+    printf '%s' "$raw"
+  else
+    printf '%s/.agent-bridge' "$raw"
+  fi
+}
+
 REPO="${AGENT_BRIDGE_REPO:-$HOME/Projects/agent-bridge}"
-LOG_DIR="$HOME/.agent-bridge/logs"
-RUN_DIR="$HOME/.agent-bridge/run"
-STATE_DIR="$HOME/.agent-bridge/state"
+if ! BRIDGE_HOME="$(resolve_bridge_home)"; then exit 2; fi
+export AGENT_BRIDGE_HOME="$BRIDGE_HOME"
+LOG_DIR="$BRIDGE_HOME/logs"
+RUN_DIR="$BRIDGE_HOME/run"
+STATE_DIR="$BRIDGE_HOME/state"
 LOG_FILE="$LOG_DIR/periodic-update.log"
 LOCK_DIR="$RUN_DIR/periodic-update.lock"
 BUILT_HEAD_FILE="$STATE_DIR/built-head.txt"
@@ -279,6 +345,47 @@ if [[ -x "$REPO/agent-bridge" ]]; then
 else
   echo "WARN: $REPO/agent-bridge not executable; skipping plugin-registry-rewire"
   emit warn "registry.rewire_skipped" '{"reason":"agent-bridge_not_executable"}'
+fi
+
+# ---------- Step 7: codex-channel service refresh (4.10.0) ------------------
+#
+# When this machine has enabled Codex bindings OR a pending sticky-settings
+# recovery journal, make sure the codex-channel push daemon is running FROM
+# THIS CANONICAL CLONE and at the freshly-built version. `service.mjs --ensure`
+# is version-aware: it no-ops when a healthy same-or-newer daemon holds the
+# lease and replaces a verified older-version holder.
+# Runs unconditionally of $changed: it also self-heals a daemon that died.
+
+codex_bindings="$BRIDGE_HOME/codex/bindings.json"
+codex_pending_settings="$BRIDGE_HOME/codex/pending-settings"
+if [[ -f "$REPO/codex-channel/service.mjs" ]]; then
+  if [[ "${AGENT_BRIDGE_CODEX_NO_ENSURE:-0}" == "1" ]]; then
+    emit info "codex.service_ensure_skipped" '{"reason":"AGENT_BRIDGE_CODEX_NO_ENSURE"}'
+  # Enabled bindings need delivery; journals need recovery even after their
+  # binding was disabled or removed.
+  elif node -e '
+    const fs = require("fs");
+    let needed = false;
+    try {
+      const reg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      needed = Object.values(reg.bindings ?? {}).some(b => b && b.enabled !== false);
+    } catch {}
+    try {
+      needed ||= fs.readdirSync(process.argv[2], { withFileTypes: true })
+        .some(e => e.isFile() && e.name.endsWith(".json"));
+    } catch {}
+    process.exit(needed ? 0 : 1);
+  ' "$codex_bindings" "$codex_pending_settings" >/dev/null 2>&1; then
+    if node "$REPO/codex-channel/service.mjs" --ensure >/dev/null 2>&1; then
+      emit info "codex.service_ensured" '{}'
+    else
+      rc=$?
+      echo "WARN: codex-channel service ensure exited rc=$rc (non-fatal)"
+      emit warn "codex.service_ensure_failed" "{\"rc\":$rc}"
+    fi
+  else
+    emit info "codex.service_ensure_skipped" '{"reason":"no_enabled_bindings_or_pending_settings"}'
+  fi
 fi
 
 # ---------- Step 5 (optional): OpenClaw MCP repair (moved below) ------------

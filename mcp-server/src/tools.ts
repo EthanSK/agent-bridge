@@ -36,8 +36,14 @@ import {
   peekInboxForTarget,
   clearInbox,
   getInboxStats,
+  getActiveClaudeCodeTarget,
   getActiveClaudeCodeTargetOrDefault,
 } from './inbox.js';
+// PACKAGING NOTE: ./codex.js is a LAZY loader with no top-level codex-channel
+// imports — the marketplace/cache artifact (mcp-server only) must never fail
+// to load because Codex support is absent. Handlers resolve the runtime at
+// call time and return actionable errors when it is unavailable.
+import { getCodexSupport, performCodexBind, type CodexEnsureStatus } from './codex.js';
 import { subscribeToInboxArrival } from './watcher.js';
 import { logInfo, logError } from './logger.js';
 import { logEvent } from './log.js';
@@ -61,10 +67,50 @@ import {
 const LONG_POLL_DEFAULT_TIMEOUT_S = 30;
 const LONG_POLL_MAX_TIMEOUT_S = 60;
 
+export function formatCodexEnsureStatus(status: Pick<CodexEnsureStatus, 'healthy' | 'message'>): string {
+  return `${status.healthy ? '' : 'WARNING: '}${status.message}`;
+}
+
 function normalizeRelaySummary(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const cleaned = value.replace(/\s+/g, ' ').trim();
   return cleaned || undefined;
+}
+
+/**
+ * 4.10.0 [CODEX-CHANNEL] — default outbound reply identity.
+ *
+ * Order:
+ *   1. Bound Claude Code persona target (channel-owner children) — unchanged
+ *      behavior for every existing Claude Code install.
+ *   2. `AGENT_BRIDGE_FROM_TARGET` env var, when set AND a valid target —
+ *      the explicit identity signal for tools-only hosts. Codex users set it
+ *      in ~/.codex/config.toml on the agent-bridge MCP entry, e.g.
+ *      `env = { AGENT_BRIDGE_FROM_TARGET = "codex/main" }`, so outbound
+ *      sends default their reply routing to the bound codex/<alias> instead
+ *      of silently claiming `claude-code/default`. Machines running several
+ *      bound Codex tasks should keep passing `from_target` explicitly per
+ *      send (the bind output + BRIDGE-CONTEXT reply instructions do this).
+ *   3. Legacy tools-only fallback `claude-code/default` (pre-4.10 behavior).
+ *
+ * An invalid env value is ignored with a warn log (fail-open: sends must not
+ * break because of a typo'd identity), which the caller can correct via
+ * explicit `from_target`.
+ */
+export function resolveDefaultFromTarget(env: NodeJS.ProcessEnv = process.env): string {
+  const personaTarget = getActiveClaudeCodeTarget();
+  if (personaTarget) return personaTarget;
+  const fromEnv = (env.AGENT_BRIDGE_FROM_TARGET ?? '').trim();
+  if (fromEnv) {
+    if (isValidTarget(fromEnv)) return fromEnv;
+    logEvent({
+      event: 'tool.from_target_env_invalid',
+      level: 'warn',
+      msg: `AGENT_BRIDGE_FROM_TARGET is not a valid target; falling back to claude-code/default`,
+      context: { value: fromEnv.slice(0, 128) },
+    });
+  }
+  return getActiveClaudeCodeTargetOrDefault();
 }
 
 /**
@@ -234,13 +280,14 @@ export function registerTools(server: McpServer): void {
         + '  • target="claude-code/default"         — Claude Code channel plugin (default persona; pre-4.0.0 senders may still address "claude-code" and the receiver routes it to "claude-code/default")\n'
         + '  • target="claude-code/<persona>"       — Claude Code channel plugin for a non-default persona (4.0.0+ multi-session support, e.g. "claude-code/yolo")\n'
         + '  • target="openclaw/default"            — example: an OpenClaw running Telegram session (the "default" account)\n'
+        + '  • target="codex/<alias>"               — a BOUND Codex task (4.10.0+): the codex-channel service resumes that exact persisted thread and starts a turn with the message (queued while a turn is active). Bind with `agent-bridge codex bind` or bridge_codex_bind.\n'
         + '  • target="<harness>/<account-alias>"   — any other configured harness/per-account session, e.g. "openclaw/<your-account-alias>"\n\n'
         + 'Named-target routing rule: when the user names a specific target alias (a persona, a session, a per-account bot, etc.), match the alias LITERALLY — do NOT silently default to "<harness>/default" when a specific alias was named. Voice transcripts often mis-hear short proper-noun aliases; re-read the source twice if a specific name was mentioned. Canonical rule + rationale: docs/named-target-routing.md.\n\n'
         + '**Recipient relay rule**: when YOU receive an inbound bridge message via the `<channel source="agent-bridge">` block, relay a compact 1-3 sentence summary (source machine + source target + destination machine + destination target + actionable ask) to the user via your harness\'s configured user-facing channel (Telegram, Slack, Discord, native UI, etc.) so the user has live visibility into cross-harness coordination without dumping the full bridge body. When YOU send a bridge message and user-facing visibility matters, pass `relay_summary` / `relaySummary` with a source-authored 1-3 sentence summary; OpenClaw destinations can use that to code-post the visible relay receipt before the destination agent turn. Use the generated relay scaffold when present: it labels both the source endpoint + source agent-bridge version and the destination endpoint + destination agent-bridge version. If composing a fallback manually, read `source_agent_bridge_version` / `destination_agent_bridge_version` from metadata or call `claude_code_channel_status` for the local destination version; do NOT hardcode. If the user asks to expand an OpenClaw `[Agent Bridge relay]` notice by its `expand id`, run `agent-bridge relay-expand <id>` on that same machine and send the retrieved full content subject to normal privacy/channel rules. Reply via bridge first if needed, THEN relay to the user. Don\'t suppress routine messages except pure-noise heartbeats / `bridge_status` polls. See AGENTS.md "Relay inbound bridge messages to the user" + canonical doc docs/relay-to-user.md.\n\n'
         + 'The `machine` parameter accepts either a paired remote machine name OR the local machine name (or one of the aliases "local", "self", "localhost"). Same-machine delivery is first-class (3.5.0+): the message JSON is written directly to ~/.agent-bridge/inbox/<target>/<id>.json with no SSH hop. Useful for routing to embedded agents (e.g. target="<harness>/<account-alias>") on the same host.\n\n'
         + 'The target field is REQUIRED as of agent-bridge 3.4.0 — there is intentionally no default delivery routing. '
         + 'Messages without a target are rejected at the sender. Legacy messages that land at the root of the inbox on the receiver are moved to .failed/_unrouted/ on next startup. '
-        + '`from_target` / `fromTarget` defaults to `claude-code/<persona>` (the active persona of THIS Claude Code session) for normal Claude Code sends so the remote agent can reply back into THIS session\'s inbox subdir. Falls back to `claude-code/default` when no persona is bound (for example tools-only/cold-start contexts). '
+        + '`from_target` / `fromTarget` default precedence (4.10.0): (1) the active `claude-code/<persona>` when this is a Claude Code channel session; else (2) the `AGENT_BRIDGE_FROM_TARGET` env var when set to a valid target — the identity signal for tools-only hosts such as Codex, e.g. `AGENT_BRIDGE_FROM_TARGET="codex/<alias>"` in the MCP env block of ~/.codex/config.toml; else (3) legacy `claude-code/default`. Pass `from_target` explicitly per send when one machine runs several bound Codex tasks. '
         + 'Set `one_way=true` only when you intentionally do not want a bridge reply path.',
       inputSchema: {
         machine: z
@@ -252,13 +299,13 @@ export function registerTools(server: McpServer): void {
         target: z
           .string()
           .describe(
-            'Required. Slash-delimited routing target, e.g. "claude-code/default", "claude-code/<persona>", "<harness>/<account-alias>" (such as "openclaw/default"). Determines which inbox subdir on the remote the message lands in, and which listener picks it up. Senders may still use the legacy "claude-code" literal — the receiver routes it to "claude-code/default" for backward compatibility.',
+            'Required. Slash-delimited routing target, e.g. "claude-code/default", "claude-code/<persona>", "openclaw/<account-alias>", or "codex/<alias>" for a bound Codex task. Determines which inbox subdir on the remote the message lands in, and which listener picks it up. Senders may still use the legacy "claude-code" literal — the receiver routes it to "claude-code/default" for backward compatibility.',
           ),
         from_target: z
           .string()
           .optional()
           .describe(
-            'Sender-side reply target for round-trip routing. Defaults to the active `claude-code/<persona>` for Claude Code sends (so replies land back in THIS session). Set explicitly when sending from another local target such as `<harness>/<account-alias>`.',
+            'Sender-side reply target for round-trip routing. Default precedence: active `claude-code/<persona>` (Claude Code sessions) > valid `AGENT_BRIDGE_FROM_TARGET` env (tools-only hosts — set it to `codex/<alias>` for a bound Codex task) > `claude-code/default`. Set explicitly when sending from another local target such as `codex/<alias>` or `<harness>/<account-alias>`.',
           ),
         fromTarget: z
           .string()
@@ -338,7 +385,7 @@ export function registerTools(server: McpServer): void {
               type: 'text' as const,
               text:
                 `Missing/invalid target. The target field is REQUIRED as of agent-bridge 3.4.0 — there is no default routing. `
-                + `Use "claude-code/default" for the default Claude Code persona, "claude-code/<persona>" for a named Claude Code persona, or "<harness>/<account-alias>" (e.g. "openclaw/default") for a per-account session. `
+                + `Use "claude-code/default" for the default Claude Code persona, "claude-code/<persona>" for a named Claude Code persona, "openclaw/<account-alias>" for an OpenClaw session, or "codex/<alias>" for a bound Codex task. `
                 + `Got: ${JSON.stringify(target ?? null)}.`,
             },
           ],
@@ -379,13 +426,13 @@ export function registerTools(server: McpServer): void {
         // 4.0.0 — Default the sender's return-target to a persona-scoped
         // target ("claude-code/<persona>") rather than the legacy
         // `claude-code` literal. The reply lands back in the active
-        // persona's inbox subdir on the receiver. Tools-only children
-        // (no persona bound, `getActiveClaudeCodeTarget()` returns null)
-        // fall back to `claude-code/default` so the response we send to
-        // the caller MATCHES the on-disk `fromTarget` after `sendMessage`
-        // applies its CLAUDE_CODE_TARGET → claude-code/default rewrite —
-        // we apply the same rewrite up front to avoid disagreement.
-        resolvedFromTarget = getActiveClaudeCodeTargetOrDefault();
+        // persona's inbox subdir on the receiver.
+        // 4.10.0 [CODEX-CHANNEL] — tools-only children (no persona bound)
+        // now honor AGENT_BRIDGE_FROM_TARGET before the legacy
+        // `claude-code/default` fallback, so a Codex-hosted MCP can default
+        // its reply identity to its bound `codex/<alias>`. See
+        // resolveDefaultFromTarget for the full precedence + rationale.
+        resolvedFromTarget = resolveDefaultFromTarget();
       }
       if (resolvedFromTarget && !isValidTarget(resolvedFromTarget)) {
         return {
@@ -394,7 +441,7 @@ export function registerTools(server: McpServer): void {
               type: 'text' as const,
               text:
                 `Missing/invalid from_target. When provided it must be a valid target like `
-                + `"claude-code/default", "claude-code/<persona>", or "<harness>/<account-alias>". `
+                + `"claude-code/default", "claude-code/<persona>", "openclaw/<account-alias>", or "codex/<alias>". `
                 + `Got: ${JSON.stringify(resolvedFromTarget)}.`,
             },
           ],
@@ -1319,6 +1366,169 @@ export function registerTools(server: McpServer): void {
 
       return {
         content: [{ type: 'text' as const, text: lines.join('\n') }],
+      };
+    },
+  );
+
+  // -- bridge_codex_bind -------------------------------------------------------
+  //
+  // 4.10.0 [CODEX-CHANNEL] — opt a Codex task into agent-bridge from inside
+  // the task itself. Writes the durable alias -> thread binding registry at
+  // ~/.agent-bridge/codex/bindings.json (same registry as the
+  // `agent-bridge codex` CLI) and best-effort starts the codex-channel push
+  // daemon. Never claims a Claude persona lease; safe in tools-only mode.
+  server.registerTool(
+    'bridge_codex_bind',
+    {
+      title: 'Bind Codex Task (opt in to agent-bridge)',
+      description:
+        'Connect the current Codex task to Agent Bridge. Omit `alias` for the normal UX: the tool reuses this task\'s saved alias, or reads its user-facing task name and derives a stable collision-safe target "codex/<alias>" automatically. An explicit alias remains available as an override. The codex-channel service is ensured automatically.\n\n'
+        + 'Thread id resolution: pass `thread_id` explicitly, or omit it and the tool uses the CODEX_THREAD_ID env var when the Codex host exported it to this MCP process. If neither is available, run `agent-bridge codex bind` from inside the task\'s own shell instead (Codex always exports CODEX_THREAD_ID to shell commands).\n\n'
+        + 'Safety: the thread must already exist (validated against $CODEX_HOME/sessions rollouts unless force=true); an alias already bound errors unless rebind=true; delivered turns run with explicit safe defaults (approvalPolicy "never", sandbox "workspace-write"; danger-full-access is CLI-only with double consent). Trust boundary: binding grants a paired sender user-prompt authority and the ability to ask the model to use tools already exposed to this task; Codex 0.145 has no per-turn tool allowlist/isolation. Bind only for peers whose prompt/tool authority you accept. After binding, outbound sends from this task should use from_target="codex/<alias>" — set AGENT_BRIDGE_FROM_TARGET in the MCP env block of ~/.codex/config.toml to make that the default.',
+      inputSchema: {
+        alias: z.string().optional().describe('Optional stable alias override. Omit to derive it automatically from the current task name and reuse it thereafter.'),
+        thread_id: z.string().optional().describe('Exact Codex thread id (uuid). Omit to auto-discover from CODEX_THREAD_ID when available.'),
+        cwd: z.string().optional().describe('Working directory for bridge-delivered turns. Defaults to the previous binding value or none.'),
+        steering: z.boolean().optional().describe('Opt-in: inject into an ACTIVE turn via guarded turn/steer instead of queueing. Default false (queue until idle).'),
+        sandbox: z.string().optional().describe('Sandbox for delivered turns: "read-only" or "workspace-write" (default). "danger-full-access" is refused here — CLI-only with --allow-danger.'),
+        approval_policy: z.string().optional().describe('Codex approvalPolicy for delivered turns: "never" (default) | "on-request" | "untrusted". ("granular" needs per-rule config this surface does not expose; legacy "on-failure" is not a Codex 0.145 policy and is rejected.) Interactive approvals are always DECLINED by the channel.'),
+        rebind: z.boolean().optional().describe('Allow moving an existing alias to this thread.'),
+        allow_shared_thread: z.boolean().optional().describe('Permit binding a thread that another alias already delivers to (double-delivery risk).'),
+        force: z.boolean().optional().describe('Skip rollout existence validation (e.g. custom CODEX_HOME).'),
+        no_ensure: z.boolean().optional().describe('Do not auto-start the codex-channel service after binding.'),
+      },
+    },
+    async ({ alias, thread_id, cwd, steering, sandbox, approval_policy, rebind, allow_shared_thread, force, no_ensure }) => {
+      try {
+        const outcome = await performCodexBind({
+          alias,
+          threadId: thread_id,
+          cwd,
+          steering,
+          sandbox,
+          approvalPolicy: approval_policy,
+          rebind,
+          allowSharedThread: allow_shared_thread,
+          force,
+          noEnsure: no_ensure,
+        });
+        logEvent({
+          event: 'tool.bridge_codex_bind',
+          msg: `Bound ${outcome.target} -> thread ${outcome.binding.threadId}`,
+          context: {
+            alias: outcome.binding.alias,
+            alias_automatic: outcome.aliasAutomatic,
+            alias_source: outcome.aliasSource,
+            thread_id: outcome.binding.threadId,
+            thread_id_source: outcome.threadIdSource,
+            rebind: rebind === true,
+            rollout_found: outcome.rolloutFound,
+            service_spawned: outcome.serviceEnsured.spawned,
+            service_healthy: outcome.serviceEnsured.healthy,
+            service_message: outcome.serviceEnsured.message,
+            service_stale_version: outcome.serviceEnsured.staleVersion === true,
+            service_unverified: outcome.serviceEnsured.unverified === true,
+            service_teardown_poisoned: outcome.serviceEnsured.teardownPoisoned === true,
+            service_error: outcome.serviceEnsured.error ?? null,
+          },
+        });
+        const lines = [
+          `Bound ${outcome.target} -> Codex thread ${outcome.binding.threadId} (thread id from ${outcome.threadIdSource}).`,
+          ...(outcome.aliasAutomatic
+            ? [`Automatic alias: ${outcome.aliasSource}${outcome.aliasTitle ? ` from task name ${JSON.stringify(outcome.aliasTitle)}` : ''}.`]
+            : []),
+          ...(outcome.aliasMetadataWarning ? [`Warning: ${outcome.aliasMetadataWarning}`] : []),
+          ...(outcome.replaced ? [`Replaced previous thread ${outcome.replaced.threadId}.`] : []),
+          `Policy: sandbox=${outcome.binding.policy.sandbox} approvals=${outcome.binding.policy.approvalPolicy} steering=${outcome.binding.policy.steering ? 'on' : 'off'}.`,
+          formatCodexEnsureStatus(outcome.serviceEnsured),
+          '',
+          `Reachable fleet-wide as: bridge_send_message({ machine: "${getLocalMachineName()}", target: "${outcome.target}", ... })`,
+          `Reply identity for outbound sends from this task: from_target="${outcome.target}".`,
+        ];
+        return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logEvent({
+          event: 'tool.bridge_codex_bind.failed',
+          level: 'warn',
+          msg: `bridge_codex_bind failed for alias ${alias ?? '(automatic)'}`,
+          context: { alias: alias ?? null, error: errMsg },
+        });
+        return { content: [{ type: 'text' as const, text: `bridge_codex_bind failed: ${errMsg}` }], isError: true };
+      }
+    },
+  );
+
+  // -- bridge_codex_unbind -----------------------------------------------------
+  server.registerTool(
+    'bridge_codex_unbind',
+    {
+      title: 'Unbind Codex Task',
+      description:
+        'Remove a codex/<alias> binding. Pending/staged messages for the alias stay on disk and resume if the alias is re-bound. The codex-channel service picks the change up within one poll interval.',
+      inputSchema: {
+        alias: z.string().describe('The bound alias to remove.'),
+      },
+    },
+    async ({ alias }) => {
+      let support;
+      try {
+        support = await getCodexSupport();
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        };
+      }
+      const removed = support.unbindAlias(alias);
+      if (!removed) {
+        return {
+          content: [{ type: 'text' as const, text: `No codex binding for alias "${alias}". Current: ${support.listBindings().map(b => b.alias).join(', ') || '(none)'}` }],
+          isError: true,
+        };
+      }
+      logEvent({
+        event: 'tool.bridge_codex_unbind',
+        msg: `Unbound codex/${alias}`,
+        context: { alias, thread_id: removed.threadId },
+      });
+      return {
+        content: [{ type: 'text' as const, text: `Unbound ${support.codexTargetForAlias(alias)} (was thread ${removed.threadId}).` }],
+      };
+    },
+  );
+
+  // -- bridge_codex_status -----------------------------------------------------
+  server.registerTool(
+    'bridge_codex_status',
+    {
+      title: 'Codex Channel Status',
+      description:
+        'Durable-state snapshot of the Codex channel on THIS machine: service lease health, every codex/<alias> binding (thread id, policy, pending/staged queue depths, rollout presence), unbound alias inboxes, and dead-letter count. Reads the filesystem only — works whether or not the daemon is running.',
+    },
+    async () => {
+      let support;
+      try {
+        support = await getCodexSupport();
+      } catch (err) {
+        return {
+          content: [{ type: 'text' as const, text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        };
+      }
+      const snapshot = support.buildStatusSnapshot();
+      logEvent({
+        event: 'tool.bridge_codex_status',
+        msg: `Codex status: service=${snapshot.service.running ? 'running' : 'stopped'} bindings=${snapshot.bindings.length}`,
+        context: {
+          service_running: snapshot.service.running,
+          bindings: snapshot.bindings.length,
+          dead_letters: snapshot.deadLetterCount,
+        },
+      });
+      return {
+        content: [{ type: 'text' as const, text: support.formatStatus(snapshot) }],
+        structuredContent: snapshot as unknown as Record<string, unknown>,
       };
     },
   );

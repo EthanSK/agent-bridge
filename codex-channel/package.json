@@ -1,0 +1,23 @@
+{
+  "name": "@agent-bridge/codex-channel",
+  "version": "4.10.0",
+  "description": "First-class Codex channel for agent-bridge: automatically bind existing Codex tasks to stable title-derived codex/<alias> targets and push inbound BridgeMessages into the exact persisted thread via the Codex App Server (thread/resume + turn/start), with queue-while-active, crash-safe delivery state, and safe approval defaults.",
+  "type": "module",
+  "main": "./src/service.js",
+  "bin": {
+    "agent-bridge-codex-channel": "./bin/codex-channel.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EthanSK/agent-bridge.git",
+    "directory": "codex-channel"
+  },
+  "author": "EthanSK",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

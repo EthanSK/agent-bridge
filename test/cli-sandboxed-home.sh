@@ -11,6 +11,7 @@
 #   • Sandboxed HOME with no config + real home with config → uses real home.
 #   • AGENT_BRIDGE_HOME state-dir override beats both.
 #   • AGENT_BRIDGE_HOME parent-home override is accepted for convenience.
+#   • Windows drive-path overrides are converted for Git Bash path lookup.
 #   • Sandboxed HOME with no real-home config → no fallback (fresh install
 #     should still see "no machines paired", not crash).
 #   • Normal HOME path (config present) is untouched.
@@ -71,6 +72,18 @@ exit 0
 DSCL
 chmod +x "$TMP/bin/dscl"
 
+# Git for Windows ships cygpath. Stub it here so the Windows-native override
+# regression can run deterministically on macOS/Linux too.
+cat >"$TMP/bin/cygpath" <<CYGPATH
+#!/usr/bin/env bash
+if [ "\${1:-}" != "-u" ]; then exit 2; fi
+case "\${2:-}" in
+  *'.agent-bridge'|*'.agent-bridge\\'|*'.AGENT-BRIDGE'|*'.AGENT-BRIDGE\\') printf '%s/.agent-bridge\n' "$TMP/realhome" ;;
+  *) printf '%s\n' "$TMP/realhome" ;;
+esac
+CYGPATH
+chmod +x "$TMP/bin/cygpath"
+
 run_cli() {
   HOME="$1" PATH="$TMP/bin:$PATH" USER="${USER:-test}" \
     AGENT_BRIDGE_VERBOSE=0 \
@@ -98,6 +111,56 @@ OUTPUT="$(HOME="$TMP/sandbox" AGENT_BRIDGE_HOME="$TMP/realhome" \
   "$ROOT/agent-bridge" list 2>&1)"
 grep -q 'real-peer' <<<"$OUTPUT" \
   || { echo "FAIL: AGENT_BRIDGE_HOME parent-home override did not direct to real home"; echo "$OUTPUT"; exit 1; }
+
+# -- Case 2c: install.ps1-style Windows paths work when the CLI runs in Git Bash --
+OUTPUT="$(HOME="$TMP/sandbox" AGENT_BRIDGE_HOME='C:\Users\BridgeTest' \
+  PATH="$TMP/bin:$PATH" USER="${USER:-test}" AGENT_BRIDGE_VERBOSE=0 \
+  AGENT_BRIDGE_MACHINE_NAME=TestHost \
+  "$ROOT/agent-bridge" list 2>&1)"
+grep -q 'real-peer' <<<"$OUTPUT" \
+  || { echo "FAIL: Windows parent-form AGENT_BRIDGE_HOME was not converted with cygpath"; echo "$OUTPUT"; exit 1; }
+
+OUTPUT="$(HOME="$TMP/sandbox" AGENT_BRIDGE_HOME='C:\Users\BridgeTest\.agent-bridge' \
+  PATH="$TMP/bin:$PATH" USER="${USER:-test}" AGENT_BRIDGE_VERBOSE=0 \
+  AGENT_BRIDGE_MACHINE_NAME=TestHost \
+  "$ROOT/agent-bridge" list 2>&1)"
+grep -q 'real-peer' <<<"$OUTPUT" \
+  || { echo "FAIL: Windows state-dir AGENT_BRIDGE_HOME was not converted with cygpath"; echo "$OUTPUT"; exit 1; }
+
+OUTPUT="$(HOME="$TMP/sandbox" AGENT_BRIDGE_HOME='C:\Users\BridgeTest\.AGENT-BRIDGE\\' \
+  PATH="$TMP/bin:$PATH" USER="${USER:-test}" AGENT_BRIDGE_VERBOSE=0 \
+  AGENT_BRIDGE_MACHINE_NAME=TestHost \
+  "$ROOT/agent-bridge" list 2>&1)"
+grep -q 'real-peer' <<<"$OUTPUT" \
+  || { echo "FAIL: Windows state-dir matching was not case-insensitive"; echo "$OUTPUT"; exit 1; }
+
+# -- Case 2d: Windows-style tilde prefixes normalize under HOME too --
+OUTPUT="$(HOME="$TMP" AGENT_BRIDGE_HOME='~\realhome\\' \
+  PATH="$TMP/bin:$PATH" USER="${USER:-test}" AGENT_BRIDGE_VERBOSE=0 \
+  AGENT_BRIDGE_MACHINE_NAME=TestHost \
+  "$ROOT/agent-bridge" list 2>&1)"
+grep -q 'real-peer' <<<"$OUTPUT" \
+  || { echo "FAIL: tilde-backslash AGENT_BRIDGE_HOME was not normalized"; echo "$OUTPUT"; exit 1; }
+
+OUTPUT="$(HOME="$TMP/sandbox" AGENT_BRIDGE_HOME='\\server\share\.AGENT-BRIDGE' \
+  PATH="$TMP/bin:$PATH" USER="${USER:-test}" AGENT_BRIDGE_VERBOSE=0 \
+  AGENT_BRIDGE_MACHINE_NAME=TestHost \
+  "$ROOT/agent-bridge" list 2>&1)"
+grep -q 'real-peer' <<<"$OUTPUT" \
+  || { echo "FAIL: complete Windows UNC AGENT_BRIDGE_HOME was not accepted"; echo "$OUTPUT"; exit 1; }
+
+# -- Case 2e: cwd-dependent roots fail closed before any config lookup --
+for invalid_home in 'relative-state' '../state' 'C:state' '\state' '\\server'; do
+  if OUTPUT="$(HOME="$TMP/sandbox" AGENT_BRIDGE_HOME="$invalid_home" \
+    PATH="$TMP/bin:$PATH" USER="${USER:-test}" AGENT_BRIDGE_VERBOSE=0 \
+    AGENT_BRIDGE_MACHINE_NAME=TestHost \
+    "$ROOT/agent-bridge" list 2>&1)"; then
+    echo "FAIL: relative AGENT_BRIDGE_HOME was accepted: $invalid_home"
+    exit 1
+  fi
+  grep -Eq 'must (be|resolve to) an absolute path' <<<"$OUTPUT" \
+    || { echo "FAIL: relative-home rejection was not actionable: $invalid_home"; echo "$OUTPUT"; exit 1; }
+done
 
 # -- Case 3: HOME with config present is untouched (normal path) --
 # Use $TMP/realhome directly. getent stub still points to realhome, so even

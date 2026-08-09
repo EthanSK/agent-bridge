@@ -6,13 +6,14 @@
     <title>agent-bridge &mdash; Bridge agent harness sessions across machines</title>
     <meta
       name="description"
-      content="Bridge running AI agent harness sessions across machines. Agent-to-agent messaging over SSH with harness-specific push paths."
+      content="Bridge running Claude Code, OpenClaw, and Codex sessions across machines. Agent-to-agent messaging over SSH with first-class harness-specific delivery."
     />
     <meta name="robots" content="index, follow, max-image-preview:large" />
     <link rel="canonical" href="https://ethansk.github.io/agent-bridge/" />
     <meta name="application-name" content="agent-bridge" />
     <meta name="theme-color" content="#0a0a0b" />
     <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg" />
+    <link rel="manifest" href="./site.webmanifest" />
 
     <!-- Open Graph -->
     <meta property="og:site_name" content="agent-bridge" />
@@ -52,7 +53,7 @@
           </span>
           <span class="logo-copy">
             <span class="logo-title">
-              agent-bridge <span class="logo-version">v4.1.0</span>
+              agent-bridge <span class="logo-version">v4.10.0</span>
             </span>
             <span class="logo-sub">channel-mode · peer-to-peer · SSH</span>
           </span>
@@ -69,7 +70,7 @@
       <header class="hero wrap">
         <div class="hero-meta reveal reveal-1">
           <span><span class="dot" aria-hidden="true"></span> channel open</span>
-          <span class="ver">v4.1.0</span>
+          <span class="ver">v4.10.0</span>
           <span>AI agent harnesses</span>
           <span>tested end-to-end</span>
         </div>
@@ -81,13 +82,13 @@
         </h1>
 
         <p class="hero-lede reveal reveal-3">
-          <strong>agent-bridge</strong> lets running AI agent harness sessions push messages to each other across machines &mdash; agent-to-agent, not shell-to-shell. Every harness shares the same SSH file transport, while each receiver keeps its own host lifecycle: Claude Code uses an MCP + <code>claude/channel</code> stdio plugin; OpenClaw uses a native <code>openclaw-channel/</code> gateway plugin. No broker, no cloud, no fresh agents spawned on the remote side.
+          <strong>agent-bridge</strong> lets running AI agent harness sessions push messages to each other across machines &mdash; agent-to-agent, not shell-to-shell. Every harness shares the same SSH file transport, while each receiver keeps its own host lifecycle: Claude Code uses an MCP + <code>claude/channel</code> stdio plugin; OpenClaw uses a native gateway plugin; Codex uses a background service that wakes the exact bound persisted task through the public App Server API. No broker, no cloud, no fresh agents spawned on the remote side.
         </p>
 
         <div class="hero-actions reveal reveal-4">
           <a class="btn btn--primary" href="#install">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1v9m0 0L4.5 6.5M8 10l3.5-3.5M2 13h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            Install the plugin
+            Install agent-bridge
           </a>
           <a class="btn btn--ghost" href="https://github.com/EthanSK/agent-bridge" target="_blank" rel="noopener">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.37.5 0 5.87 0 12.5a12 12 0 0 0 8.21 11.39c.6.11.82-.26.82-.58v-2.05c-3.34.73-4.04-1.61-4.04-1.61-.55-1.4-1.34-1.77-1.34-1.77-1.1-.75.08-.74.08-.74 1.2.09 1.84 1.24 1.84 1.24 1.08 1.85 2.83 1.32 3.52 1.01.11-.79.42-1.32.76-1.62-2.66-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.39 1.24-3.23-.13-.31-.54-1.53.11-3.19 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.29-1.55 3.3-1.23 3.3-1.23.65 1.66.25 2.88.12 3.19.77.84 1.24 1.92 1.24 3.23 0 4.61-2.81 5.62-5.49 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.7.83.58A12 12 0 0 0 24 12.5C24 5.87 18.63.5 12 .5Z"/></svg>
@@ -123,11 +124,11 @@
           </div>
           <div class="hero-stat">
             <span class="k">Delivery</span>
-            <span class="v"><span class="mark">push</span> · long-poll</span>
+            <span class="v"><span class="mark">push</span> · exact-task wake</span>
           </div>
           <div class="hero-stat">
             <span class="k">MCP tools</span>
-            <span class="v"><span class="mark">8</span> · 7 bridge + status</span>
+            <span class="v"><span class="mark">13</span> · bridge tools + status</span>
           </div>
           <div class="hero-stat">
             <span class="k">License</span>
@@ -155,8 +156,8 @@
             <div class="terminal-body">
 <pre><span class="t-dim">Read the README at https://github.com/EthanSK/agent-bridge and follow</span>
 <span class="t-dim">the setup instructions for this computer. Install agent-bridge, run</span>
-<span class="t-dim">the setup command, and install the appropriate channel plugin for</span>
-<span class="t-dim">this harness. Do everything automatically -- don't ask me questions.</span></pre>
+<span class="t-dim">the setup command, and install the appropriate Claude Code, OpenClaw,</span>
+<span class="t-dim">or Codex integration for this harness. Do everything automatically.</span></pre>
             </div>
           </div>
 
@@ -186,11 +187,11 @@
         <div class="card-grid">
           <div class="card" data-tag="01">
             <h3>Push, not poll</h3>
-            <p>Messages from a remote machine arrive through the right host path: <code>&lt;channel source="agent-bridge"&gt;</code> events in Claude Code, or native OpenClaw channel turns in OpenClaw. No fresh agent spawn on the far side.</p>
+            <p>Messages arrive through the right host path: <code>&lt;channel source="agent-bridge"&gt;</code> events in Claude Code, native OpenClaw channel turns, or an exact persisted Codex task resumed and woken by <code>codex-channel</code>. No fresh agent spawn on the far side.</p>
           </div>
           <div class="card" data-tag="02">
             <h3>Running sessions, not new ones</h3>
-            <p>The bridge connects <em>already-running</em> sessions. Machine A&rsquo;s <code>bridge_send_message</code> drops a signed file into Machine B&rsquo;s target inbox; Machine B&rsquo;s Claude Code or OpenClaw watcher injects it into the live conversation. No fresh <code>claude --print</code> spawned on the far side &mdash; that whole shape was removed in 3.0.0.</p>
+            <p>The bridge connects <em>already-existing</em> sessions. Machine A&rsquo;s <code>bridge_send_message</code> drops an SSH-authenticated envelope into Machine B&rsquo;s target inbox; the receiving harness injects it into the addressed conversation. No fresh <code>claude --print</code> or <code>codex exec</code> is spawned on the far side.</p>
           </div>
           <div class="card" data-tag="03">
             <h3>Peer-to-peer over SSH</h3>
@@ -203,6 +204,10 @@
           <div class="card" data-tag="05">
             <h3>Shared context: fleet-wide learnings</h3>
             <p>Your fleet develops institutional memory. Any agent on any machine records globally-useful learnings (<code>agent-bridge learnings add</code> / <code>bridge_learnings_add</code>) and searches what every other agent already figured out (<code>learnings search</code> / <code>bridge_learnings_search</code>). Strictly <em>additive</em> to each harness&rsquo;s own memory &mdash; agents keep writing their native memory exactly as before and copy the fleet-wide subset here, never relocate it. Full NDJSON replica per machine, replicated peer-to-peer over the same SSH transport, idempotent by entry id &mdash; offline peers reconcile with <code>learnings sync</code>.</p>
+          </div>
+          <div class="card" data-tag="06">
+            <h3>Codex tasks become stable endpoints</h3>
+            <p>Run <code>agent-bridge codex bind</code> inside a task. It discovers the thread id, derives a stable title-based <code>codex/&lt;alias&gt;</code>, and starts the background service. Messages queue safely while the task is busy; the task itself never polls.</p>
           </div>
         </div>
       </section>
@@ -325,12 +330,20 @@
 
         <div class="install-panel">
           <div class="panel-head">
-            <h3>Other MCP-capable harnesses</h3>
-            <span class="panel-tag panel-tag--muted">MCP tools · OpenClaw push</span>
+            <h3>Codex and other MCP-capable harnesses</h3>
+            <span class="panel-tag panel-tag--muted">Codex push · generic MCP tools</span>
           </div>
           <p class="panel-desc">
-            Codex CLI, Gemini CLI, Aider, and anything else that speaks the Model Context Protocol can call the <code>bridge_*</code> tools, but their inbound receive loops are still scaffolded until tested. OpenClaw is verified separately through the native <code>openclaw-channel/</code> plugin, which watches per-target inboxes and dispatches bridge messages into live Telegram-backed sessions.
+            Codex 0.145.0+ is verified first-class in both directions. A bound task receives pushed turns through the background <code>codex-channel</code> service; Gemini CLI, Aider, and other MCP hosts can call the tools but remain tools-only until their own receive loops are verified. OpenClaw remains a separate native gateway integration.
           </p>
+          <div class="step-block">
+            <div class="step-block-head">
+              <span class="lbl">Codex: install once, then opt the current task in</span>
+            </div>
+<pre><span class="t-prompt"></span><span class="t-kw">curl</span> -fsSL <span class="t-str">https://raw.githubusercontent.com/EthanSK/agent-bridge/main/install.sh</span> | bash
+<span class="t-prompt"></span>agent-bridge codex bind   <span class="t-comment"># automatic task id + title-derived alias</span>
+<span class="t-prompt"></span>agent-bridge codex doctor <span class="t-comment"># read-only health check</span></pre>
+          </div>
           <div class="step-block">
             <div class="step-block-head">
               <span class="lbl">.mcp.json (or your harness&rsquo;s equivalent)</span>
@@ -340,13 +353,13 @@
     <span class="t-str">"agent-bridge"</span>: {
       <span class="t-str">"command"</span>: <span class="t-str">"node"</span>,
       <span class="t-str">"args"</span>: [<span class="t-str">"/absolute/path/to/agent-bridge/mcp-server/build/index.js"</span>],
-      <span class="t-str">"env"</span>: { <span class="t-str">"AGENT_BRIDGE_ROLE"</span>: <span class="t-str">"tools-only"</span> }
+      <span class="t-str">"env"</span>: {}
     }
   }
 }</pre>
           </div>
           <p class="panel-note">
-            Without a verified push channel, MCP-only harnesses are tools-only by default; <code>bridge_receive_messages</code> is a manual Claude Code-target inbox fallback, not proof of full Codex/Gemini/Aider delivery. Companion instruction files ship in the repo: <code>AGENTS.md</code> (Codex), <code>GEMINI.md</code> (Gemini), <code>INSTRUCTIONS.md</code> (generic), and an <code>openclaw-channel/</code> native channel plugin for OpenClaw push delivery.
+            Codex delivery is documented in <a href="https://github.com/EthanSK/agent-bridge/blob/main/codex-channel/README.md">codex-channel/README.md</a>. For unverified MCP-only harnesses, <code>bridge_receive_messages</code> is a manual Claude Code-target diagnostic fallback, not proof of a complete receive loop. Companion instruction files ship for Codex, Gemini, generic MCP hosts, and OpenClaw.
           </p>
         </div>
       </section>
@@ -369,7 +382,7 @@
           </li>
           <li>
             <h3>Use</h3>
-            <p>Once paired, either side calls <code>bridge_send_message</code> with an explicit <code>target</code>. The message lands in the remote target inbox over SSH and is injected into the running remote session by Claude Code&rsquo;s channel-owner or OpenClaw&rsquo;s native channel plugin. No fresh agent is ever spawned on either side.</p>
+            <p>Once paired, either side calls <code>bridge_send_message</code> with an explicit <code>target</code>. Claude Code and OpenClaw inject into their running sessions; <code>codex/&lt;alias&gt;</code> wakes the exact bound persisted task through the background Codex service. No fresh agent is spawned.</p>
           </li>
         </ol>
       </section>
@@ -379,7 +392,7 @@
         <div class="kicker"><span class="num">05 /</span> The channel</div>
         <h2 class="section-title">Push into a <span class="accent">running session.</span></h2>
         <p class="section-sub">
-          For Claude Code, the plugin registers a single MCP stdio server that advertises the experimental <code>claude/channel</code> capability <em>and</em> the <code>bridge_*</code> tools. A watcher on <code>~/.agent-bridge/inbox/claude-code/</code> emits <code>notifications/claude/channel</code> into the Claude session. OpenClaw uses a separate gateway plugin watching <code>inbox/openclaw/&lt;target&gt;/</code>.
+          Claude Code advertises the experimental <code>claude/channel</code> capability and the <code>bridge_*</code> tools from one MCP child. OpenClaw uses a separate gateway plugin. Codex uses a singleton background service that scans bound <code>inbox/codex/&lt;alias&gt;/</code> targets and drives <code>thread/resume</code> plus <code>turn/start</code> for the exact task.
         </p>
         <div class="terminal">
           <div class="terminal-bar">
@@ -414,11 +427,11 @@
       <!-- TOOLS -->
       <section class="tools wrap" id="tools">
         <div class="kicker"><span class="num">06 /</span> Tool reference</div>
-        <h2 class="section-title">Eight MCP tools. <span class="accent">One concept</span> per tool.</h2>
+        <h2 class="section-title">Thirteen bridge tools. <span class="accent">One concept</span> per tool.</h2>
         <div class="tools-grid">
           <div class="tool">
             <div class="tool-name">bridge_send_message</div>
-            <p>Deliver a message to a running agent on a paired machine. Requires an explicit <code>target</code>; writes a signed JSON message file to the matching remote inbox over SSH. Claude Code receives <code>&lt;channel&gt;</code> events; OpenClaw receives native channel turns; other MCP hosts remain unverified/manual.</p>
+            <p>Deliver an SSH-authenticated message envelope to an explicit target. Claude Code receives channel events, OpenClaw receives native turns, and <code>codex/&lt;alias&gt;</code> wakes the exact bound task.</p>
           </div>
           <div class="tool">
             <div class="tool-name">bridge_receive_messages</div>
@@ -443,6 +456,30 @@
           <div class="tool">
             <div class="tool-name">bridge_inbox_stats</div>
             <p>Report pending count, oldest message age, total size, watcher health, processed-ID count, and failed-message count. Useful for diagnosing &ldquo;did my message arrive?&rdquo;</p>
+          </div>
+          <div class="tool">
+            <div class="tool-name">bridge_notify</div>
+            <p>Show a native macOS completion banner locally or on a paired Mac. This is a user notification, not an agent message, and never writes an inbox file.</p>
+          </div>
+          <div class="tool">
+            <div class="tool-name">bridge_learnings_add</div>
+            <p>Record a fleet-wide learning locally and replicate it to paired peers. This adds a shared copy; it never replaces repo or harness-native memory.</p>
+          </div>
+          <div class="tool">
+            <div class="tool-name">bridge_learnings_search</div>
+            <p>Search the local full replica of fleet-wide learnings before re-deriving a machine or infrastructure fix.</p>
+          </div>
+          <div class="tool">
+            <div class="tool-name">bridge_codex_bind</div>
+            <p>Bind the current Codex task as a stable address. The alias is optional: task id and title-derived alias are discovered automatically when the host exposes them.</p>
+          </div>
+          <div class="tool">
+            <div class="tool-name">bridge_codex_unbind</div>
+            <p>Remove a Codex alias binding after safe session release and settings recovery.</p>
+          </div>
+          <div class="tool">
+            <div class="tool-name">bridge_codex_status</div>
+            <p>Inspect Codex bindings, queue state, service health, recovery journals, and actionable supervision warnings.</p>
           </div>
           <div class="tool">
             <div class="tool-name">claude_code_channel_status</div>
@@ -489,10 +526,10 @@
               <span class="glyph" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
               </span>
-              Codex CLI
+              Codex
             </div>
-            <div class="compat-status" role="cell"><span class="pill pill--scaffold">scaffolded</span></div>
-            <div class="compat-desc" role="cell">MCP tools via <code>codex mcp add agent-bridge ...</code>. <code>AGENTS.md</code> in the repo root is auto-picked-up by Codex as instructions. Polling mode &mdash; call <code>bridge_receive_messages</code> at breakpoints.</div>
+            <div class="compat-status" role="cell"><span class="pill pill--live">● live</span></div>
+            <div class="compat-desc" role="cell">Verified against Codex 0.145.0 App Server. <code>agent-bridge codex bind</code> creates a stable automatic alias for the exact persisted task; the background service queues and injects inbound turns while MCP tools handle sends, replies, binding, and status. The task itself never polls.</div>
           </div>
 
           <div class="compat-row" role="row">
@@ -530,7 +567,11 @@
           </li>
           <li>
             <h3>SFTP delivery over SSH</h3>
-            <p>Message JSON is delivered with the SSH SFTP subsystem: create parent inbox directories, upload to a temporary file, then atomically rename into place. No remote login shell, no <code>$HOME</code> expansion, no <code>mkdir -p</code>, and no <code>mv</code> are required, so Windows OpenSSH targets work cleanly.</p>
+            <p>Message JSON is delivered with the SSH SFTP subsystem: create parent inbox directories, upload to a temporary file, then atomically rename into place. The transport path itself needs no remote shell commands, <code>$HOME</code> expansion, <code>mkdir -p</code>, or <code>mv</code>, so Windows OpenSSH targets work cleanly.</p>
+          </li>
+          <li>
+            <h3>Pairing grants full local-account SSH authority</h3>
+            <p>The default setup adds an unrestricted key to <code>authorized_keys</code>. A paired peer can therefore open a shell as that local user, not merely deliver bridge messages. Protect, revoke, and rotate keys accordingly; use a restricted account or forced command if you need message-only trust.</p>
           </li>
           <li>
             <h3>TTL-bounded delivery</h3>
@@ -548,6 +589,18 @@
         <div class="kicker"><span class="num">09 /</span> Changelog highlights</div>
         <h2 class="section-title">What&rsquo;s <span class="accent">new.</span></h2>
         <ul class="changelog-list">
+          <li class="cl-item">
+            <div class="cl-version">4.10.0</div>
+            <div class="cl-body">
+              <strong>First-class Codex endpoints.</strong> Bind the current task with one command; Agent Bridge derives a stable alias, queues safely while busy, resumes the exact persisted thread through the public App Server, and preserves at-most-once delivery with durable recovery. A real Codex &rarr; Claude Code &rarr; OpenClaw &rarr; OpenClaw &rarr; Codex chain passed across two Macs.
+            </div>
+          </li>
+          <li class="cl-item">
+            <div class="cl-version">4.9.x / 4.8.0</div>
+            <div class="cl-body">
+              <strong>Fleet learnings, endpoint fallback, and native notifications.</strong> Shared context remains additive to native memory; replication can fall back between tailnet and LAN endpoints; agents can show native completion banners without waking another agent.
+            </div>
+          </li>
           <li class="cl-item">
             <div class="cl-version">4.1.0</div>
             <div class="cl-body">
@@ -610,7 +663,7 @@
             <circle cx="25" cy="16" r="3.5" fill="#4dd0e1"/>
             <path d="M11 16 L21 16" stroke="#ff7a1a" stroke-width="1.3" stroke-dasharray="2 2"/>
           </svg>
-          <span>agent-bridge / v4.1.0</span>
+          <span>agent-bridge / v4.10.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/EthanSK/agent-bridge" target="_blank" rel="noopener">GitHub</a>

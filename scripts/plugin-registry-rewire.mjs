@@ -25,16 +25,17 @@
 //
 //   Phase 1 — Claude Code registry (~/.claude/plugins/installed_plugins.json)
 //     For each entry under `.plugins["agent-bridge@<marketplace>"]`:
-//       * If `installPath` does not exist on disk:
-//           - If a directory-source marketplace entry for "agent-bridge" exists
-//             in ~/.claude/settings.json's extraKnownMarketplaces, REMOVE the
-//             stale entry (Strategy B — marketplace handles the registration).
-//           - Otherwise REWIRE installPath to the current dev-clone plugin-root
-//             (Strategy A — the entry is the only registration channel).
+//       * If `installPath` does not exist on disk, REWIRE it to the current
+//         dev-clone plugin root. Claude Code needs an installed-plugin entry in
+//         addition to extraKnownMarketplaces; the marketplace alone does not
+//         register or start the plugin.
 //       * If `installPath` exists but is a stale cache path (e.g.
 //         ~/.claude/plugins/cache/agent-bridge/agent-bridge/<old-version>) AND
-//         the dev-clone is what's actually running, also rewire/remove per the
-//         same decision tree.
+//         the dev-clone is what's actually running, also rewire it.
+//       * If the canonical entry is missing while Agent Bridge is enabled and
+//         its directory marketplace exists, recreate the user-scope entry,
+//         preferring Claude Code's current-version installed cache when it is
+//         present and falling back to the dev-clone plugin root otherwise.
 //
 //   Phase 2 — OpenClaw registry (~/.openclaw/openclaw.json)
 //     * For each path in plugins.load.paths[] that mentions "agent-bridge",
@@ -395,6 +396,22 @@ function currentPluginVersion() {
   }
 }
 
+function preferredClaudeInstallRoot(currentVersion) {
+  if (currentVersion) {
+    const currentCacheRoot = join(
+      homedir(),
+      '.claude',
+      'plugins',
+      'cache',
+      'agent-bridge',
+      'agent-bridge',
+      currentVersion,
+    );
+    if (pathExists(currentCacheRoot)) return normPath(currentCacheRoot);
+  }
+  return normPath(PLUGIN_ROOT);
+}
+
 // ---------- Phase 1: Claude Code registry -----------------------------------
 
 const CLAUDE_INSTALLED_PLUGINS_PATH = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
@@ -411,6 +428,10 @@ function hasDirectorySourceMarketplace(settingsData) {
   return src.source === 'directory' && typeof src.path === 'string' && src.path.length > 0;
 }
 
+function agentBridgeEnabled(settingsData) {
+  return settingsData?.enabledPlugins?.['agent-bridge@agent-bridge'] === true;
+}
+
 function rewirePhase1ClaudeRegistry(stats) {
   const installed = readJsonSafe(CLAUDE_INSTALLED_PLUGINS_PATH);
   if (!installed.exists) {
@@ -423,7 +444,9 @@ function rewirePhase1ClaudeRegistry(stats) {
   }
 
   const settings = readJsonSafe(CLAUDE_SETTINGS_PATH);
-  const hasMarketplace = hasDirectorySourceMarketplace(settings.exists ? settings.data : null);
+  const settingsData = settings.exists ? settings.data : null;
+  const hasMarketplace = hasDirectorySourceMarketplace(settingsData);
+  const enabled = agentBridgeEnabled(settingsData);
 
   const data = installed.data;
   if (!data || typeof data !== 'object' || !data.plugins || typeof data.plugins !== 'object') {
@@ -438,17 +461,38 @@ function rewirePhase1ClaudeRegistry(stats) {
   // Find ALL agent-bridge keys (could be `agent-bridge@agent-bridge`,
   // `agent-bridge@<other-marketplace>`, etc.). Never touch anything else.
   const agentBridgeKeys = Object.keys(data.plugins).filter((k) => /^agent-bridge@/.test(k));
-  if (agentBridgeKeys.length === 0) {
+  let mutated = false;
+  const currentVersion = currentPluginVersion();
+  const currentPluginRoot = preferredClaudeInstallRoot(currentVersion);
+  const currentDevPluginRoot = normPath(PLUGIN_ROOT);
+
+  if (agentBridgeKeys.length === 0 && hasMarketplace && enabled) {
+    const timestamp = nowIso();
+    data.plugins['agent-bridge@agent-bridge'] = [{
+      scope: 'user',
+      installPath: currentPluginRoot,
+      ...(currentVersion ? { version: currentVersion } : {}),
+      installedAt: timestamp,
+      lastUpdated: timestamp,
+    }];
+    mutated = true;
+    agentBridgeKeys.push('agent-bridge@agent-bridge');
+    log('info', 'auto_update_runner.plugin_registry_rewired', {
+      harness: 'claude-code',
+      plugin: 'agent-bridge',
+      marketplace_key: 'agent-bridge@agent-bridge',
+      action: 'restored',
+      after_path: currentPluginRoot,
+      reason: 'enabled_plugin_entry_missing',
+      dry_run: DRY_RUN,
+    });
+  } else if (agentBridgeKeys.length === 0) {
     log('info', 'auto_update_runner.plugin_registry_clean', {
       harness: 'claude-code',
       reason: 'no_agent_bridge_entries',
     });
     return;
   }
-
-  let mutated = false;
-  const currentPluginRoot = normPath(PLUGIN_ROOT);
-  const currentVersion = currentPluginVersion();
 
   for (const key of agentBridgeKeys) {
     const rawEntries = data.plugins[key];
@@ -502,7 +546,10 @@ function rewirePhase1ClaudeRegistry(stats) {
         reason = 'missing_install_path';
       } else if (isCachePath && !matchesCurrent) {
         needsAction = true;
-        reason = 'stale_cache_path_dev_clone_active';
+        reason = 'stale_cache_path_not_current_install';
+      } else if (pathsEqual(before, currentDevPluginRoot) && !matchesCurrent) {
+        needsAction = true;
+        reason = 'source_path_replaced_by_current_install_cache';
       }
 
       if (!needsAction) {
@@ -512,36 +559,21 @@ function rewirePhase1ClaudeRegistry(stats) {
 
       mutated = true;
 
-      if (hasMarketplace) {
-        // Strategy B — drop the entry; marketplace handles registration.
-        log('info', 'auto_update_runner.plugin_registry_rewired', {
-          harness: 'claude-code',
-          plugin: 'agent-bridge',
-          marketplace_key: key,
-          action: 'removed',
-          before_path: before,
-          reason,
-          dry_run: DRY_RUN,
-        });
-        // Drop (do not push to kept).
-      } else {
-        // Strategy A — rewire installPath to current dev-clone.
-        const newEntry = { ...entry };
-        newEntry.installPath = currentPluginRoot;
-        if (currentVersion) newEntry.version = currentVersion;
-        newEntry.lastUpdated = nowIso();
-        log('info', 'auto_update_runner.plugin_registry_rewired', {
-          harness: 'claude-code',
-          plugin: 'agent-bridge',
-          marketplace_key: key,
-          action: 'rewired',
-          before_path: before,
-          after_path: currentPluginRoot,
-          reason,
-          dry_run: DRY_RUN,
-        });
-        kept.push(newEntry);
-      }
+      const newEntry = { ...entry };
+      newEntry.installPath = currentPluginRoot;
+      if (currentVersion) newEntry.version = currentVersion;
+      newEntry.lastUpdated = nowIso();
+      log('info', 'auto_update_runner.plugin_registry_rewired', {
+        harness: 'claude-code',
+        plugin: 'agent-bridge',
+        marketplace_key: key,
+        action: 'rewired',
+        before_path: before,
+        after_path: currentPluginRoot,
+        reason,
+        dry_run: DRY_RUN,
+      });
+      kept.push(newEntry);
     }
 
     if (kept.length === 0) {

@@ -1,0 +1,16 @@
+{
+  "name": "agent-bridge",
+  "short_name": "agent-bridge",
+  "description": "Agent-to-agent messaging over SSH for running Claude Code, OpenClaw, and Codex sessions.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0a0a0b",
+  "theme_color": "#0a0a0b",
+  "icons": [
+    {
+      "src": "./assets/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

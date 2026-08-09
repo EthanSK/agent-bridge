@@ -377,9 +377,17 @@ test('Backward-compat: legacy `inbox/claude-code/*.json` files migrate to `inbox
     // Legacy path must be gone.
     assert.equal(existsSync(legacyPath), false, 'legacy path no longer holds the file');
 
-    const events = await readEvents(home);
-    const migrated = events.find((e) => e.event === 'inbox.legacy_migrated');
-    assert.ok(migrated, 'inbox.legacy_migrated event must fire on boot');
+    // The rename and its audit append are two synchronous operations. Under
+    // full-suite load the parent can observe the rename during the tiny
+    // scheduling window before the child appends the event, so wait for the
+    // complete externally visible startup contract instead of sampling once.
+    let migrated;
+    const migrationLogged = await waitFor(async () => {
+      const events = await readEvents(home);
+      migrated = events.find((e) => e.event === 'inbox.legacy_migrated');
+      return Boolean(migrated);
+    }, 2_000, 25);
+    assert.ok(migrationLogged, 'inbox.legacy_migrated event must fire on boot');
     assert.equal(migrated.context.persona, 'default', 'migration logged for default persona');
     assert.ok(migrated.context.moved >= 1, 'at least 1 file moved');
     assert.ok(migrated.context.ids.includes(msgId), 'migrated id list includes our test message');

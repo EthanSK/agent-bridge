@@ -24,6 +24,33 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Test-AgentBridgeAbsolutePath {
+    param([string]$Path)
+    if ($Path -match '^[A-Za-z]:[\\/]') { return $true }
+    if ($Path -match '^[\\/]{2}[^\\/]+[\\/]+[^\\/]+(?:[\\/]|$)') { return $true }
+    return $false
+}
+
+function Resolve-AgentBridgeHome {
+    $raw = [string]$env:AGENT_BRIDGE_HOME
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return (Join-Path $env:USERPROFILE '.agent-bridge')
+    }
+    $raw = $raw.Trim()
+    if ($raw -eq '~') {
+        $raw = $env:USERPROFILE
+    } elseif ($raw.StartsWith('~/') -or $raw.StartsWith('~\')) {
+        $raw = Join-Path $env:USERPROFILE $raw.Substring(2)
+    }
+    $trimmed = $raw.TrimEnd([char[]]@('\', '/'))
+    if (($trimmed -match '^[A-Za-z]:$') -and ($raw -match '^[A-Za-z]:[\\/]+$')) { $trimmed += '\' }
+    if (-not (Test-AgentBridgeAbsolutePath $trimmed)) {
+        throw "AGENT_BRIDGE_HOME must resolve to an absolute path: $raw"
+    }
+    if ((Split-Path -Leaf $trimmed) -ieq '.agent-bridge') { return $trimmed }
+    return (Join-Path $trimmed '.agent-bridge')
+}
+
 # ---------- Resolve paths ---------------------------------------------------
 
 $ScriptDir = Split-Path -Parent $PSCommandPath
@@ -36,7 +63,8 @@ if (-not (Test-Path $BodyScript)) {
 }
 
 $TaskName = 'AgentBridge Periodic Update'
-$LogDir   = Join-Path $env:USERPROFILE '.agent-bridge\logs'
+$BridgeHome = Resolve-AgentBridgeHome
+$LogDir   = Join-Path $BridgeHome 'logs'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 # ---------- Compose action --------------------------------------------------
@@ -48,6 +76,15 @@ $psArgs = @(
 )
 if ($WithOpenclawMcpRepair) {
     $psArgs += '-WithOpenclawMcpRepair'
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$env:AGENT_BRIDGE_HOME)) {
+    # Scheduled Tasks do not preserve a transient installer-process env block;
+    # pass the normalized state dir explicitly to the updater body.
+    $psArgs += '-AgentBridgeHome'
+    $psArgs += "`"$BridgeHome`""
+}
+if ($env:AGENT_BRIDGE_CODEX_NO_ENSURE -eq '1') {
+    $psArgs += '-CodexNoEnsure'
 }
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($psArgs -join ' ') -WorkingDirectory $RepoRoot

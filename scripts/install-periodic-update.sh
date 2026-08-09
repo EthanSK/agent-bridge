@@ -44,6 +44,70 @@ done
 
 # ---------- Resolve paths ---------------------------------------------------
 
+bridge_home_is_complete_unc() {
+  local normalized="${1//\\//}" server rest share
+  case "$normalized" in //*) ;; *) return 1 ;; esac
+  normalized="${normalized#//}"
+  server="${normalized%%/*}"
+  [ "$server" != "$normalized" ] || return 1
+  rest="${normalized#*/}"
+  share="${rest%%/*}"
+  [ -n "$server" ] && [ -n "$share" ]
+}
+
+bridge_home_is_absolute() {
+  case "$1" in
+    [A-Za-z]:[\\/]*) return 0 ;;
+    //*) bridge_home_is_complete_unc "$1"; return ;;
+    \\*) bridge_home_is_complete_unc "$1"; return ;;
+    /*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_bridge_home() {
+  local raw="${AGENT_BRIDGE_HOME:-}"
+  if [[ -z "$raw" ]]; then
+    printf '%s' "$HOME/.agent-bridge"
+    return
+  fi
+  case "$raw" in
+    "~") raw="$HOME" ;;
+    "~/"*) raw="$HOME/${raw#~/}" ;;
+    "~\\"*)
+      raw="${raw#~\\}"
+      raw="$HOME/${raw//\\//}"
+      ;;
+  esac
+  if ! bridge_home_is_absolute "$raw"; then
+    printf 'install-periodic-update: AGENT_BRIDGE_HOME must resolve to an absolute path: %s\n' "$raw" >&2
+    return 2
+  fi
+  case "$raw" in
+    [A-Za-z]:[\\/]*|\\*)
+      if command -v cygpath >/dev/null 2>&1; then
+        raw="$(cygpath -u "$raw")"
+      else
+        printf 'install-periodic-update: native Windows AGENT_BRIDGE_HOME requires cygpath (Git Bash): %s\n' "$raw" >&2
+        return 2
+      fi
+      ;;
+  esac
+  while [[ "$raw" != "/" ]]; do
+    case "$raw" in
+      */|*\\) raw="${raw%?}" ;;
+      *) break ;;
+    esac
+  done
+  local leaf="${raw##*/}"
+  leaf="${leaf##*\\}"
+  if [[ "$leaf" == ".agent-bridge" ]]; then
+    printf '%s' "$raw"
+  else
+    printf '%s/.agent-bridge' "$raw"
+  fi
+}
+
 # Resolve the real path of this script, following symlinks.
 SCRIPT_SRC="${BASH_SOURCE[0]}"
 while [ -h "$SCRIPT_SRC" ]; do
@@ -61,7 +125,8 @@ chmod +x "$BODY_SCRIPT" 2>/dev/null || true
 LABEL="com.ethansk.agent-bridge.periodic-update"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/${LABEL}.plist"
-LOG_DIR="$HOME/.agent-bridge/logs"
+if ! BRIDGE_HOME="$(resolve_bridge_home)"; then exit 2; fi
+LOG_DIR="$BRIDGE_HOME/logs"
 LOG_FILE="$LOG_DIR/periodic-update.log"
 
 mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
@@ -72,6 +137,19 @@ mkdir -p "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
 BODY_ARGS_XML="    <string>$BODY_SCRIPT</string>"
 if [[ "$WITH_OPENCLAW_MCP_REPAIR" == "1" ]]; then
   BODY_ARGS_XML+=$'\n    <string>--with-openclaw-mcp-repair</string>'
+fi
+
+# launchd does not inherit the installer shell's custom environment. Preserve
+# an explicit bridge-home override (normalized to the state-dir form) and the
+# persistent no-ensure policy in the generated job.
+OPTIONAL_ENV_XML=""
+if [[ -n "${AGENT_BRIDGE_HOME:-}" ]]; then
+  OPTIONAL_ENV_XML+=$'\n    <key>AGENT_BRIDGE_HOME</key>'
+  OPTIONAL_ENV_XML+=$'\n    <string>'"$BRIDGE_HOME"$'</string>'
+fi
+if [[ "${AGENT_BRIDGE_CODEX_NO_ENSURE:-0}" == "1" ]]; then
+  OPTIONAL_ENV_XML+=$'\n    <key>AGENT_BRIDGE_CODEX_NO_ENSURE</key>'
+  OPTIONAL_ENV_XML+=$'\n    <string>1</string>'
 fi
 
 # Resolve a sensible PATH with nvm node prepended when present, mirroring the
@@ -120,6 +198,7 @@ ${BODY_ARGS_XML}
     <string>${HOME}</string>
     <key>AGENT_BRIDGE_REPO</key>
     <string>${REPO_ROOT}</string>
+${OPTIONAL_ENV_XML}
   </dict>
 </dict>
 </plist>

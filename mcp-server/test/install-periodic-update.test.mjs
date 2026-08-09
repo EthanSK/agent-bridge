@@ -57,10 +57,34 @@ const isWindows = platform() === 'win32';
 const isMac = platform() === 'darwin';
 const hasBash = !isWindows;  // Git-Bash on Windows would also work, but skipping for CI simplicity.
 
+function findPowerShell() {
+  const candidates = isWindows ? ['pwsh', 'powershell.exe'] : ['pwsh'];
+  for (const candidate of candidates) {
+    const probe = spawnSync(candidate, ['-NoProfile', '-NonInteractive', '-Command', '$null'], { encoding: 'utf8' });
+    if (!probe.error && probe.status === 0) return candidate;
+  }
+  return null;
+}
+
+const powerShell = findPowerShell();
+
 function teardown(...paths) {
   for (const p of paths) {
     try { rmSync(p, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+}
+
+function extractPowerShellFunction(source, name) {
+  const start = source.indexOf(`function ${name} {`);
+  assert.notEqual(start, -1, `missing PowerShell function ${name}`);
+  const open = source.indexOf('{', start);
+  let depth = 0;
+  for (let i = open; i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1;
+    if (source[i] === '}') depth -= 1;
+    if (depth === 0) return source.slice(start, i + 1);
+  }
+  throw new Error(`unterminated PowerShell function ${name}`);
 }
 
 // ---------- 1. macOS body syntax + structural checks -----------------------
@@ -89,11 +113,166 @@ test('agent-bridge-periodic-update.sh: contains expected blocks', () => {
   // Step 5 (optional): OC MCP repair
   assert.match(src, /WITH_OPENCLAW_MCP_REPAIR/, 'missing OpenClaw MCP repair flag');
   assert.match(src, /openclaw mcp set agent-bridge/, 'missing OpenClaw MCP set call');
+  // Step 7 (4.10.0): codex-channel service refresh, gated on bindings registry
+  assert.match(src, /codex-channel\/service\.mjs" --ensure/, 'missing codex-channel service ensure step');
+  assert.match(src, /codex\/bindings\.json/, 'codex ensure must be gated on the bindings registry');
+  assert.match(src, /codex\/pending-settings/, 'pending settings journals must also trigger recovery');
+  assert.match(src, /AGENT_BRIDGE_CODEX_NO_ENSURE/, 'persistent no-ensure policy must win');
+  assert.match(src, /BRIDGE_HOME="\$\(resolve_bridge_home\)"/, 'periodic paths must normalize AGENT_BRIDGE_HOME');
   // Log path
   assert.match(src, /\.agent-bridge\/logs\/periodic-update\.log/, 'missing log path');
 });
 
+test('agent-bridge-periodic-update.sh: recovery-work gate honors enabled bindings, journals, custom home, and NO_ENSURE', { skip: !hasBash }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'periodic-codex-gate-'));
+  const home = join(root, 'profile');
+  const overrideParent = join(root, 'custom-state-parent');
+  const bridgeHome = join(overrideParent, '.agent-bridge');
+  const fakeRepo = join(root, 'repo');
+  const stubBin = join(home, 'bin');
+  const serviceCalls = join(root, 'service-calls.log');
+  const head = '1111111111111111111111111111111111111111';
+  mkdirSync(join(fakeRepo, '.git'), { recursive: true });
+  mkdirSync(join(fakeRepo, 'mcp-server', 'build'), { recursive: true });
+  mkdirSync(join(fakeRepo, 'codex-channel'), { recursive: true });
+  mkdirSync(join(bridgeHome, 'codex'), { recursive: true });
+  mkdirSync(join(bridgeHome, 'state'), { recursive: true });
+  mkdirSync(stubBin, { recursive: true });
+  writeFileSync(join(fakeRepo, 'mcp-server', 'build', 'index.js'), '');
+  writeFileSync(join(fakeRepo, 'mcp-server', 'package.json'), '{"version":"4.10.0"}\n');
+  writeFileSync(join(fakeRepo, 'codex-channel', 'service.mjs'), '');
+  writeFileSync(join(bridgeHome, 'state', 'built-head.txt'), `${head}\n`);
+
+  // The updater prepends $HOME/bin to PATH. Keep inline `node -e` / `node -p`
+  // real, but record service ensures instead of spawning a daemon.
+  writeFileSync(join(stubBin, 'node'), `#!/bin/bash
+if [[ "\${1:-}" == "-e" || "\${1:-}" == "-p" ]]; then exec "$REAL_NODE" "$@"; fi
+if [[ "\${1:-}" == */codex-channel/service.mjs && "\${2:-}" == "--ensure" ]]; then
+  printf 'ensure\\n' >> "$SERVICE_CALL_LOG"
+  exit 0
+fi
+exec "$REAL_NODE" "$@"
+`);
+  writeFileSync(join(stubBin, 'git'), `#!/bin/bash
+case "\${1:-}" in
+  rev-parse) printf '${head}\\n' ;;
+  fetch|pull|diff|ls-files) exit 0 ;;
+  *) exit 0 ;;
+esac
+`);
+  chmodSync(join(stubBin, 'node'), 0o755);
+  chmodSync(join(stubBin, 'git'), 0o755);
+
+  const bindingsPath = join(bridgeHome, 'codex', 'bindings.json');
+  const pendingDir = join(bridgeHome, 'codex', 'pending-settings');
+  const baseEnv = {
+    ...process.env,
+    HOME: home,
+    AGENT_BRIDGE_HOME: overrideParent, // parent form must normalize to bridgeHome
+    AGENT_BRIDGE_REPO: fakeRepo,
+    AGENT_BRIDGE_MACHINE_NAME: 'Periodic-Test',
+    REAL_NODE: process.execPath,
+    SERVICE_CALL_LOG: serviceCalls,
+  };
+  const runBody = (extraEnv = {}) => spawnSync('/bin/bash', [BODY_SH, '--skip-oc-restart'], {
+    env: { ...baseEnv, ...extraEnv },
+    encoding: 'utf8',
+  });
+
+  try {
+    writeFileSync(bindingsPath, JSON.stringify({ bindings: { paused: { enabled: false } } }));
+    let res = runBody();
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(existsSync(serviceCalls), false, 'all-disabled registry alone must not ensure');
+
+    writeFileSync(bindingsPath, JSON.stringify({ bindings: { active: { enabled: true } } }));
+    res = runBody();
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(serviceCalls, 'utf8'), 'ensure\n', 'enabled binding triggers ensure');
+
+    rmSync(serviceCalls, { force: true });
+    writeFileSync(bindingsPath, JSON.stringify({ bindings: {} }));
+    mkdirSync(pendingDir, { recursive: true });
+    writeFileSync(join(pendingDir, 'removed.json'), '{}\n');
+    res = runBody();
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(readFileSync(serviceCalls, 'utf8'), 'ensure\n', 'journal-only recovery triggers ensure');
+
+    rmSync(serviceCalls, { force: true });
+    res = runBody({ AGENT_BRIDGE_CODEX_NO_ENSURE: '1' });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(existsSync(serviceCalls), false, 'NO_ENSURE wins over pending recovery work');
+    assert.ok(existsSync(join(bridgeHome, 'logs', 'periodic-update.log')),
+      'parent-form AGENT_BRIDGE_HOME is normalized for updater state and logs');
+    assert.equal(existsSync(join(overrideParent, 'logs')), false,
+      'updater never treats the parent form itself as the state dir');
+  } finally {
+    teardown(root);
+  }
+});
+
+test('Unix updater/provisioner reject cwd-dependent AGENT_BRIDGE_HOME roots', { skip: !hasBash }, () => {
+  const home = mkdtempSync(join(tmpdir(), 'periodic-relative-home-'));
+  try {
+    for (const invalid of ['state', '../state', 'C:state', '\\state', '\\\\server']) {
+      for (const script of [BODY_SH, INSTALL_SH]) {
+        const args = script === BODY_SH ? [script, '--skip-oc-restart'] : [script];
+        const res = spawnSync('/bin/bash', args, {
+          env: { ...process.env, HOME: home, AGENT_BRIDGE_HOME: invalid },
+          encoding: 'utf8',
+        });
+        assert.notEqual(res.status, 0, `${script} accepted ${invalid}`);
+        assert.match(res.stderr, /must resolve to an absolute path/, `${script}: ${invalid}`);
+      }
+    }
+  } finally {
+    teardown(home);
+  }
+});
+
 // ---------- 2. Windows body structural checks ------------------------------
+
+test('PowerShell installers/updater: parser accepts every script', { skip: !powerShell }, () => {
+  for (const path of [join(REPO_ROOT, 'install.ps1'), BODY_PS1, INSTALL_PS1]) {
+    const escaped = path.replaceAll("'", "''");
+    const command = `$tokens=$null; $errors=$null; `
+      + `[void][System.Management.Automation.Language.Parser]::ParseFile('${escaped}', [ref]$tokens, [ref]$errors); `
+      + `if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }`;
+    const res = spawnSync(powerShell, ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8' });
+    assert.equal(res.status, 0, `${path} failed PowerShell parse: ${res.stderr}${res.stdout}`);
+  }
+});
+
+test('PowerShell bridge-home matrix accepts fully qualified roots and rejects cwd-dependent roots', { skip: !isWindows || !powerShell }, () => {
+  for (const path of [join(REPO_ROOT, 'install.ps1'), BODY_PS1, INSTALL_PS1]) {
+    const source = readFileSync(path, 'utf8');
+    const functions = [
+      extractPowerShellFunction(source, 'Test-AgentBridgeAbsolutePath'),
+      extractPowerShellFunction(source, 'Resolve-AgentBridgeHome'),
+    ].join('\n\n');
+    const command = `${functions}
+$env:USERPROFILE = 'C:\\Users\\BridgeTest'
+$accepted = @{
+  'C:\\Bridge\\state\\' = 'C:\\Bridge\\state\\.agent-bridge'
+  'C:\\Bridge\\.AGENT-BRIDGE\\' = 'C:\\Bridge\\.AGENT-BRIDGE'
+  '~\\state\\' = 'C:\\Users\\BridgeTest\\state\\.agent-bridge'
+  '\\\\server\\share\\state' = '\\\\server\\share\\state\\.agent-bridge'
+}
+foreach ($entry in $accepted.GetEnumerator()) {
+  $env:AGENT_BRIDGE_HOME = $entry.Key
+  $actual = Resolve-AgentBridgeHome
+  if ($actual -cne $entry.Value) { throw "unexpected normalization: $($entry.Key) -> $actual" }
+}
+foreach ($value in @('state', '..\\state', 'C:state', '\\state', '\\\\server')) {
+  $env:AGENT_BRIDGE_HOME = $value
+  $rejected = $false
+  try { $null = Resolve-AgentBridgeHome } catch { $rejected = $true }
+  if (-not $rejected) { throw "relative root accepted: $value" }
+}`;
+    const res = spawnSync(powerShell, ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8' });
+    assert.equal(res.status, 0, `${path} normalization matrix failed: ${res.stderr}${res.stdout}`);
+  }
+});
 
 test('agent-bridge-periodic-update.ps1: contains expected blocks', () => {
   assert.ok(existsSync(BODY_PS1), `body script missing: ${BODY_PS1}`);
@@ -106,6 +285,52 @@ test('agent-bridge-periodic-update.ps1: contains expected blocks', () => {
   assert.match(src, /plugin-registry-rewire/, 'missing plugin-registry-rewire call');
   assert.match(src, /periodic-update\.log/, 'missing log path');
   assert.match(src, /periodic-update\.lock/, 'missing lock dir');
+  // Step 6 (4.10.0): codex-channel service refresh, gated on recovery work
+  assert.match(src, /codex-channel\\service\.mjs/, 'missing codex-channel service path');
+  assert.match(src, /codex\\bindings\.json/, 'codex ensure must inspect the bindings registry under the resolved bridge home');
+  assert.match(src, /codex\\pending-settings/, 'pending settings journals must also trigger recovery');
+  assert.match(src, /AGENT_BRIDGE_CODEX_NO_ENSURE/, 'persistent no-ensure policy must win');
+  assert.match(src, /Resolve-AgentBridgeHome/, 'periodic paths must normalize AGENT_BRIDGE_HOME');
+  assert.match(src, /Test-AgentBridgeAbsolutePath/, 'periodic paths reject cwd-dependent bridge homes');
+});
+
+// ---------- 2b. Installer lifecycle structure (4.10.0 codex runtime) -------
+// Behavioral Unix coverage lives in codex-channel/test/installer.test.mjs
+// (runs the real install.sh hermetically). These structural checks pin the
+// override surface + stage/swap/rollback + actionable failure wording on
+// BOTH installers; Codex executes the Windows behavior on the fleet.
+
+test('install.sh: hermetic overrides, stage-swap runtime install, actionable failure', () => {
+  const src = readFileSync(join(REPO_ROOT, 'install.sh'), 'utf8');
+  assert.match(src, /AGENT_BRIDGE_INSTALL_DIR/, 'install dir override');
+  assert.match(src, /AGENT_BRIDGE_REPO_BASE/, 'repo base override (file:// fixtures)');
+  assert.match(src, /AGENT_BRIDGE_RUNTIME_SRC_DIR/, 'local runtime source override');
+  assert.match(src, /AGENT_BRIDGE_RUNTIME_TARBALL_URL/, 'runtime tarball override');
+  assert.match(src, /BRIDGE_HOME="\$\(resolve_bridge_home\)"/, 'runtime follows normalized AGENT_BRIDGE_HOME');
+  assert.match(src, /codex-channel\.new/, 'staged install');
+  assert.match(src, /codex-channel\.old/, 'swap keeps the previous runtime for rollback');
+  assert.match(src, /\[warn\] Codex support NOT installed/, 'runtime failure is loud, not implied success');
+  assert.match(src, /AGENT_BRIDGE_SOURCE_DIR/, 'failure message names the recovery lever');
+  assert.match(src, /pending-settings/, 'journal-only recovery triggers ensure');
+  assert.match(src, /AGENT_BRIDGE_CODEX_NO_ENSURE/, 'installer honors no-ensure policy');
+});
+
+test('install.ps1: stage-swap with rollback, LASTEXITCODE-safe periodic step, actionable failure', () => {
+  const src = readFileSync(join(REPO_ROOT, 'install.ps1'), 'utf8');
+  assert.match(src, /codex-channel\.new/, 'staged install');
+  assert.match(src, /codex-channel\.old/, 'previous runtime kept for rollback');
+  assert.match(src, /Move-Item -Path \$DestNew -Destination \$Dest/, 'atomic-ish swap via rename');
+  assert.match(src, /\[warn\] Codex support NOT installed/, 'runtime failure is loud');
+  assert.match(src, /AGENT_BRIDGE_SOURCE_DIR/, 'failure message names the recovery lever');
+  assert.match(src, /Resolve-AgentBridgeHome/, 'runtime follows normalized AGENT_BRIDGE_HOME');
+  assert.match(src, /Test-AgentBridgeAbsolutePath/, 'installer rejects cwd-dependent bridge homes');
+  assert.match(src, /pending-settings/, 'journal-only recovery triggers ensure');
+  assert.match(src, /AGENT_BRIDGE_CODEX_NO_ENSURE/, 'installer honors no-ensure policy');
+  assert.match(src, /codex-channel\\service\.mjs'\) --ensure/, 'newly installed runtime is version-ensured after the swap');
+  assert.match(src, /\$env:AGENT_BRIDGE_HOME = \$BridgeHome[\s\S]*codex-channel\\service\.mjs/, 'ensured runtime receives the normalized bridge home');
+  assert.match(src, /\$PreviousBridgeHome[\s\S]*Remove-Item Env:AGENT_BRIDGE_HOME/, 'installer restores the caller process override after ensure');
+  const periodic = readFileSync(BODY_PS1, 'utf8');
+  assert.match(periodic, /\$LASTEXITCODE -eq 0[\s\S]*codex-channel service ensured/, 'native exit codes checked before logging success');
 });
 
 // ---------- 3. macOS provisioner: plist generation -------------------------
@@ -131,6 +356,8 @@ test('install-periodic-update.sh: generates valid plist with correct fields (san
     const env = {
       ...process.env,
       HOME: sandboxHome,
+      AGENT_BRIDGE_HOME: join(sandboxHome, 'custom-bridge-parent'),
+      AGENT_BRIDGE_CODEX_NO_ENSURE: '1',
       PATH: `${stubBin}:${process.env.PATH || ''}`,
     };
     const res = spawnSync('/bin/bash', [INSTALL_SH], { env, encoding: 'utf8' });
@@ -146,6 +373,13 @@ test('install-periodic-update.sh: generates valid plist with correct fields (san
     assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/, 'missing RunAtLoad=true');
     assert.match(plist, new RegExp(`<string>${BODY_SH.replace(/[.\/]/g, '\\$&')}</string>`), 'plist missing body script path');
     assert.match(plist, /<key>WorkingDirectory<\/key>/, 'missing WorkingDirectory');
+    assert.match(
+      plist,
+      new RegExp(`<key>AGENT_BRIDGE_HOME<\\/key>\\s*<string>${join(sandboxHome, 'custom-bridge-parent', '.agent-bridge').replace(/[.\/]/g, '\\$&')}<\\/string>`),
+      'normalized AGENT_BRIDGE_HOME is preserved in the LaunchAgent',
+    );
+    assert.match(plist, /<key>AGENT_BRIDGE_CODEX_NO_ENSURE<\/key>\s*<string>1<\/string>/,
+      'no-ensure policy is preserved in the LaunchAgent');
 
     // Validate XML via plutil.
     const plutilRes = spawnSync('plutil', ['-lint', plistPath], { encoding: 'utf8' });
@@ -200,6 +434,10 @@ test('install-periodic-update.ps1: structural markers present', () => {
   assert.match(src, /New-TimeSpan -Minutes 10/, 'missing 10-min interval');
   assert.match(src, /AtLogOn/, 'missing logon trigger');
   assert.match(src, /WithOpenclawMcpRepair/, 'missing OC MCP repair switch param');
+  assert.match(src, /AgentBridgeHome/, 'custom bridge home forwarded to task body');
+  assert.match(src, /CodexNoEnsure/, 'no-ensure policy forwarded to task body');
+  assert.match(src, /Resolve-AgentBridgeHome/, 'provisioner normalizes bridge home');
+  assert.match(src, /Test-AgentBridgeAbsolutePath/, 'provisioner rejects cwd-dependent bridge homes');
 });
 
 // ---------- 5. Stale-lock reclaim behaviour --------------------------------
