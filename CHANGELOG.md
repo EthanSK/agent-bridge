@@ -2,6 +2,12 @@
 
 ## agent-bridge 4.10.0 — 2026-08-09
 
+- **Codex CLI Node resolution in non-login contexts.** `agent-bridge codex …`
+  now resolves an explicit `AGENT_BRIDGE_NODE`, the current `PATH`, then the
+  standard Apple Silicon/Intel Homebrew Node locations. This keeps the
+  installed Codex channel usable from launchd and non-login SSH commands whose
+  default PATH omits Homebrew, with deterministic regression coverage.
+
 - **Zero-argument Codex opt-in**: from the current task, `agent-bridge codex bind` now discovers `CODEX_THREAD_ID`, reads the user-facing task name through read-only `thread/read`, derives a portable collision-safe alias, persists it across later title changes, and ensures the service. `bridge_codex_bind` now makes `alias` optional with the same behavior; `--alias` / `alias` remain explicit overrides.
 
 FIRST-CLASS CODEX SUPPORT. Codex tasks become real Agent Bridge endpoints: any existing or new Codex task can opt in by binding a stable `codex/<alias>` target to its exact persisted thread id, after which the background codex-channel service delivers inbound bridge messages into that exact thread (the task itself never polls; the service scans the inbox and wakes the persisted task through the App Server) and outbound sends/replies route back to the precise originating target. Built on the public Codex App Server API only (`thread/resume` + `turn/start`, guarded optional `turn/steer`), with a validated **0.145.0 floor** (raised from the initially-planned 0.143.0 during the protocol-review pass: active-resume hydration and structural clientId echo are validated 0.145 surfaces; no equally safe older floor is claimed).

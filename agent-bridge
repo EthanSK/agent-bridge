@@ -2936,7 +2936,7 @@ cmd_codex() {
   # (symlinked CLI on macOS/Linux), then known dev-clone paths for installed
   # bin-copy layouts (Windows install.ps1 copies the CLI instead of
   # symlinking, so $0 does not live inside the repo there).
-  local resolved script_dir repo_root codex_cli candidate
+  local resolved script_dir repo_root codex_cli candidate node_bin
   resolved="$0"
   while [ -h "$resolved" ]; do
     script_dir="$(cd -P "$(dirname "$resolved")" && pwd)"
@@ -2966,8 +2966,28 @@ cmd_codex() {
   done
 
   [ -n "$codex_cli" ] || die "codex-channel runtime not found (searched: \$AGENT_BRIDGE_SOURCE_DIR, $repo_root/codex-channel/, $CONFIG_DIR/runtime/codex-channel/, $HOME/Projects/agent-bridge/, $HOME/.openclaw/workspace/agent-bridge/). Re-run install.sh / install.ps1 (which installs the self-contained runtime), clone the agent-bridge repo, or set AGENT_BRIDGE_SOURCE_DIR to a checkout."
-  command -v node >/dev/null 2>&1 || die "node is required for 'agent-bridge codex'"
-  exec node "$codex_cli" "$@"
+
+  # SSH and launchd commonly provide a minimal PATH on macOS, omitting the
+  # Homebrew prefix even when Node is installed normally. Resolve the runtime
+  # at this owning CLI boundary so `agent-bridge codex ...` works identically
+  # from interactive shells, bridge_run_command, and launch-at-login jobs.
+  # AGENT_BRIDGE_NODE remains an explicit escape hatch for nonstandard installs.
+  node_bin=""
+  if [ -n "${AGENT_BRIDGE_NODE:-}" ]; then
+    [ -x "$AGENT_BRIDGE_NODE" ] || die "AGENT_BRIDGE_NODE is not executable: $AGENT_BRIDGE_NODE"
+    node_bin="$AGENT_BRIDGE_NODE"
+  elif command -v node >/dev/null 2>&1; then
+    node_bin="$(command -v node)"
+  else
+    for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
+      if [ -x "$candidate" ]; then
+        node_bin="$candidate"
+        break
+      fi
+    done
+  fi
+  [ -n "$node_bin" ] || die "node is required for 'agent-bridge codex' (set AGENT_BRIDGE_NODE or add node to PATH)"
+  exec "$node_bin" "$codex_cli" "$@"
 }
 
 cmd_codex_help() {

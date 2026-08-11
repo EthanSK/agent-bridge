@@ -205,4 +205,36 @@ set -e
 grep -qiE 'no.*paired|no machines' <<<"$OUTPUT" \
   || { echo "FAIL: empty homes case should report no paired machines"; echo "$OUTPUT"; exit 1; }
 
+# -- Case 5: Codex subcommands resolve Node outside a minimal non-login PATH --
+# Use an explicit runtime override first so this proof is portable across CI
+# hosts whose Node binary is not installed in a standard macOS prefix.
+CODEX_HOME_DIR="$TMP/codex-home"
+mkdir -p "$CODEX_HOME_DIR"
+OUTPUT="$(env -i \
+  HOME="$TMP/realhome" \
+  USER="${USER:-test}" \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  AGENT_BRIDGE_HOME="$TMP/realhome/.agent-bridge" \
+  AGENT_BRIDGE_SOURCE_DIR="$ROOT" \
+  AGENT_BRIDGE_NODE="$(command -v node)" \
+  CODEX_HOME="$CODEX_HOME_DIR" \
+  "$ROOT/agent-bridge" codex status --json)"
+grep -q '"channelVersion"' <<<"$OUTPUT" \
+  || { echo "FAIL: AGENT_BRIDGE_NODE did not make codex status usable under a minimal PATH"; echo "$OUTPUT"; exit 1; }
+
+# On Apple Silicon Macs, the normal Homebrew location must work with no
+# override at all — this is the real launchd/SSH regression being fenced.
+if [ -x /opt/homebrew/bin/node ]; then
+  OUTPUT="$(env -i \
+    HOME="$TMP/realhome" \
+    USER="${USER:-test}" \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    AGENT_BRIDGE_HOME="$TMP/realhome/.agent-bridge" \
+    AGENT_BRIDGE_SOURCE_DIR="$ROOT" \
+    CODEX_HOME="$CODEX_HOME_DIR" \
+    "$ROOT/agent-bridge" codex status --json)"
+  grep -q '"channelVersion"' <<<"$OUTPUT" \
+    || { echo "FAIL: Homebrew Node fallback did not work under a minimal PATH"; echo "$OUTPUT"; exit 1; }
+fi
+
 echo "cli-sandboxed-home.sh: all checks passed"
