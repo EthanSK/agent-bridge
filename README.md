@@ -1371,7 +1371,7 @@ The bash `agent-bridge` CLI (used for `pair`, `list`, `status`, `run`, `connect`
 **Install the skill:**
 ```bash
 mkdir -p ~/.claude/skills/agent-bridge
-cp skills/bridge/skill.md ~/.claude/skills/agent-bridge/skill.md
+cp -R skills/bridge/. ~/.claude/skills/agent-bridge/
 ```
 
 **For remote-only access** (connecting to a remote machine's MCP server via SSH):
@@ -2262,11 +2262,12 @@ agent-bridge ships with skill/instruction files that teach each AI agent how to 
 ```bash
 # If you cloned the repo:
 mkdir -p ~/.claude/skills/agent-bridge
-cp skills/bridge/skill.md ~/.claude/skills/agent-bridge/skill.md
+cp -R skills/bridge/. ~/.claude/skills/agent-bridge/
 
 # Or download directly:
-curl -fsSL https://raw.githubusercontent.com/EthanSK/agent-bridge/main/skills/bridge/skill.md \
-  -o ~/.claude/skills/agent-bridge/skill.md --create-dirs
+git clone https://github.com/EthanSK/agent-bridge.git agent-bridge-skill-source
+mkdir -p ~/.claude/skills/agent-bridge
+cp -R agent-bridge-skill-source/skills/bridge/. ~/.claude/skills/agent-bridge/
 ```
 
 #### Claude Code watcher ownership
@@ -2466,3 +2467,7 @@ Agent Bridge still contains a Fleet Chime module because it depends on the bridg
 ## License
 
 [MIT](LICENSE) -- Ethan SK
+
+## Weekly skill update checks
+
+The bundled skills include an agent-led weekly check against this public repository. A small Python 3 helper coordinates dates and leases; it starts no background process. The agent reviews updates, preserves local edits, uses the appropriate installer or plugin host, and tells you after a verified update. Users can opt out; copied skills without a trustworthy baseline require reconciliation before updating. This updates skill files only, without starting domain actions or restarting running services. See [the update procedure](skills/openclaw/references/public-updates.md).

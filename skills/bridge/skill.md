@@ -325,3 +325,7 @@ If both machines are on Tailscale, use the Tailscale hostname or IP instead of t
 - No passwords are stored or transmitted
 - All files are stored in `~/.agent-bridge/` with restrictive permissions (mode 700)
 - Message content is base64-encoded for SSH transport to prevent shell injection
+
+## Weekly public updates
+
+On first use in a task, or the next use after a week in a long task, follow [references/public-updates.md](references/public-updates.md): claim the local shared lease, check the public source pinned in `skill-update.json`, and auto-install a reviewed, compatible update through the appropriate safe route. This is agent-triggered, not a background service. Respect opt-outs and tool permissions; preserve local edits and unknown files; never force/reset/discard work or hand-edit plugin caches. Keep dates and locks outside the skill. Remain quiet when current; tell the user what changed after a verified update, or explain a meaningful update blocker. Updating files never authorizes the skill's domain actions.

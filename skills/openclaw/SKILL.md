@@ -153,3 +153,7 @@ When the user names an OpenClaw persona, route to the matching `target` LITERALL
 - `Claude Station Mini` / `Clawdmini` / `default` / unspecified → `openclaw/default`
 
 Voice transcripts mis-hear persona names (`Claude the third` → `"Cloward third"`); re-read before routing. Canonical rule + rationale: [`docs/oc-persona-routing.md`](../../docs/oc-persona-routing.md).
+
+## Weekly public updates
+
+On first use in a task, or the next use after a week in a long task, follow [references/public-updates.md](references/public-updates.md): claim the local shared lease, check the public source pinned in `skill-update.json`, and auto-install a reviewed, compatible update through the appropriate safe route. This is agent-triggered, not a background service. Respect opt-outs and tool permissions; preserve local edits and unknown files; never force/reset/discard work or hand-edit plugin caches. Keep dates and locks outside the skill. Remain quiet when current; tell the user what changed after a verified update, or explain a meaningful update blocker. Updating files never authorizes the skill's domain actions.

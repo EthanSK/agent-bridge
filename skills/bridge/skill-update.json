@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/EthanSK/agent-bridge",
+  "branch": "main",
+  "path": "skills/bridge",
+  "distribution": "git-or-copy"
+}
