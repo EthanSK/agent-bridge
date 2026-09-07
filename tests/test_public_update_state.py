@@ -69,6 +69,41 @@ class StateTests(unittest.TestCase):
             self.call('finish', token=token, outcome='updated', now=101)
         self.assertEqual('busy', self.call(now=102)['status'])
 
+    def offer(self):
+        token = self.call(now=100)['token']
+        self.call('finish', token=token, outcome='available', revision='abc', now=101)
+
+    def test_offer_waits_without_installing_or_reprompting(self):
+        self.offer()
+        self.assertEqual('not_due', self.call(now=102)['status'])
+        later = self.call(now=101 + state.WEEK)
+        self.assertEqual('abc', later['offered_revision'])
+        with self.assertRaises(ValueError):
+            self.call('finish', token=later['token'], outcome='updated', revision='abc', now=102 + state.WEEK)
+
+    def test_approval_resumes_immediately_and_only_that_revision(self):
+        self.offer()
+        token = self.call(approved_revision='abc', now=102)['token']
+        with self.assertRaises(ValueError):
+            self.call('finish', token=token, outcome='updated', revision='newer', now=103)
+        self.call('finish', token=token, outcome='updated', revision='abc', now=104)
+        with self.assertRaises(ValueError):
+            self.call(approved_revision='abc', now=105)
+
+    def test_unoffered_approval_cannot_bypass_schedule(self):
+        with self.assertRaises(ValueError):
+            self.call(approved_revision='abc', now=100)
+        self.offer()
+        with self.assertRaises(ValueError):
+            self.call(approved_revision='newer', now=102)
+
+    def test_approval_does_not_bypass_opt_out_or_other_owner(self):
+        self.offer()
+        self.call(approved_revision='abc', now=102)
+        self.assertEqual('busy', self.call(approved_revision='abc', now=103)['status'])
+        self.call('disable', now=104)
+        self.assertEqual('disabled', self.call(approved_revision='abc', now=105)['status'])
+
 
 if __name__ == '__main__':
     unittest.main()

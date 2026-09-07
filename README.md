@@ -2471,3 +2471,7 @@ Agent Bridge still contains a Fleet Chime module because it depends on the bridg
 ## Weekly skill update checks
 
 The bundled skills include an agent-led weekly check against this public repository. A small Python 3 helper coordinates dates and leases; it starts no background process. The agent reviews updates, preserves local edits, uses the appropriate installer or plugin host, and tells you after a verified update. Users can opt out; copied skills without a trustworthy baseline require reconciliation before updating. This updates skill files only, without starting domain actions or restarting running services. See [the update procedure](skills/openclaw/references/public-updates.md).
+
+## Weekly skill update checks
+
+The agent checks the skill's configured public source on first use when a week has passed. When an update is available, it explains the changes and asks if you want it first. It installs only after you agree, preserves local edits and respects opt-outs. Declining or ignoring the offer leaves your installed skill unchanged. The date and shared lease stay local; no background process is added. See [the update procedure](skills/openclaw/references/public-updates.md).
