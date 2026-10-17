@@ -24,6 +24,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-10-17
+**Trigger:** Ethan requested daily background update checks rather than every ten minutes.
+**Symptom:** The installed periodic updater pointed at a linked worktree, not the main checkout; changing only the main installer would leave that runtime and future reinstallations stale.
+**Root cause:** launchd retains loaded schedule values, while linked worktrees can independently retain an older installer. The separate in-process MCP notification probe is a third schedule, not this periodic updater.
+**Fix:** Commit 0afb727 changes the macOS interval to 86400 seconds and Windows to a daily trigger, with no extra login trigger. Apply the same installer change to the actual runtime worktree, preserve its existing arguments/options, and reload only the idle updater job; never run its update body merely to test the schedule.
+**Guard:** Installer fixtures passed 16 tests with two Windows-only tests skipped; loaded macOS readback showed 86400 seconds and no immediate update run. The MCP notification probe remains separate and unchanged.
+---
+
+---
 **Date:** 2026-08-08T23:38:00Z
 **Trigger:** Real four-participant Agent Bridge chain: Codex -> Claude Code -> OpenClaw clawdiboi2 -> OpenClaw clordlethird -> Codex
 **Symptom:** Claude Code 2.1.226 first missed an offline replay because the MCP child emitted it before Claude registered its channel handler. After delaying replay, Claude accepted the notification transport but disconnected it with a Zod error because `params.meta.ts` was a number. Claude's directory marketplace also existed while the installed plugin registry entry had been removed, so a healthy watcher process alone was not evidence of a usable channel.
