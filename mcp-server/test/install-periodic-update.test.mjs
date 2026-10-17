@@ -18,11 +18,11 @@
 //      otherwise smoke-check structural markers.
 //   3. Lint install-periodic-update.sh and assert the generated plist (when
 //      we run the script in a sandbox HOME with a stub launchctl) is valid
-//      XML, contains the right Label, StartInterval=600, and points at the
+//      XML, contains the right Label, StartInterval=86400, and points at the
 //      correct body script. Also asserts idempotent re-run leaves a single
 //      plist.
 //   4. Smoke-check install-periodic-update.ps1 structurally (Register-
-//      ScheduledTask call, 10-min RepetitionInterval, AtLogOn trigger).
+//      ScheduledTask call, daily trigger, and no logon trigger).
 //
 // All tests are gated to skip on platforms that can't run them.
 
@@ -369,8 +369,8 @@ test('install-periodic-update.sh: generates valid plist with correct fields (san
     const plist = readFileSync(plistPath, 'utf8');
     assert.match(plist, /<\?xml version="1\.0"/, 'plist missing XML preamble');
     assert.match(plist, /<key>Label<\/key>\s*<string>com\.ethansk\.agent-bridge\.periodic-update<\/string>/, 'wrong Label');
-    assert.match(plist, /<key>StartInterval<\/key>\s*<integer>600<\/integer>/, 'wrong StartInterval');
-    assert.match(plist, /<key>RunAtLoad<\/key>\s*<true\/>/, 'missing RunAtLoad=true');
+    assert.match(plist, /<key>StartInterval<\/key>\s*<integer>86400<\/integer>/, 'wrong daily StartInterval');
+    assert.doesNotMatch(plist, /<key>RunAtLoad<\/key>/, 'login must not add an extra updater run');
     assert.match(plist, new RegExp(`<string>${BODY_SH.replace(/[.\/]/g, '\\$&')}</string>`), 'plist missing body script path');
     assert.match(plist, /<key>WorkingDirectory<\/key>/, 'missing WorkingDirectory');
     assert.match(
@@ -431,8 +431,8 @@ test('install-periodic-update.ps1: structural markers present', () => {
   assert.match(src, /Register-ScheduledTask/, 'missing Register-ScheduledTask call');
   assert.match(src, /Unregister-ScheduledTask/, 'missing Unregister-ScheduledTask (idempotency)');
   assert.match(src, /AgentBridge Periodic Update/, 'missing task name');
-  assert.match(src, /New-TimeSpan -Minutes 10/, 'missing 10-min interval');
-  assert.match(src, /AtLogOn/, 'missing logon trigger');
+  assert.match(src, /New-ScheduledTaskTrigger -Daily/, 'missing daily trigger');
+  assert.doesNotMatch(src, /New-ScheduledTaskTrigger -AtLogOn/, 'logon must not add an extra updater run');
   assert.match(src, /WithOpenclawMcpRepair/, 'missing OC MCP repair switch param');
   assert.match(src, /AgentBridgeHome/, 'custom bridge home forwarded to task body');
   assert.match(src, /CodexNoEnsure/, 'no-ensure policy forwarded to task body');

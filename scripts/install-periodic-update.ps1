@@ -3,8 +3,8 @@
 # [PERIODIC-UPDATE 2026-05-04]
 #
 # Provisions a Windows Scheduled Task that runs
-# scripts\agent-bridge-periodic-update.ps1 every 10 minutes (and at user
-# logon). This is the harness-INDEPENDENT half of auto-update: it fires
+# scripts\agent-bridge-periodic-update.ps1 daily, without a user-logon
+# run. This is the harness-INDEPENDENT half of auto-update: it fires
 # whether or not Claude Code / OpenClaw is running.
 #
 # Idempotent: re-running unregisters any prior task with the same name,
@@ -91,11 +91,9 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($psArgs -
 
 # ---------- Triggers --------------------------------------------------------
 
-# 10-min repeating trigger that fires immediately on registration AND repeats
-# indefinitely. Plus a logon trigger so the task fires at user login too.
+# Start tomorrow and repeat daily; installation/login must not add extra runs.
 $now = Get-Date
-$triggerPeriodic = New-ScheduledTaskTrigger -Once -At $now -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration ([TimeSpan]::FromDays(36500))
-$triggerLogon    = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$triggerPeriodic = New-ScheduledTaskTrigger -Daily -At $now.AddDays(1)
 
 # ---------- Settings + principal -------------------------------------------
 
@@ -117,13 +115,13 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger @($triggerPeriodic, $triggerLogon) `
+    -Trigger $triggerPeriodic `
     -Settings $settings `
     -Principal $principal `
-    -Description 'agent-bridge harness-independent periodic auto-updater (10min)' | Out-Null
+    -Description 'agent-bridge harness-independent daily auto-updater' | Out-Null
 
 Write-Host "[ok] Scheduled Task installed: $TaskName" -ForegroundColor Green
-Write-Host "     Interval:    10 min (also fires at logon)"
+Write-Host "     Interval:    daily (no logon run)"
 Write-Host "     Body script: $BodyScript"
 Write-Host "     Log file:    $(Join-Path $LogDir 'periodic-update.log')"
 if ($WithOpenclawMcpRepair) {

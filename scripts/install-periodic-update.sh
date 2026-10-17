@@ -4,7 +4,7 @@
 # [PERIODIC-UPDATE 2026-05-04]
 #
 # Provisions a launchd LaunchAgent that runs scripts/agent-bridge-periodic-update.sh
-# every 10 minutes (and at user login). This is the harness-INDEPENDENT half of
+# once every 24 hours, not at user login. This is the harness-INDEPENDENT half of
 # auto-update: it fires whether or not Claude Code / OpenClaw is running.
 #
 # Idempotent: re-running tears down any prior agent under the same Label,
@@ -176,10 +176,7 @@ ${BODY_ARGS_XML}
   </array>
 
   <key>StartInterval</key>
-  <integer>600</integer>
-
-  <key>RunAtLoad</key>
-  <true/>
+  <integer>86400</integer>
 
   <key>StandardOutPath</key>
   <string>${LOG_FILE}</string>
@@ -229,7 +226,7 @@ fi
 if launchctl bootstrap "${DOMAIN}" "$PLIST_PATH"; then
   echo "[ok] LaunchAgent installed: $PLIST_PATH"
   echo "     Label:       $LABEL"
-  echo "     Interval:    600s (also fires at login)"
+  echo "     Interval:    86400s (daily; no login run)"
   echo "     Body script: $BODY_SCRIPT"
   echo "     Log file:    $LOG_FILE"
   if [[ "$WITH_OPENCLAW_MCP_REPAIR" == "1" ]]; then

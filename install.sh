@@ -364,7 +364,7 @@ else
   fi
 
   if [ -n "$PROVISIONER" ]; then
-    printf "${DIM}  Installing periodic-update LaunchAgent (10 min interval)...${RESET}\n"
+    printf "${DIM}  Installing periodic-update LaunchAgent (daily)...${RESET}\n"
     if /bin/bash "$PROVISIONER"; then
       :
     else

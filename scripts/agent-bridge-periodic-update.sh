@@ -4,7 +4,7 @@
 # [PERIODIC-UPDATE 2026-05-04]
 #
 # Harness-INDEPENDENT periodic auto-updater for an agent-bridge dev clone.
-# Runs every 10 minutes via a launchd LaunchAgent (macOS) — see
+# Runs daily via a launchd LaunchAgent (macOS) — see
 # scripts/install-periodic-update.sh.
 #
 # This is the COMPLEMENT to the in-process 3-hour probe in mcp-server
@@ -46,7 +46,7 @@
 #   ~/.agent-bridge/logs/periodic-update.log               (human readable)
 #   ~/.claude/logs/skills.log                              (NDJSON, optional)
 #
-# Lock prevents concurrent runs (LaunchAgent fires every 10m, while a build
+# Lock prevents concurrent runs (including manual runs while a daily build
 # may still be in progress).
 
 set -uo pipefail
