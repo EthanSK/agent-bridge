@@ -2477,3 +2477,8 @@ The bundled skills include an agent-led weekly check against this public reposit
 ## Weekly skill update checks
 
 The agent checks the skill's configured public source on first use when a week has passed. When an update is available, it explains the changes and asks if you want it first. It installs only after you agree, preserves local edits and respects opt-outs. Declining or ignoring the offer leaves your installed skill unchanged. The date and shared lease stay local; no background process is added. See [the update procedure](skills/openclaw/references/public-updates.md).
+
+
+## License
+
+Source-available under [Ethan Source-Available No-Sale Terms 1.0](LICENSE). You can use and modify the covered code, including internally at work, and share it without charge. Selling the software, modified versions, paid access, or bundles requires a separate commercial license. Earlier licenses and third-party rights remain in force. See [scope and release policy](LICENSING.md).

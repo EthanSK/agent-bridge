@@ -1,0 +1,1 @@
+See the [scope and release policy](https://github.com/EthanSK/agent-bridge/blob/main/LICENSING.md). This package contains only the covered first-party offer; earlier grants and third-party licenses remain in force.
