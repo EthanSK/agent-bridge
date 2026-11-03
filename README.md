@@ -2482,3 +2482,14 @@ The agent checks the skill's configured public source on first use when a week h
 ## License
 
 Source-available under [Ethan Source-Available No-Sale Terms 1.0](LICENSE). You can use and modify the covered code, including internally at work, and share it without charge. Selling the software, modified versions, paid access, or bundles requires a separate commercial license. Earlier licenses and third-party rights remain in force. See [scope and release policy](LICENSING.md).
+
+## The Fleet: shared workers
+
+[The Fleet](https://github.com/EthanSK/the-fleet) is an optional companion for
+sharing worker computers across apps and agents. It reuses Agent Bridge's
+pairings; one local coordinator reports load, reserves capacity and runs finite
+commands with verified returned files. Saved project profiles are optional.
+
+After installing The Fleet, use `agent-bridge fleet state --fresh` or the
+`bridge_fleet_state` and `bridge_fleet` MCP tools. All entry points use the same
+service. See [the extension setup](extensions/the-fleet/README.md).

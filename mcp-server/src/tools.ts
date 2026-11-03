@@ -15,6 +15,7 @@
  */
 
 import { z } from 'zod';
+import { registerFleetTools } from './fleet.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   loadConfig,
@@ -117,6 +118,7 @@ export function resolveDefaultFromTarget(env: NodeJS.ProcessEnv = process.env): 
  * Register all agent-bridge tools on the MCP server.
  */
 export function registerTools(server: McpServer): void {
+  registerFleetTools(server);
   // -- bridge_list_machines --------------------------------------------------
   server.registerTool(
     'bridge_list_machines',
