@@ -3391,6 +3391,7 @@ cmd_help() {
   printf '  pair               Pair with another machine (interactive or flags)\n'
   printf '  config <machine>   View or update machine config (--internet-host, --internet-port)\n'
   printf '  chime ...          Fleet-aware completion chimes and hook helpers\n'
+  printf '  fleet <command>    The Fleet: shared workers, jobs and reservations\n'
   printf '  codex <sub>        First-class Codex: bind tasks to codex/<alias> targets, push delivery, doctor (bind|list|status|send|service|...)\n'
   printf '  notify <machine>   Pop a native macOS notification on a Mac (local or remote); --local renders here\n'
   printf '  learnings <sub>    SHARED CONTEXT: fleet-wide learnings store (add|search|list|show|sync|remove|ingest)\n'
@@ -3442,6 +3443,7 @@ main() {
 
   case "$cmd" in
     setup)    cmd_setup "$@" ;;
+    fleet)    exec "${THE_FLEET_BIN:-the-fleet}" "$@" ;;
     pair)     cmd_pair "$@" ;;
     config)   cmd_config "$@" ;;
     chime)    cmd_chime "$@" ;;
