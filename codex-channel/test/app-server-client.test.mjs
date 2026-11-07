@@ -1,4 +1,9 @@
+// Exercise the wire client's framing, lifecycle, and bounded memory guard.
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { EventEmitter } from "node:events";
 import {
@@ -388,6 +393,47 @@ test("oversized newline-terminated frame closes the connection before parsing", 
   assert.ok(fake.child.exitCode !== null || fake.child.signalCode !== null,
     "oversized complete frame tears down the child");
   await client.close();
+});
+
+test("service-scoped frame settings survive restarts and reject unsafe limits", () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-frame-limit-"));
+  mkdirSync(join(root, ".agent-bridge/codex"), { recursive: true });
+  const clientUrl = new URL("../src/app-server-client.js", import.meta.url).href;
+  const fakeUrl = new URL("./fake-app-server.mjs", import.meta.url).href;
+  const script = `
+    import { CodexAppServerClient } from ${JSON.stringify(clientUrl)};
+    import { createFakeAppServer } from ${JSON.stringify(fakeUrl)};
+    const fake = createFakeAppServer({ autoRespond: false });
+    const client = new CodexAppServerClient(fake.child, { logEvent: () => {} });
+    let received = false;
+    client.onNotification(n => { if (n.method === 'large/history') received = true; });
+    fake.writeRaw(JSON.stringify({ method: 'large/history', params: { text: 'x'.repeat(1_100_000) } }) + '\\n');
+    await new Promise(resolve => setImmediate(resolve));
+    process.stdout.write(JSON.stringify({ received, closed: client.closed }));
+    await client.close();
+  `;
+  try {
+    for (const [setting, saved, accepted] of [
+      ["2000000", null, true], ["67108865", null, false],
+      ["2000000junk", null, false], ["999999", null, false],
+      [null, 2000000, true], [null, 67108865, false],
+      ["999999", 2000000, false],
+    ]) {
+      writeFileSync(join(root, ".agent-bridge/codex/runtime.json"), JSON.stringify({ maxFrameBytes: saved }));
+      const env = { ...process.env, AGENT_BRIDGE_HOME: root };
+      if (setting === null) delete env.AGENT_BRIDGE_CODEX_LINE_BUFFER_MAX_BYTES;
+      else env.AGENT_BRIDGE_CODEX_LINE_BUFFER_MAX_BYTES = setting;
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+        encoding: "utf8",
+        env,
+        timeout: 5000,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), { received: accepted, closed: !accepted }, setting);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("notification handlers receive notifications and can unsubscribe", async () => {

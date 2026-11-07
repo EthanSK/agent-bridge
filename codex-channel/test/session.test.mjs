@@ -1,3 +1,4 @@
+// Exercise exact-thread resume, message delivery and ownership protection.
 import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
@@ -62,9 +63,9 @@ test("resume subscribes the exact thread, captures original settings, and releas
   assert.equal(session.subscribed, true);
   const resumeReq = fake.requestsFor("thread/resume")[0];
   assert.equal(resumeReq.params.threadId, THREAD);
-  // Exact 0.145 shape: recent full page requested so in-progress turns can
+  // Exact 0.145 shape: recent summary page requested so in-progress turns can
   // be hydrated before declaring idle.
-  assert.deepEqual(resumeReq.params.initialTurnsPage, { limit: 20, sortDirection: "desc", itemsView: "full" });
+  assert.deepEqual(resumeReq.params.initialTurnsPage, { limit: 20, sortDirection: "desc", itemsView: "summary" });
   assert.equal(session.turnActive, false, "idle thread resumes idle");
   // Original settings captured from the resume response for later restore.
   assert.equal(session.originalSettings.cwd, "/original/cwd");
@@ -813,6 +814,32 @@ test("resume hydrates an inProgress turn from PAGINATED initialTurnsPage.data", 
   await session.resume();
   assert.equal(session.activeTurnId, "turn-paged");
   assert.equal(session.activeTurnOurs, false);
+  await client.close();
+});
+
+test("large history resumes as summaries while preserving foreign active-turn ownership", async () => {
+  const largeToolOutput = "x".repeat(1_100_000);
+  const { fake, client, session } = await makeSession({
+    resumeResult: (params) => ({
+      thread: { id: THREAD, status: { type: "active" } },
+      initialTurnsPage: {
+        data: [{
+          id: "turn-large-history",
+          status: "inProgress",
+          items: params.initialTurnsPage.itemsView === "full"
+            ? [{ type: "commandExecution", aggregatedOutput: largeToolOutput }]
+            : [],
+        }],
+        nextCursor: null,
+      },
+    }),
+  });
+  await session.resume();
+  assert.equal(session.subscribed, true);
+  assert.equal(session.activeTurnId, "turn-large-history");
+  assert.equal(session.activeTurnOurs, false);
+  assert.equal(fake.requestsFor("turn/start").length, 0);
+  assert.equal(fake.requestsFor("turn/steer").length, 0);
   await client.close();
 });
 

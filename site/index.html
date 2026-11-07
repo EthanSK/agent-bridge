@@ -53,7 +53,7 @@
           </span>
           <span class="logo-copy">
             <span class="logo-title">
-              agent-bridge <span class="logo-version">v4.10.0</span>
+              agent-bridge <span class="logo-version">v4.10.1</span>
             </span>
             <span class="logo-sub">channel-mode · peer-to-peer · SSH</span>
           </span>
@@ -70,7 +70,7 @@
       <header class="hero wrap">
         <div class="hero-meta reveal reveal-1">
           <span><span class="dot" aria-hidden="true"></span> channel open</span>
-          <span class="ver">v4.10.0</span>
+          <span class="ver">v4.10.1</span>
           <span>AI agent harnesses</span>
           <span>tested end-to-end</span>
         </div>
@@ -221,7 +221,7 @@
         </p>
         <div class="callout callout--warn">
           <strong>Install from GitHub, not npm.</strong>
-          The current release ships through this repository, its one-line installers, the Claude Code local marketplace, and the repo-loaded OpenClaw plugin. The npm package named <code>agent-bridge-mcp-server</code> is a legacy 0.1.x artifact; the 4.10.0 channel packages are repository packaging units, not npm-registry products.
+          The current release ships through this repository, its one-line installers, the Claude Code local marketplace, and the repo-loaded OpenClaw plugin. The npm package named <code>agent-bridge-mcp-server</code> is a legacy 0.1.x artifact; the 4.10.1 channel packages are repository packaging units, not npm-registry products.
         </div>
 
         <div class="install-panel install-panel--featured">
@@ -594,6 +594,12 @@
         <h2 class="section-title">What&rsquo;s <span class="accent">new.</span></h2>
         <ul class="changelog-list">
           <li class="cl-item">
+            <div class="cl-version">4.10.1</div>
+            <div class="cl-body">
+              <strong>Large saved Codex chats resume reliably.</strong> Request turn summaries rather than full message/tool bodies while retaining active-turn ownership checks. Keep the default frame limit, with a bounded per-machine recovery setting when summaries still exceed it.
+            </div>
+          </li>
+          <li class="cl-item">
             <div class="cl-version">4.10.0</div>
             <div class="cl-body">
               <strong>First-class Codex endpoints.</strong> Bind the current task with one command; Agent Bridge derives a stable alias, queues safely while busy, resumes the exact persisted thread through the public App Server, and preserves at-most-once delivery with durable recovery. A real Codex &rarr; Claude Code &rarr; OpenClaw &rarr; OpenClaw &rarr; Codex chain passed across two Macs.
@@ -667,7 +673,7 @@
             <circle cx="25" cy="16" r="3.5" fill="#4dd0e1"/>
             <path d="M11 16 L21 16" stroke="#ff7a1a" stroke-width="1.3" stroke-dasharray="2 2"/>
           </svg>
-          <span>agent-bridge / v4.10.0</span>
+          <span>agent-bridge / v4.10.1</span>
         </div>
         <div class="footer-links">
           <a href="https://ethansk.github.io/ethan-setup/">Ethan’s setup</a>

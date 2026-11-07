@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-11-07T00:29:04Z
+**Trigger:** Approved M1 saved-history repair
+**Symptom:** Long-lived bound Codex tasks failed during thread/resume with stdout line exceeded 1000000 bytes.
+**Root cause:** Full turn hydration included large message/tool bodies; even summaries can exceed the normal frame bound for a sufficiently long-lived task.
+**Fix:** Request summary turn history while preserving active-turn ownership checks. Keep the 1,000,000-byte default; permit a bounded per-machine codex/runtime.json or service-environment override up to 64 MiB, outside the source checkout.
+**Commit:** 8b4bf1c570fd3d9d4dfc0dcc52b722a0d73c8388
+**Guard:** Fresh-process frame-limit tests cover persistence, bounds and environment precedence; large-history regression checks foreign active-turn ownership. Same-task live receipt passed before and after a normal service restart. Reply tools remain a separate concern.
+---
+
+---
 **Date:** 2026-10-17
 **Trigger:** Ethan requested daily background update checks rather than every ten minutes.
 **Symptom:** The installed periodic updater pointed at a linked worktree, not the main checkout; changing only the main installer would leave that runtime and future reinstallations stale.

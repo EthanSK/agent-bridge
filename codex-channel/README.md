@@ -250,6 +250,23 @@ bridge_send_message  ──SSH/SFTP──▶ ~/.agent-bridge/inbox/codex/<alias>
   handlers answer them (declines, never grants). Disable the guard per
   binding with `--no-ownership-guard` (not recommended).
 
+## Large saved histories
+
+Resume requests fetch turn summaries instead of full message/tool bodies, while
+retaining active-turn ownership checks. The default wire-frame limit remains
+1,000,000 bytes. If a saved thread still exceeds that limit, set a private
+per-machine limit in `~/.agent-bridge/codex/runtime.json`, then restart the
+message service with its supported `service stop` and `service ensure` commands:
+
+```json
+{ "maxFrameBytes": 16777216 }
+```
+
+`AGENT_BRIDGE_CODEX_LINE_BUFFER_MAX_BYTES` overrides the file for a single service
+environment. Values must be integer byte counts from 1,000,000 through
+67,108,864; invalid values fall back to the default. Keep the smallest adequate
+limit. The file changes no binding, sandbox, approval or message-expiry policy.
+
 ## Known limitations (honest list)
 
 - **A live interactive session does not render pushed turns mid-scroll.** If

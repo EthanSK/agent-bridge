@@ -296,10 +296,11 @@ export class ThreadSession {
     try {
       response = await this.client.request("thread/resume", {
         threadId: this.threadId,
-        // Codex 0.145 rejoins RUNNING threads: request a recent full page so
-        // an in-progress turn can be hydrated before we declare the thread
-        // idle (legacy `thread.turns` is still read as well).
-        initialTurnsPage: { limit: 20, sortDirection: "desc", itemsView: "full" },
+        // Resume needs turn ids and status, not full messages or tool output.
+        // Large histories otherwise exceed the transport's bounded frame size
+        // before we can discover an active turn. Summary view preserves that
+        // ownership check without loading unrelated private conversation text.
+        initialTurnsPage: { limit: 20, sortDirection: "desc", itemsView: "summary" },
       }, { timeoutMs, dispatchFence: this.dispatchFence });
       resumeRpcCompleted = true;
       returned = readThreadIdFromResponse(response);

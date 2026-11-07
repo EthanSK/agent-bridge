@@ -29,9 +29,11 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { buildElicitationDecline, buildEmptyUserInputAnswers, buildLegacyApprovalDecline } from "./session.js";
+import { codexStateDir } from "./paths.js";
 
 /**
  * 0.145.0 is the only validated floor: the channel's correctness depends on
@@ -44,7 +46,23 @@ import { buildElicitationDecline, buildEmptyUserInputAnswers, buildLegacyApprova
  * degraded unsafely.
  */
 export const MIN_CODEX_VERSION = "0.145.0";
-const LINE_BUFFER_MAX = 1_000_000; // 1 MB maximum per newline-delimited frame
+const DEFAULT_LINE_BUFFER_MAX = 1_000_000;
+const ABSOLUTE_LINE_BUFFER_MAX = 64 * 1024 * 1024;
+// The private runtime setting survives normal service restarts. It belongs
+// outside the source checkout so updates do not erase an operator's limit.
+let savedLineBufferMax;
+try {
+  savedLineBufferMax = JSON.parse(readFileSync(join(codexStateDir(), "runtime.json"), "utf8"))?.maxFrameBytes;
+} catch { /* absent or malformed configuration keeps the normal limit */ }
+const configuredLineBufferMax = Number(process.env.AGENT_BRIDGE_CODEX_LINE_BUFFER_MAX_BYTES ?? savedLineBufferMax);
+// Long-lived threads can exceed 1 MB even in summary view. Keep the normal
+// limit and permit a bounded, service-scoped recovery setting; never disable
+// the memory guard or accept malformed/oversized configuration values.
+const LINE_BUFFER_MAX = Number.isSafeInteger(configuredLineBufferMax)
+  && configuredLineBufferMax >= DEFAULT_LINE_BUFFER_MAX
+  && configuredLineBufferMax <= ABSOLUTE_LINE_BUFFER_MAX
+  ? configuredLineBufferMax
+  : DEFAULT_LINE_BUFFER_MAX;
 const STDERR_TAIL_MAX = 2000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 /** Hard ceiling on any single RPC wait — guarantees every request settles. */
