@@ -6,4 +6,4 @@
  * openclaw-channel/test/version-parity.test.js and
  * codex-channel/test/version-parity.test.mjs.
  */
-export const CHANNEL_VERSION = "4.10.0";
+export const CHANNEL_VERSION = "4.10.1";

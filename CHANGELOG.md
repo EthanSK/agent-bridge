@@ -1,5 +1,12 @@
 # Changelog
 
+## agent-bridge 4.10.1 — 2026-11-07
+
+- **Large saved Codex chats resume reliably.** Request turn summaries rather than full message/tool bodies while retaining active-turn ownership checks.
+- **Bounded recovery setting.** Keep the default 1,000,000-byte frame limit; allow an explicit per-machine `codex/runtime.json` setting or service environment override up to 64 MiB when summaries still exceed the default. Invalid limits keep the default. See `codex-channel/README.md`.
+- **Protected behavior.** No change to sandbox, approvals, ownership, expiry, deduplication or reply routing. The separate missing-reply/fallback issue is not fixed by this release.
+- **Distribution.** Existing GitHub source archives and repository installers; no npm release or new binary channel. Includes the current root LICENSE, LICENSING.md, historical license notices and existing third-party/vendor terms.
+
 ## agent-bridge 4.10.0 — 2026-08-09
 
 - **Codex CLI Node resolution in non-login contexts.** `agent-bridge codex …`

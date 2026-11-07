@@ -1,6 +1,6 @@
 {
   "name": "@agent-bridge/codex-channel",
-  "version": "4.10.0",
+  "version": "4.10.1",
   "description": "First-class Codex channel for agent-bridge: automatically bind existing Codex tasks to stable title-derived codex/<alias> targets and push inbound BridgeMessages into the exact persisted thread via the Codex App Server (thread/resume + turn/start), with queue-while-active, crash-safe delivery state, and safe approval defaults.",
   "type": "module",
   "main": "./src/service.js",
