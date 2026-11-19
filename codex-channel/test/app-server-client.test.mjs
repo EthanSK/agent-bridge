@@ -114,6 +114,50 @@ test("malformed frames are counted, not fatal", async () => {
   await client.close();
 });
 
+test("large fragmented frames use a linear byte budget and reset for the next frame", async () => {
+  const { fake, client } = makeClient({ autoRespond: false }, { lineBufferMax: 9 * 1024 * 1024 });
+  const seen = [];
+  client.onNotification((frame) => seen.push(frame));
+  const frame = Buffer.from(`${JSON.stringify({ method: "large/frame", params: { blob: "x".repeat(8 * 1024 * 1024), marker: "🛰" } })}\r\n`);
+  const byteLength = Buffer.byteLength;
+  let measuredCharacters = 0;
+  Buffer.byteLength = (value, ...args) => {
+    measuredCharacters += value.length;
+    return byteLength(value, ...args);
+  };
+  try {
+    for (let start = 0; start < frame.length; start += 16 * 1024) {
+      fake.writeRaw(frame.subarray(start, start + 16 * 1024));
+    }
+    fake.writeRaw('{"method":"next/frame","params":{}}\n');
+    assert.ok(measuredCharacters <= frame.length * 4,
+      `framing repeatedly rescanned a large history: measured ${measuredCharacters} for ${frame.length} bytes`);
+    await tickAsync();
+    assert.deepEqual(seen.map((item) => item.method), ["large/frame", "next/frame"]);
+    assert.equal(seen[0].params.marker, "🛰");
+    assert.equal(seen[0].params.blob.length, 8 * 1024 * 1024);
+  } finally {
+    Buffer.byteLength = byteLength;
+    await client.close();
+  }
+});
+
+test("fragmented UTF-8 byte cap is cumulative and permits an exact-sized frame", async () => {
+  const valid = Buffer.from('{"method":"x","params":{"text":"🛰"}}', "utf8");
+  const { fake, client } = makeClient({ autoRespond: false }, { lineBufferMax: valid.length });
+  const seen = [];
+  client.onNotification((frame) => seen.push(frame));
+  for (const byte of valid) fake.writeRaw(Buffer.from([byte]));
+  fake.writeRaw("\n");
+  assert.equal(client.closed, false);
+  assert.equal(seen[0].params.text, "🛰");
+  fake.writeRaw(valid);
+  fake.writeRaw("x\n");
+  assert.equal(client.closed, true, "one additional byte must exceed the accumulated cap");
+  assert.equal(seen.length, 1, "oversized second frame is never parsed");
+  await client.close();
+});
+
 test("request timeout rejects and does not leak the pending entry", async () => {
   const { client } = makeClient({ autoRespond: false });
   await assert.rejects(
@@ -353,6 +397,39 @@ test("Unix teardown verifies the owned process group even when its wrapper exite
   assert.equal(groupAlive, false);
 });
 
+test("Unix teardown rejection is re-probed and resolves once the exact owned group is absent", async () => {
+  let groupState = "unpermitted";
+  const signals = [];
+  let fake;
+  const processKill = (pid, signal) => {
+    signals.push({ pid, signal, groupState });
+    assert.equal(pid, -fake.child.pid);
+    const error = new Error(groupState === "unpermitted" ? "not permitted" : "no such process group");
+    error.code = groupState === "unpermitted" ? "EPERM" : "ESRCH";
+    throw error;
+  };
+  fake = createFakeAppServer();
+  const client = new CodexAppServerClient(fake.child, {
+    logEvent: noopLog,
+    clientName: "test-client",
+    clientVersion: "0.0.1",
+    platform: "darwin",
+    ownsProcessGroup: true,
+    processKill,
+  });
+  await client.initialize();
+  await assert.rejects(() => client.close(), /process-group SIGTERM failed.*not permitted/i);
+
+  groupState = "absent";
+  await client.close();
+  assert.equal(
+    signals.filter((entry) => entry.signal === "SIGTERM").length,
+    1,
+    "the second close must not signal a group ID whose ownership is uncertain",
+  );
+  assert.equal(signals.at(-1).signal, 0, "the retry checks group existence without sending a signal");
+});
+
 test("Windows teardown never trusts a pre-exited wrapper without exact tree cleanup", async () => {
   const taskkillCalls = [];
   const spawnProcess = (command, args, options) => {
@@ -370,7 +447,7 @@ test("Windows teardown never trusts a pre-exited wrapper without exact tree clea
 });
 
 test("oversized un-terminated line closes the connection instead of buffering forever", async () => {
-  const { fake, client } = makeClient({ autoRespond: false });
+  const { fake, client } = makeClient({ autoRespond: false }, { lineBufferMax: 1_000_000 });
   const closed = new Promise((resolve) => client.onClose(resolve));
   fake.writeRaw("x".repeat(1_100_000)); // > 1MB, no newline
   const err = await closed;
@@ -381,7 +458,7 @@ test("oversized un-terminated line closes the connection instead of buffering fo
 });
 
 test("oversized newline-terminated frame closes the connection before parsing", async () => {
-  const { fake, client } = makeClient({ autoRespond: false });
+  const { fake, client } = makeClient({ autoRespond: false }, { lineBufferMax: 1_000_000 });
   const closed = new Promise((resolve) => client.onClose(resolve));
   const frame = Buffer.from(`${JSON.stringify({ method: "oversized/frame", params: { blob: "x".repeat(1_000_000) } })}\n`);
   assert.ok(frame.length > 1_000_000, "fixture must exceed the framing limit");

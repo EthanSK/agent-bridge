@@ -171,6 +171,22 @@ bridge_send_message  ──SSH/SFTP──▶ ~/.agent-bridge/inbox/codex/<alias>
 - **Retries**: 3 backoff delays (5 s, 30 s, 120 s — each genuinely
   reachable), then dead-letter on the 4th failure to
   `inbox/.failed/.exhausted/` with a `codex.delivery_exhausted` event.
+- **Session-open backoff** is separate from delivery retries. A failed
+  `thread/resume` keeps its 20-second RPC timeout and leaves messages staged
+  without consuming their send attempts. Repeated failures wait 30 seconds,
+  2 minutes, 10 minutes, then a 30-minute cooldown between probes. Unsupported
+  versions, missing threads and incompatible stored-history formats get
+  hourly probes immediately. The budget is durably saved under
+  `codex/resume-retry/<alias>.json` and exposed by `status --json`, so restarting
+  the daemon does not restart a hot loop. A successful open clears it;
+  rebind/enable or restarting after the selected Codex executable changes
+  starts a fresh budget. Pending settings recovery uses the same protection;
+  foreign active sessions still defer without consuming failure attempts.
+  If its retry record cannot be read, the daemon checks again on its normal
+  retry cadence. A resolved settings journal does not reset history backoff.
+- **Large histories**: resume asks for the newest turn's metadata. Fragmented
+  stdout is counted incrementally within the existing frame limit. Queues waiting
+  for retry do not keep an idle App Server alive past its normal idle-close window.
 - **Terminal turn outcomes** are recorded: `turn/completed` success logs
   `codex.turn_completed`; a failed/cancelled bridge turn logs
   `codex.turn_failed_terminal` (with the originating message id) and shows
@@ -320,7 +336,12 @@ limit. The file changes no binding, sandbox, approval or message-expiry policy.
   App Server loss and normal close verify the exact owned process tree (Unix
   process group; Windows `/PID ... /T`) before replacement; an unverified
   teardown leaves a durable poison fence rather than spawning beside a
-  possible orphan.
+  possible orphan. The fence remains fail-closed while that exact Unix group
+  exists or cannot be signalled (`EPERM`). If a later liveness probe proves
+  the recorded group is absent (`ESRCH`), the daemon durably resolves the
+  poison, retires the retained closed client, and resumes queued aliases; an
+  operator does not need to keep moving a poison file that can otherwise be
+  recreated by the same stale in-memory client.
 - **Registry**: `~/.agent-bridge/codex/bindings.json` mutations run under an
   interprocess lock (parallel binds never lose records); saves are atomic +
   durable; an existing-but-unreadable registry fails mutations closed and
@@ -358,6 +379,14 @@ limit. The file changes no binding, sandbox, approval or message-expiry policy.
   `codex.appserver_*`, `codex.service_*`, `codex.lease_*`.
 - **Recovery**:
   - Daemon stuck/stale → `agent-bridge codex service stop && agent-bridge codex service ensure`.
+  - `service: BLOCKED` by `codex-channel.teardown-poison.json` → run
+    `agent-bridge codex status` or `doctor`. Recovery is automatic only after
+    the exact recorded Unix process group is conclusively absent. An existing
+    group, `EPERM`, an unreadable record, or Windows wrapper-tree uncertainty
+    remains blocked: verify or reboot rather than deleting the fence blindly.
+    Valid queued envelopes stay staged and deduplicated throughout recovery.
+    Older versions may still treat a resolved record as active after rollback.
+    Verify the old process group is gone before clearing that record.
   - Dead letters → inspect `inbox/.failed/.exhausted/`, re-send from the
     origin after fixing the cause. For an indeterminate/possibly-sent reason,
     first verify that no turn landed, then send a deliberate NEW message id;
@@ -379,7 +408,9 @@ limit. The file changes no binding, sandbox, approval or message-expiry policy.
 
 Zero-dependency `node:test` suites with a scriptable fake App Server
 (`test/fake-app-server.mjs`) covering protocol negotiation and unsupported
-versions, framing/fragmentation/malformed frames, exact-thread resume,
+versions, framing/fragmentation/malformed frames, metadata-only page hints plus
+large legacy resume frames, durable teardown-poison recovery after exact
+process-group absence, exact-thread resume,
 idle delivery, active-turn queueing, steering timeout/fallback,
 approval/user-input handling, claims/ledger/replay/dedupe/quarantine,
 TTL while queued, immutable delivered/indeterminate tombstones, lease

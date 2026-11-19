@@ -37,10 +37,11 @@ import { codexStateDir } from "./paths.js";
 
 /**
  * 0.145.0 is the only validated floor: the channel's correctness depends on
- * 0.145 surfaces (initialTurnsPage resume hydration and
- * clientUserMessageId echoed as userMessage.clientId). The generated 0.145
- * schema also exposes thread/items/list pagination, although an installed
- * 0.145 runtime may return -32601; the session layer therefore keeps an
+ * clientUserMessageId being echoed as userMessage.clientId. Generated 0.145
+ * schemas differ across installed builds: newer variants expose
+ * initialTurnsPage and thread/items/list pagination, while the live legacy
+ * build returns all thread.turns and may answer items/list with -32601. The
+ * session layer therefore accepts both resume shapes and keeps an
  * exact-hit-only thread/read fallback. No equally safe older path is
  * implemented, so older builds are rejected at initialize rather than
  * degraded unsafely.
@@ -246,6 +247,7 @@ export class CodexAppServerClient {
     ownsProcessGroup = false,
     killGraceMs = KILL_GRACE_MS,
     reapGraceMs = 200,
+    lineBufferMax = LINE_BUFFER_MAX,
   } = {}) {
     this.child = child;
     this.logEvent = logEvent;
@@ -257,6 +259,7 @@ export class CodexAppServerClient {
     this.ownsProcessGroup = ownsProcessGroup;
     this.killGraceMs = killGraceMs;
     this.reapGraceMs = reapGraceMs;
+    this.lineBufferMax = lineBufferMax;
     this.pending = new Map();
     this.nextId = 1;
     this.closed = false;
@@ -276,7 +279,8 @@ export class CodexAppServerClient {
     this.closeHandlers = new Set();
     this.parseFailures = 0;
     this.stderrTail = "";
-    this._lineBuffer = "";
+    this._lineChunks = [];
+    this._lineBytes = 0;
     this._stdoutDecoder = new StringDecoder("utf8");
     this._stdoutDecoderFinished = false;
     this._teardownPromise = null;
@@ -384,23 +388,28 @@ export class CodexAppServerClient {
 
   _consumeStdoutText(text) {
     if (this.closed || !text) return;
-    this._lineBuffer += text;
-    let idx;
-    while ((idx = this._lineBuffer.indexOf("\n")) >= 0) {
-      const rawLine = this._lineBuffer.slice(0, idx);
-      this._lineBuffer = this._lineBuffer.slice(idx + 1);
-      if (Buffer.byteLength(rawLine, "utf8") > LINE_BUFFER_MAX) {
-        this._lineBuffer = "";
-        this._closeUnexpected(new CodexConnectionClosedError(`stdout line exceeded ${LINE_BUFFER_MAX} bytes`));
+    // Scan/count each decoded chunk once; joining or measuring the entire
+    // incomplete line on every read is quadratic for large legacy histories.
+    let start = 0;
+    while (start < text.length) {
+      const newline = text.indexOf("\n", start);
+      const fragment = text.slice(start, newline < 0 ? text.length : newline);
+      this._lineBytes += Buffer.byteLength(fragment, "utf8");
+      if (this._lineBytes > this.lineBufferMax) {
+        this._lineChunks = [];
+        this._lineBytes = 0;
+        this._closeUnexpected(new CodexConnectionClosedError(`stdout line exceeded ${this.lineBufferMax} bytes`));
         return;
       }
+      if (fragment) this._lineChunks.push(fragment);
+      if (newline < 0) return;
+      const rawLine = this._lineChunks.join("");
+      this._lineChunks = [];
+      this._lineBytes = 0;
       const line = rawLine.replace(/\r$/, "");
-      if (!line.trim()) continue;
-      this._handleLine(line);
-    }
-    if (Buffer.byteLength(this._lineBuffer, "utf8") > LINE_BUFFER_MAX) {
-      this._lineBuffer = "";
-      this._closeUnexpected(new CodexConnectionClosedError(`stdout line exceeded ${LINE_BUFFER_MAX} bytes`));
+      if (line.trim()) this._handleLine(line);
+      if (this.closed) return;
+      start = newline + 1;
     }
   }
 
@@ -619,6 +628,8 @@ export class CodexAppServerClient {
     if (this.closed) return;
     this.closed = true;
     this.closeError = error;
+    this._lineChunks = [];
+    this._lineBytes = 0;
     for (const entry of this.pending.values()) {
       try { entry.reject(error); } catch { /* ignore */ }
     }
@@ -646,11 +657,27 @@ export class CodexAppServerClient {
 
   /** Idempotent bounded child teardown shared by explicit and fatal close. */
   _terminateChild() {
-    if (this._teardownPromise) return this._teardownPromise;
     const child = this.child;
     const windowsTreeKill = this.platform === "win32" && Number.isInteger(child?.pid) && child.pid > 0;
     const unixGroupKill = this.platform !== "win32" && this.ownsProcessGroup
       && Number.isInteger(child?.pid) && child.pid > 0;
+    if (this._teardownPromise) {
+      const teardown = this._teardownPromise;
+      if (!unixGroupKill) return teardown;
+      return teardown.catch((error) => {
+        // A rejected teardown no longer proves that we own this group ID.
+        // Signal zero only checks existence. It cannot kill a reused group.
+        try {
+          this.processKill(-child.pid, 0);
+        } catch (probeError) {
+          if (probeError?.code === "ESRCH") {
+            if (this._teardownPromise === teardown) this._teardownPromise = Promise.resolve();
+            return;
+          }
+        }
+        throw error;
+      });
+    }
     // A wrapper's own exit is not proof that its inherited App Server tree is
     // gone. Unix can verify the owned process group; Windows must re-run the
     // exact /PID /T cleanup and fail closed if that ownership cannot be
@@ -659,7 +686,7 @@ export class CodexAppServerClient {
       this._teardownPromise = Promise.resolve();
       return this._teardownPromise;
     }
-    this._teardownPromise = new Promise((resolve, reject) => {
+    const teardownAttempt = new Promise((resolve, reject) => {
       let settled = false;
       let killTimer = null;
       let reapTimer = null;
@@ -804,7 +831,8 @@ export class CodexAppServerClient {
         if (child.exitCode !== null || child.signalCode) done();
       }
     });
-    return this._teardownPromise;
+    this._teardownPromise = teardownAttempt;
+    return teardownAttempt;
   }
 
   /**

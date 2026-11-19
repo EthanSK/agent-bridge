@@ -25,6 +25,7 @@ import {
   serviceTeardownPoisonPath,
 } from "./paths.js";
 import { CHANNEL_VERSION } from "./version.js";
+import { readResumeRetry } from "./resume-retry.js";
 
 function countJson(dir) {
   try {
@@ -44,6 +45,10 @@ export function buildStatusSnapshot({ env = process.env } = {}) {
 
   const aliases = bindings.map((binding) => {
     const rollout = findRolloutForThread(binding.threadId, { env });
+    let resumeRetry;
+    try { resumeRetry = readResumeRetry(binding.alias, env); } catch (err) {
+      resumeRetry = { unreadable: true, error: String(err?.message ?? err) };
+    }
     return {
       alias: binding.alias,
       target: `${CODEX_HARNESS_PREFIX}/${binding.alias}`,
@@ -56,6 +61,7 @@ export function buildStatusSnapshot({ env = process.env } = {}) {
       rolloutFound: Boolean(rollout),
       rolloutMtime: rollout ? new Date(rollout.mtimeMs).toISOString() : null,
       updatedAt: binding.updatedAt,
+      resumeRetry,
     };
   });
 
@@ -162,7 +168,7 @@ export function runDoctor({ env = process.env } = {}) {
     "appserver_teardown_fence",
     !snapshot.service.teardownPoisoned,
     snapshot.service.teardownPoisoned
-      ? `startup blocked at ${snapshot.service.teardownPoisonPath}; verify/reboot so the old App Server tree is gone, then remove this file explicitly`
+      ? `startup blocked at ${snapshot.service.teardownPoisonPath}; an owned Unix group recovers automatically only after ESRCH, otherwise verify/reboot before explicit recovery`
       : "no unverified prior App Server teardown",
   );
 

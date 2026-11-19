@@ -18,13 +18,15 @@ import {
   leaseFresh,
   makeLeaseDispatchFence,
   readLease,
+  readTeardownPoison,
   releaseLease,
   stopService,
   verifyLiveDaemon,
   waitForSpawnedDaemonReady,
 } from "../src/service.js";
-import { codexInboxDir, codexSessionsDir, pendingSettingsPath, serviceControlPath, serviceLeasePath, serviceTeardownPoisonPath, unroutedDir, inboxRoot } from "../src/paths.js";
+import { codexInboxDir, codexSessionsDir, pendingSettingsPath, resumeRetryPath, serviceControlPath, serviceLeasePath, serviceTeardownPoisonPath, unroutedDir, inboxRoot } from "../src/paths.js";
 import { CHANNEL_VERSION } from "../src/version.js";
+import { readResumeRetry } from "../src/resume-retry.js";
 import { createFakeAppServer, FAKE_USER_AGENT } from "./fake-app-server.mjs";
 
 const THREAD = "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0001";
@@ -164,6 +166,47 @@ test("lease: corrupt or unreadable retained state fails closed across acquire, e
   mkdirSync(serviceLeasePath(env));
   assert.equal(readLease(env).unreadable, true, "non-file lease is also fenced");
   assert.equal(acquireLease(env), null);
+});
+
+test("teardown poison: every read failure except ENOENT remains an unreadable active fence", async () => {
+  const env = makeEnv();
+  mkdirSync(dirname(serviceTeardownPoisonPath(env)), { recursive: true });
+  mkdirSync(serviceTeardownPoisonPath(env));
+  const poison = readTeardownPoison(env);
+  assert.equal(poison.unreadable, true);
+  let spawned = false;
+  const ensured = await ensureService({
+    env,
+    logEvent: noop,
+    spawnImpl: () => { spawned = true; throw new Error("must remain fenced"); },
+  });
+  assert.equal(ensured.teardownPoisoned, true);
+  assert.equal(spawned, false);
+  assert.equal((await stopService({ env, logEvent: noop })).reason, "teardown_poisoned");
+});
+
+test("stopService resolves an absent owned Unix process-group fence before evaluating the daemon lease", async () => {
+  const env = makeEnv();
+  mkdirSync(dirname(serviceTeardownPoisonPath(env)), { recursive: true });
+  writeFileSync(serviceTeardownPoisonPath(env), JSON.stringify({
+    version: 2,
+    state: "active",
+    path: serviceTeardownPoisonPath(env),
+    pid: 515151,
+    treeKind: "unix-process-group",
+    processGroupId: 515151,
+    context: "replace_closed_client",
+    error: "process-group SIGTERM failed: kill EPERM",
+  }));
+  const absentGroup = () => {
+    const error = new Error("kill ESRCH");
+    error.code = "ESRCH";
+    throw error;
+  };
+  const stopped = await stopService({ env, logEvent: noop, teardownProbeKill: absentGroup });
+  assert.equal(stopped.reason, "not_running");
+  assert.equal(readTeardownPoison(env), null);
+  assert.equal(JSON.parse(readFileSync(serviceTeardownPoisonPath(env), "utf8")).state, "resolved");
 });
 
 test("lease: dead holders are replaced, but a heartbeat-stale live PID still blocks split-brain takeover", () => {
@@ -850,6 +893,167 @@ test("unsupported Codex version is classified and blocks with a retry window", a
   await service.shutdown("test");
 });
 
+test("resume failures back off through a cooldown, survive restart, and preserve the staged message", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, env });
+  const msg = writeInbound(env, "review");
+  const fakes = [];
+  let clock = Date.now();
+  const options = { env, logEvent: noop, machineName: "MBP", now: () => clock,
+    clientFactory: fakeClientFactory(fakes, { resumeResult: () => { throw new Error("thread/resume timed out after 20000ms"); } }) };
+  const first = createService(options);
+  await first.tick();
+  assert.equal(readResumeRetry("review", env).delayMs, 30_000);
+  const resumes = () => fakes.reduce((sum, fake) => sum + fake.requestsFor("thread/resume").length, 0);
+  await first.tick();
+  assert.equal(resumes(), 1);
+  await first.shutdown("test-restart");
+  const restarted = createService(options);
+  await restarted.tick();
+  assert.equal(resumes(), 1, "restart cannot reset a failed history's retry budget");
+  for (const delay of [120_000, 600_000, 1_800_000, 1_800_000]) {
+    clock = readResumeRetry("review", env).retryAt;
+    await restarted.tick();
+    const record = readResumeRetry("review", env);
+    assert.equal(record.delayMs, delay);
+    clock = record.retryAt - 1;
+    const before = resumes();
+    await restarted.tick();
+    assert.equal(resumes(), before, "no resume during backoff or cooldown");
+  }
+  assert.equal(readResumeRetry("review", env).phase, "cooldown");
+  const alias = restarted.statusSnapshot().aliases[0];
+  assert.equal(alias.entries[0].id, msg.id);
+  assert.equal(alias.entries[0].attempts, 0, "session-open errors never consume delivery attempts");
+  assert.ok(fakes.every((fake) => fake.requestsFor("turn/start").length === 0));
+  await restarted.shutdown("test");
+});
+
+test("incompatible histories get sparse probes without blocking healthy aliases; a rebind resets the circuit", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "broken", threadId: THREAD, env });
+  bindAlias({ alias: "healthy", threadId: THREAD2, env });
+  writeInbound(env, "broken");
+  writeInbound(env, "healthy");
+  const fakes = [];
+  const factory = fakeClientFactory(fakes, { resumeResult: (params) => {
+    if (params.threadId === THREAD) throw new Error("unknown variant `functionCallOutput`");
+    return { thread: { id: params.threadId }, cwd: realpathSync(process.cwd()), approvalPolicy: "on-request", sandbox: { type: "readOnly" } };
+  } });
+  const service = createService({ env, logEvent: noop, machineName: "MBP", clientFactory: factory });
+  await service.tick();
+  assert.equal(readResumeRetry("broken", env).delayMs, 3_600_000);
+  assert.equal(service.statusSnapshot().aliases.find((alias) => alias.alias === "healthy").queued, 0);
+  assert.equal(fakes.reduce((sum, fake) => sum + fake.requestsFor("turn/start").length, 0), 1);
+  bindAlias({ alias: "broken", threadId: "0199aaaa-bbbb-4ccc-8ddd-eeeeffff0003", rebind: true, env });
+  await service.tick();
+  assert.equal(readResumeRetry("broken", env), null, "successful rebind clears the retained circuit");
+  assert.equal(service.statusSnapshot().aliases.find((alias) => alias.alias === "broken").queued, 0);
+  await service.shutdown("test");
+});
+
+test("retry storage failure keeps a failed alias in memory without blocking healthy delivery", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "broken", threadId: THREAD, env });
+  bindAlias({ alias: "healthy", threadId: THREAD2, env });
+  writeInbound(env, "broken");
+  writeInbound(env, "healthy");
+  const fakes = [];
+  const events = [];
+  const retryPath = resumeRetryPath("broken", env);
+  const factory = fakeClientFactory(fakes, { resumeResult: (params) => {
+    if (params.threadId === THREAD) {
+      // The alias already read its absent retry record. A directory now
+      // obstructs publication at the file path, independent of permissions.
+      mkdirSync(retryPath, { recursive: true });
+      throw new Error("temporary resume failure");
+    }
+    return { thread: { id: params.threadId }, cwd: realpathSync(process.cwd()), approvalPolicy: "on-request", sandbox: { type: "readOnly" } };
+  } });
+  const service = createService({ env, logEvent: (_level, event) => events.push(event),
+    machineName: "MBP", clientFactory: factory });
+  await service.tick();
+  await service.tick();
+  const aliases = service.statusSnapshot().aliases;
+  assert.equal(aliases.find((alias) => alias.alias === "broken").queued, 1);
+  assert.equal(aliases.find((alias) => alias.alias === "healthy").queued, 0);
+  assert.equal(fakes[0].requestsFor("thread/resume").filter((request) => request.params.threadId === THREAD).length, 1);
+  assert.ok(events.includes("codex.resume_retry_persist_failed"));
+  await service.shutdown("test");
+});
+
+test("repairing an unreadable retry record lets the alias deliver without restarting", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, env });
+  writeInbound(env, "review");
+  const retryPath = resumeRetryPath("review", env);
+  mkdirSync(dirname(retryPath), { recursive: true });
+  writeFileSync(retryPath, "invalid JSON");
+  const fakes = [];
+  let clock = Date.now();
+  const service = createService({ env, logEvent: noop, machineName: "MBP",
+    clientFactory: fakeClientFactory(fakes), now: () => clock });
+  await service.tick();
+  assert.equal(fakes.length, 0);
+  unlinkSync(retryPath);
+  await service.tick();
+  assert.equal(fakes.length, 0, "do not bypass the scheduled retry");
+  clock += 30_000;
+  await service.tick();
+  assert.equal(fakes[0].requestsFor("turn/start").length, 1);
+  await service.shutdown("test");
+});
+
+test("a leftover resolved settings journal cannot reset a failed history's backoff", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, env });
+  writeInbound(env, "review");
+  const fakes = [];
+  const service = createService({ env, logEvent: noop, machineName: "MBP",
+    clientFactory: fakeClientFactory(fakes, { resumeResult: () => { throw new Error("temporary resume failure"); } }) });
+  await service.tick();
+  const before = readResumeRetry("review", env);
+  assert.equal(before.attempts, 1);
+  const journal = writePendingSettingsJournal(env, "review", THREAD);
+  writeFileSync(journal, JSON.stringify({ ...JSON.parse(readFileSync(journal, "utf8")), state: "resolved" }));
+  await service.tick();
+  assert.deepEqual(readResumeRetry("review", env), before);
+  assert.equal(fakes.reduce((sum, fake) => sum + fake.requestsFor("thread/resume").length, 0), 1);
+  await service.shutdown("test");
+});
+
+test("unbound pending-settings recovery observes the same durable resume backoff", async () => {
+  const env = makeEnv();
+  writePendingSettingsJournal(env, "recovery", THREAD);
+  const fakes = [];
+  const service = createService({ env, logEvent: noop, machineName: "MBP",
+    clientFactory: fakeClientFactory(fakes, { resumeResult: () => { throw new Error("temporary resume error"); } }) });
+  await service.tick();
+  await service.tick();
+  assert.equal(fakes.reduce((sum, fake) => sum + fake.requestsFor("thread/resume").length, 0), 1);
+  assert.ok(existsSync(pendingSettingsPath("recovery", env)), "recovery journal is preserved");
+  assert.equal(readResumeRetry("recovery", env).delayMs, 30_000);
+  await service.shutdown("test");
+});
+
+test("a backoff-parked queue allows idle App Server cleanup without losing its message", async () => {
+  const env = makeEnv({ AGENT_BRIDGE_CODEX_IDLE_CLOSE_MS: "1" });
+  bindAlias({ alias: "review", threadId: THREAD, env });
+  writeInbound(env, "review");
+  const fakes = [];
+  const service = createService({ env, logEvent: noop, machineName: "MBP",
+    clientFactory: fakeClientFactory(fakes, { resumeResult: () => { throw new Error("temporary resume failure"); } }) });
+  await service.tick();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await service.tick();
+  assert.equal(fakes.length, 1);
+  assert.ok(fakes[0].child.exitCode !== null || fakes[0].child.signalCode !== null,
+    "an expensive idle child is not retained merely because a failed history has queued messages");
+  assert.equal(service.statusSnapshot().aliases[0].queued, 1);
+  assert.equal(fakes[0].requestsFor("turn/start").length, 0);
+  await service.shutdown("test");
+});
+
 test("unrouted flat files under inbox/codex/ are quarantined to _unrouted", async () => {
   const env = makeEnv();
   const flatDir = join(inboxRoot(env), "codex");
@@ -867,12 +1071,13 @@ test("idle-close shuts the app server down after quiet period and reopens on dem
   bindAlias({ alias: "review", threadId: THREAD, env });
   writeInbound(env, "review");
   const fakes = [];
-  const service = createService({ env, logEvent: noop, machineName: "MBP", clientFactory: fakeClientFactory(fakes) });
+  let clock = Date.now();
+  const service = createService({ env, logEvent: noop, machineName: "MBP", clientFactory: fakeClientFactory(fakes), now: () => clock });
   await service.tick();
   assert.equal(service.statusSnapshot().appServer.connected, true);
   // Let the fake turn complete so no active turns hold the connection.
   await waitFor(() => service._internals.sessions.size === 0 || Array.from(service._internals.sessions.values()).every((s) => !s.turnActive));
-  await sleep(5);
+  clock += 5;
   await service.tick();
   assert.equal(service.statusSnapshot().appServer.connected, false, "idle connection closed");
   assert.equal(fakes[0].requestsFor("thread/unsubscribe").length, 1);
@@ -951,9 +1156,11 @@ test("failed Windows exact-tree teardown blocks replacement beside a possible or
   bindAlias({ alias: "review", threadId: THREAD, cwd: realpathSync(process.cwd()), env });
   writeInbound(env, "review");
   const fake = createFakeAppServer();
+  let taskkillCalls = 0;
   const spawnProcess = () => {
     const killer = new EventEmitter();
-    queueMicrotask(() => killer.emit("exit", 1, null));
+    const exitCode = ++taskkillCalls === 1 ? 1 : 0;
+    queueMicrotask(() => killer.emit("exit", exitCode, null));
     return killer;
   };
   const firstClient = new CodexAppServerClient(fake.child, {
@@ -987,6 +1194,7 @@ test("failed Windows exact-tree teardown blocks replacement beside a possible or
   await sleep(0); // taskkill failure settles the teardown promise
   writeInbound(env, "review");
   await service.tick();
+  assert.equal(taskkillCalls, 1, "a retry must not signal a potentially reused PID");
   assert.equal(factoryCalls, 1, "replacement remains fenced when the old process tree may survive");
   assert.match(service.statusSnapshot().aliases[0].runtime.detail, /teardown could not be verified/i);
   assert.equal(existsSync(serviceTeardownPoisonPath(env)), true, "unknown process-tree ownership is fenced durably");
@@ -1000,6 +1208,126 @@ test("failed Windows exact-tree teardown blocks replacement beside a possible or
   assert.equal(spawned, false);
   await assert.rejects(() => service.shutdown("test"), /teardown could not be verified/i);
   fake.exit(0);
+});
+
+test("retained Unix client recovers one replacement after its poisoned process group becomes absent", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, cwd: realpathSync(process.cwd()), env });
+  const firstMessage = writeInbound(env, "review");
+  let groupState = "unpermitted";
+  let firstFake;
+  const processKill = () => {
+    const error = new Error(groupState === "unpermitted" ? "kill EPERM" : "kill ESRCH");
+    error.code = groupState === "unpermitted" ? "EPERM" : "ESRCH";
+    throw error;
+  };
+  firstFake = createFakeAppServer();
+  const firstClient = new CodexAppServerClient(firstFake.child, {
+    logEvent: noop,
+    clientName: "svc-test",
+    clientVersion: "0",
+    platform: "darwin",
+    ownsProcessGroup: true,
+    processKill,
+  });
+  const replacementFakes = [];
+  let factoryCalls = 0;
+  const service = createService({
+    env,
+    logEvent: noop,
+    machineName: "MBP",
+    teardownProbeKill: processKill,
+    clientFactory: async () => {
+      factoryCalls += 1;
+      if (factoryCalls === 1) return firstClient;
+      const fake = createFakeAppServer();
+      replacementFakes.push(fake);
+      return new CodexAppServerClient(fake.child, {
+        logEvent: noop,
+        clientName: "replacement",
+        clientVersion: "0",
+      });
+    },
+  });
+  await service.tick();
+  await waitFor(() => !service._internals.sessions.get("review")?.turnActive);
+  await service.tick();
+  assert.equal(firstFake.requestsFor("turn/start").length, 1);
+  assert.equal(firstFake.requestsFor("turn/start")[0].params.clientUserMessageId, firstMessage.id);
+
+  firstFake.child.stdout.end();
+  await waitFor(() => service.statusSnapshot().appServer.connected === false);
+  const secondMessage = writeInbound(env, "review");
+  await service.tick();
+  const activePoison = JSON.parse(readFileSync(serviceTeardownPoisonPath(env), "utf8"));
+  assert.equal(activePoison.state, "active");
+  assert.equal(activePoison.treeKind, "unix-process-group");
+  assert.equal(factoryCalls, 1, "EPERM keeps replacement fail-closed");
+
+  groupState = "absent";
+  service._internals.runtime.get("review").retryAt = 0;
+  await service.tick();
+  assert.equal(factoryCalls, 2, "exact ESRCH proof permits one replacement");
+  assert.equal(replacementFakes[0].requestsFor("turn/start").length, 1);
+  assert.equal(replacementFakes[0].requestsFor("turn/start")[0].params.clientUserMessageId, secondMessage.id);
+  assert.equal(firstFake.requestsFor("turn/start").length, 1, "the earlier message is never duplicated");
+  const resolvedPoison = JSON.parse(readFileSync(serviceTeardownPoisonPath(env), "utf8"));
+  assert.equal(resolvedPoison.state, "resolved");
+  assert.equal(resolvedPoison.resolution, "owned_unix_process_group_absent_esrch");
+  await service.shutdown("test");
+});
+
+test("active Unix poison survives restart until ESRCH, then staged delivery runs exactly once", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, cwd: realpathSync(process.cwd()), env });
+  const message = writeInbound(env, "review");
+  mkdirSync(dirname(serviceTeardownPoisonPath(env)), { recursive: true });
+  writeFileSync(serviceTeardownPoisonPath(env), JSON.stringify({
+    version: 2,
+    state: "active",
+    path: serviceTeardownPoisonPath(env),
+    pid: 424242,
+    treeKind: "unix-process-group",
+    processGroupId: 424242,
+    context: "replace_closed_client",
+    error: "process-group SIGTERM failed: kill EPERM",
+    createdAt: new Date().toISOString(),
+  }));
+  let groupState = "unpermitted";
+  const processKill = () => {
+    const error = new Error(groupState === "unpermitted" ? "kill EPERM" : "kill ESRCH");
+    error.code = groupState === "unpermitted" ? "EPERM" : "ESRCH";
+    throw error;
+  };
+  let blockedFactoryCalls = 0;
+  const blocked = createService({
+    env,
+    logEvent: noop,
+    machineName: "MBP",
+    teardownProbeKill: processKill,
+    clientFactory: async () => { blockedFactoryCalls += 1; throw new Error("must remain fenced"); },
+  });
+  await blocked.tick();
+  assert.equal(blockedFactoryCalls, 0);
+  assert.equal(JSON.parse(readFileSync(serviceTeardownPoisonPath(env), "utf8")).state, "active");
+
+  groupState = "absent";
+  const fakes = [];
+  const restarted = createService({
+    env,
+    logEvent: noop,
+    machineName: "MBP",
+    teardownProbeKill: processKill,
+    clientFactory: fakeClientFactory(fakes),
+  });
+  await restarted.tick();
+  assert.equal(fakes.length, 1);
+  assert.equal(fakes[0].requestsFor("turn/start").length, 1);
+  assert.equal(fakes[0].requestsFor("turn/start")[0].params.clientUserMessageId, message.id);
+  await restarted.tick();
+  assert.equal(fakes[0].requestsFor("turn/start").length, 1, "restart recovery does not duplicate the turn");
+  assert.equal(JSON.parse(readFileSync(serviceTeardownPoisonPath(env), "utf8")).state, "resolved");
+  await restarted.shutdown("test");
 });
 
 test("initialize cleanup failure retains and poisons the exact client instead of spawning beside it", async () => {

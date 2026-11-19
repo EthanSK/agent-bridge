@@ -95,6 +95,10 @@ export function pendingSettingsPath(alias, env = process.env) {
   return join(pendingSettingsDir(env), `${alias}.json`);
 }
 
+export function resumeRetryPath(alias, env = process.env) {
+  return join(codexStateDir(env), "resume-retry", `${alias}.json`);
+}
+
 export function inboxRoot(env = process.env) {
   return join(bridgeHome(env), "inbox");
 }

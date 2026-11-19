@@ -62,6 +62,7 @@ import { makeEventLogger } from "./log.js";
 // Vendor copy for packaging self-containment (parity test-enforced).
 import { localMachineName } from "./vendor/openclaw-outbound.js";
 import { CHANNEL_VERSION } from "./version.js";
+import { clearResumeRetry, codexBinaryStamp, nextResumeRetry, persistResumeRetry, readResumeRetry, resumeRetryKey } from "./resume-retry.js";
 
 export const POLL_MS = 2000;
 const LEASE_STALE_MS = 15_000;
@@ -80,41 +81,140 @@ const LEASE_MUTEX_RETRY_MS = 10;
 const LEASE_MUTEX_TIMEOUT_MS = 5_000;
 const LEASE_MUTEX_STALE_MS = 10_000;
 
+/** Marks a failed thread resume so only history opens use the durable budget. — GPT-6.2 Sol */
+class ThreadResumeFailure extends Error {
+  constructor(cause) {
+    super(String(cause?.message ?? cause), { cause });
+  }
+}
+
+async function resumeThread(session) {
+  try {
+    await session.resume();
+  } catch (error) {
+    throw new ThreadResumeFailure(error);
+  }
+}
+
 // ── Lease ───────────────────────────────────────────────────────────────────
 
 /**
- * A teardown poison is intentionally operator-cleared only. It means an
- * owned App Server process tree could not be proven dead; automatically
- * starting another daemon would recreate the split-brain we failed to rule
- * out. The file survives daemon exit/restart and carries the exact evidence.
+ * A teardown poison means an owned App Server process tree could not be
+ * proven dead; starting another daemon would recreate the split-brain we
+ * failed to rule out. The file survives daemon exit/restart and carries the
+ * exact evidence. An owned Unix process group may resolve automatically only
+ * after a later non-mutating probe returns ESRCH; every other state remains
+ * fail-closed for explicit operator verification/reboot.
  */
-export function readTeardownPoison(env = process.env) {
+function readTeardownPoisonRecord(env = process.env) {
   const path = serviceTeardownPoisonPath(env);
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8"));
     return parsed && typeof parsed === "object" ? parsed : { version: 0, unreadable: true, path };
-  } catch {
-    return existsSync(path) ? { version: 0, unreadable: true, path } : null;
+  } catch (error) {
+    // Only a definite missing path means no fence. existsSync() itself can
+    // return false for permission failures, which must never turn unreadable
+    // safety state into permission to spawn beside an unknown process tree.
+    if (error?.code === "ENOENT") return null;
+    return { version: 0, unreadable: true, path, error: String(error?.message ?? error) };
   }
 }
 
+export function readTeardownPoison(env = process.env) {
+  const poison = readTeardownPoisonRecord(env);
+  return poison?.state === "resolved" ? null : poison;
+}
+
 function persistTeardownPoison(client, error, context, env) {
-  const path = serviceTeardownPoisonPath(env);
-  const existing = readTeardownPoison(env);
-  if (existing) return existing;
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const poison = {
-    version: 1,
-    path,
-    pid: Number.isInteger(client?.child?.pid) ? client.child.pid : null,
-    context,
-    error: String(error?.message ?? error),
-    serviceVersion: CHANNEL_VERSION,
-    createdAt: new Date().toISOString(),
-    recovery: "Verify/reboot the host so the old Codex App Server tree is gone, then remove this poison file explicitly.",
-  };
-  writeFileDurable(path, JSON.stringify(poison, null, 2));
-  return poison;
+  return withLeaseMutex(env, () => {
+    const path = serviceTeardownPoisonPath(env);
+    const existing = readTeardownPoison(env);
+    if (existing) return existing;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const poison = {
+      version: 2,
+      state: "active",
+      path,
+      pid: Number.isInteger(client?.child?.pid) ? client.child.pid : null,
+      treeKind: client?.platform !== "win32" && client?.ownsProcessGroup === true
+        ? "unix-process-group"
+        : client?.platform === "win32" ? "windows-process-tree" : "direct-child",
+      processGroupId: client?.platform !== "win32" && client?.ownsProcessGroup === true
+        && Number.isInteger(client?.child?.pid) ? client.child.pid : null,
+      context,
+      error: String(error?.message ?? error),
+      serviceVersion: CHANNEL_VERSION,
+      createdAt: new Date().toISOString(),
+      recovery: "The daemon rechecks an owned Unix process group automatically; if it remains blocked or is not safely probeable, verify/reboot before any explicit recovery.",
+    };
+    writeFileDurable(path, JSON.stringify(poison, null, 2));
+    return poison;
+  });
+}
+
+/**
+ * Resolve only the one teardown state that can be proven non-mutatingly:
+ * an owned Unix process group for which kill(-pgid, 0) returns ESRCH.
+ * Success and EPERM both mean the group may still exist and remain fenced.
+ *
+ * The resolved tombstone intentionally stays at the canonical path. New code
+ * ignores it, while a still-running 4.10.0 daemon reads it as an existing
+ * poison and therefore cannot recreate an active record during shutdown.
+ */
+export function recoverTeardownPoisonIfSafe({
+  env = process.env,
+  processKill = process.kill.bind(process),
+  logEvent = null,
+} = {}) {
+  const current = readTeardownPoisonRecord(env);
+  if (!current || current.state === "resolved") return { recovered: false, poison: null };
+  if (current.unreadable) return { recovered: false, poison: current, reason: "unreadable" };
+  // Share the lease lock with the writer. An older recovery must never
+  // replace a newer active fence after another caller resumes the service.
+  return withLeaseMutex(env, () => {
+    const poison = readTeardownPoisonRecord(env);
+    if (!poison || poison.state === "resolved") return { recovered: false, poison: null };
+    if (poison.unreadable) return { recovered: false, poison, reason: "unreadable" };
+    const inferredLegacyUnixGroup = !poison.treeKind
+      && process.platform !== "win32"
+      && /process-group/i.test(String(poison.error ?? ""));
+    if (poison.treeKind !== "unix-process-group" && !inferredLegacyUnixGroup) {
+      return { recovered: false, poison, reason: "tree_not_conclusively_probeable" };
+    }
+    const pgid = Number(poison.processGroupId ?? poison.pid);
+    if (!Number.isInteger(pgid) || pgid <= 1) {
+      return { recovered: false, poison, reason: "invalid_process_group" };
+    }
+    try {
+      processKill(-pgid, 0);
+      return { recovered: false, poison, reason: "process_group_exists" };
+    } catch (error) {
+      if (error?.code === "EPERM") {
+        return { recovered: false, poison, reason: "process_group_exists_unpermitted" };
+      }
+      if (error?.code !== "ESRCH") {
+        return { recovered: false, poison, reason: `process_group_probe_failed: ${String(error?.message ?? error)}` };
+      }
+    }
+    const resolved = {
+      ...poison,
+      version: Math.max(Number(poison.version) || 0, 2),
+      state: "resolved",
+      processGroupId: pgid,
+      resolvedAt: new Date().toISOString(),
+      resolution: "owned_unix_process_group_absent_esrch",
+    };
+    writeFileDurable(serviceTeardownPoisonPath(env), JSON.stringify(resolved, null, 2));
+    const log = logEvent ?? makeEventLogger({ env });
+    log("info", "codex.appserver_teardown_poison_resolved",
+      `Resolved App Server teardown fence after owned process group ${pgid} was conclusively absent`, {
+        child_pid: poison.pid ?? null,
+        process_group_id: pgid,
+        prior_context: poison.context ?? null,
+        resolution: resolved.resolution,
+      });
+    return { recovered: true, poison: resolved };
+  });
 }
 
 export function readLease(env = process.env) {
@@ -302,10 +402,10 @@ function removeLeaseIfToken(env, token) {
 }
 
 export function acquireLease(env = process.env, { mutexTimeoutMs = LEASE_MUTEX_TIMEOUT_MS } = {}) {
-  if (readTeardownPoison(env)) return null;
   const path = serviceLeasePath(env);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   return withLeaseMutex(env, () => {
+    if (readTeardownPoison(env)) return null;
     const existing = readLease(env);
     if (existing?.unreadable) return null;
     // Heartbeat age is not authority to replace a live process: a suspended
@@ -446,8 +546,13 @@ export async function verifyLiveDaemon(env = process.env, {
  * is cleaned up without addressing a process; a live but unverified holder is
  * left alone. Raw PID signaling is deliberately absent on every platform.
  */
-export async function stopService({ env = process.env, logEvent = null } = {}) {
+export async function stopService({
+  env = process.env,
+  logEvent = null,
+  teardownProbeKill = process.kill.bind(process),
+} = {}) {
   const log = logEvent ?? makeEventLogger({ env });
+  recoverTeardownPoisonIfSafe({ env, processKill: teardownProbeKill, logEvent: log });
   const poison = readTeardownPoison(env);
   if (poison) {
     return { stopped: false, reason: "teardown_poisoned", poison };
@@ -497,9 +602,12 @@ export function createService({
   dispatchFence = null,
   teardownPoisonWriter = persistTeardownPoison,
   teardownPoisonRetrySleep = sleep,
+  teardownProbeKill = process.kill.bind(process),
+  now = Date.now,
 } = {}) {
   const log = logEvent ?? makeEventLogger({ env });
   const localMachine = machineName ?? safeLocalMachineName(env);
+  const binaryStamp = codexBinaryStamp(env);
   const idleCloseMs = positiveEnvInt(env.AGENT_BRIDGE_CODEX_IDLE_CLOSE_MS, DEFAULT_IDLE_CLOSE_MS);
   const ownershipFreshMs = positiveEnvInt(env.AGENT_BRIDGE_CODEX_OWNERSHIP_FRESH_MS, DEFAULT_OWNERSHIP_FRESH_MS);
 
@@ -515,7 +623,7 @@ export function createService({
   let client = null;
   let clientClosedReason = null;
   let versionBlockedUntil = 0;
-  let lastActivityAt = Date.now();
+  let lastActivityAt = now();
   /** alias -> last time WE touched the thread (delivery / session activity) */
   const ourActivityAt = new Map();
   /** alias -> exact thread+rollout mtime last observed after our activity. */
@@ -575,8 +683,80 @@ export function createService({
     return runtime.get(alias);
   }
 
+  function resumeRetryState(binding) {
+    const state = aliasRuntime(binding.alias);
+    const key = resumeRetryKey(binding, binaryStamp);
+    if (state.retryKey === key && (!state.retryReadFailed || now() < state.retryAt)) return state;
+    state.retryKey = key;
+    state.retryReadFailed = false;
+    state.retryAt = 0;
+    state.resumeRetry = null;
+    try {
+      const retained = readResumeRetry(binding.alias, env);
+      if (retained?.key === key) {
+        state.resumeRetry = retained;
+        state.retryAt = retained.retryAt;
+        state.state = retained.classifiedState;
+        state.detail = retained.detail;
+      }
+    } catch (err) {
+      // Re-read repaired state on the existing retry cadence without opening
+      // an expensive history while its saved budget is unreadable.
+      state.retryReadFailed = true;
+      state.state = "session_error";
+      state.detail = `cannot read resume retry state: ${String(err?.message ?? err)}`;
+      state.retryAt = now() + RESUME_RETRY_MS;
+      log("error", "codex.resume_retry_state_unreadable", state.detail, { alias: binding.alias });
+    }
+    return state;
+  }
+
+  function recordResumeFailure(binding, err) {
+    const state = resumeRetryState(binding);
+    const detail = String(err?.message ?? err);
+    const resumeFailed = err instanceof ThreadResumeFailure;
+    const rpcMessage = detail.replace(/^thread\/resume failed: /, "");
+    const notFound = resumeFailed && /^(?:no such thread|unknown thread|thread not found|thread [\w-]+ not found)\b/i.test(rpcMessage);
+    const locked = detail.startsWith("shared Codex App Server ")
+      || (resumeFailed && /^(?:thread (?:is )?(?:locked|in use|owned by another)|another (?:client|process) owns (?:the|this) thread)\b/i.test(rpcMessage));
+    state.state = err instanceof CodexVersionError || detail.startsWith("codex app-server version unsupported ")
+      ? "codex_unsupported"
+      : notFound ? "thread_not_found"
+        : locked ? "ownership_conflict" : "session_error";
+    state.detail = detail;
+    if (!resumeFailed || locked) {
+      // Keep restores, teardown, and other temporary prerequisites on the
+      // existing retry cadence. Only history-open failures spend that budget.
+      state.retryAt = now() + RESUME_RETRY_MS;
+      return state;
+    }
+    const retry = nextResumeRetry({ previous: state.resumeRetry, key: state.retryKey, state: state.state, detail, now: now() });
+    state.resumeRetry = retry;
+    state.retryAt = retry.retryAt;
+    try {
+      persistResumeRetry(binding.alias, retry, env);
+    } catch (error) {
+      // The in-process cooldown is already set. A disk error for this
+      // alias must not abort the poll before other aliases can run.
+      log("error", "codex.resume_retry_persist_failed", String(error?.message ?? error), { alias: binding.alias });
+    }
+    return state;
+  }
+
+  function resetResumeRetry(binding) {
+    const state = resumeRetryState(binding);
+    state.resumeRetry = null;
+    state.retryAt = 0;
+    try {
+      clearResumeRetry(binding.alias, env);
+    } catch (error) {
+      log("error", "codex.resume_retry_clear_failed", String(error?.message ?? error), { alias: binding.alias });
+    }
+  }
+
   async function getClient() {
     if (client && !client.closed) return client;
+    recoverTeardownPoisonIfSafe({ env, processKill: teardownProbeKill, logEvent: log });
     const poison = readTeardownPoison(env);
     if (poison) {
       throw new Error(
@@ -613,7 +793,7 @@ export function createService({
         await closeClientVerified(fresh, "initialize_failed");
       } catch (closeErr) {
         // Retain the poisoned logical owner. Future getClient calls await the
-        // same rejected teardown and cannot manufacture a replacement.
+        // same failed teardown or prove the owned group absent before replacing it.
         client = fresh;
         clientClosedReason = String(closeErr?.message ?? closeErr);
         throw closeErr;
@@ -723,7 +903,7 @@ export function createService({
       logEvent: log,
       dispatchFence,
     });
-    await recovery.resume();
+    await resumeThread(recovery);
     let restored = { restored: false, reason: "not_needed" };
     if (recovery.recoveredRestoreJournal) {
       restored = recovery.turnActive
@@ -785,7 +965,7 @@ export function createService({
       // A live session owns its pending journal and will restore it on queue
       // drain. Opening a second recovery subscription would race that owner.
       if (sessions.has(alias)) continue;
-      if (Date.now() < (restoreRetryAt.get(alias) ?? 0)) {
+      if (now() < (restoreRetryAt.get(alias) ?? 0)) {
         blocked.add(alias);
         continue;
       }
@@ -794,14 +974,14 @@ export function createService({
         pending = readSettingsRestoreJournal(alias, env);
       } catch (err) {
         blocked.add(alias);
-        restoreRetryAt.set(alias, Date.now() + RESUME_RETRY_MS);
+        restoreRetryAt.set(alias, now() + RESUME_RETRY_MS);
         log("error", "codex.settings_restore_recovery_failed", `Cannot read pending settings journal for ${alias}`, {
           alias,
           error: String(err?.message ?? err),
         });
         continue;
       }
-      if (!pending) continue;
+      if (!pending || pending.state === "resolved") continue;
       const recoveryBinding = {
         alias,
         threadId: pending.threadId,
@@ -809,12 +989,18 @@ export function createService({
         enabled: false,
         policy: { steering: false, ownershipGuard: true, approvalPolicy: "never", sandbox: "read-only", turnTimeoutMs: null },
       };
+      const recoveryState = resumeRetryState(recoveryBinding);
+      if (now() < recoveryState.retryAt) {
+        blocked.add(alias);
+        continue;
+      }
       try {
         await recoverPendingSettings(recoveryBinding);
+        resetResumeRetry(recoveryBinding);
         restoreRetryAt.delete(alias);
       } catch (err) {
         blocked.add(alias);
-        restoreRetryAt.set(alias, Date.now() + RESUME_RETRY_MS);
+        recordResumeFailure(recoveryBinding, err);
         log("warn", "codex.settings_restore_recovery_deferred", `Pending settings restore for ${alias} remains blocked`, {
           alias,
           thread_id: pending.threadId,
@@ -855,12 +1041,12 @@ export function createService({
       dispatchFence,
       onIdle: () => {
         ourActivityAt.set(binding.alias, Date.now());
-        lastActivityAt = Date.now();
+        lastActivityAt = now();
       },
       onTurnCompleted: (finished) => {
         ourActivityAt.set(binding.alias, Date.now());
         recordRolloutBaseline(binding);
-        lastActivityAt = Date.now();
+        lastActivityAt = now();
         const delivery = deliveries.get(binding.alias);
         const msgId = finished.turnId && delivery ? delivery.messageForTurn(finished.turnId) : null;
         const state = aliasRuntime(binding.alias);
@@ -889,7 +1075,7 @@ export function createService({
         }
       },
     });
-    await session.resume();
+    await resumeThread(session);
     sessions.set(binding.alias, session);
     ourActivityAt.set(binding.alias, Date.now());
     recordRolloutBaseline(binding);
@@ -985,7 +1171,7 @@ export function createService({
   async function pumpAlias(binding) {
     const delivery = deliveries.get(binding.alias);
     if (!delivery) return;
-    const state = aliasRuntime(binding.alias);
+    const state = resumeRetryState(binding);
     delivery.scanInbox();
 
     const session = sessions.get(binding.alias);
@@ -995,6 +1181,7 @@ export function createService({
     // A crash can leave no queued message (it was already archived) but a
     // pending sticky-settings journal. Recovery itself is actionable work.
     if (!hasWork && !session) {
+      if (now() < (state.retryAt ?? 0)) return;
       let pendingRestore = null;
       try { pendingRestore = readSettingsRestoreJournal(binding.alias, env); } catch (err) {
         state.state = "settings_restore_pending";
@@ -1005,13 +1192,13 @@ export function createService({
       if (pendingRestore?.state === "pending") {
         try {
           await recoverPendingSettings(binding);
+          resetResumeRetry(binding);
           state.state = "idle";
           state.detail = null;
           state.retryAt = 0;
         } catch (err) {
+          recordResumeFailure(binding, err);
           state.state = "settings_restore_pending";
-          state.detail = String(err?.message ?? err);
-          state.retryAt = Date.now() + RESUME_RETRY_MS;
         }
         return;
       }
@@ -1073,8 +1260,8 @@ export function createService({
       }
       return;
     }
-    lastActivityAt = Date.now();
-    if (Date.now() < (state.retryAt ?? 0)) return;
+    if (now() < (state.retryAt ?? 0)) return;
+    lastActivityAt = now();
 
     if (!session && foreignActivityRecent(binding)) {
       if (state.state !== "deferred_foreign_activity") {
@@ -1097,21 +1284,17 @@ export function createService({
     let liveSession;
     try {
       liveSession = await getSession(binding);
+      resetResumeRetry(binding);
     } catch (err) {
-      const detail = String(err?.message ?? err);
-      const notFound = /not.?found|no such thread|unknown thread/i.test(detail);
-      const locked = /lock|owned|in use|another (?:client|process)/i.test(detail);
-      state.state = err instanceof CodexVersionError || /version unsupported/.test(detail)
-        ? "codex_unsupported"
-        : notFound ? "thread_not_found"
-          : locked ? "ownership_conflict"
-            : "session_error";
-      state.detail = detail;
-      state.retryAt = Date.now() + RESUME_RETRY_MS;
-      log("error", "codex.session_open_failed", `Cannot open session for ${binding.alias}: ${detail}`, {
+      recordResumeFailure(binding, err);
+      log("error", "codex.session_open_failed", `Cannot open session for ${binding.alias}: ${state.detail}`, {
         alias: binding.alias,
         thread_id: binding.threadId,
         classified_state: state.state,
+        resume_attempts: state.resumeRetry?.attempts ?? null,
+        retry_delay_ms: state.resumeRetry?.delayMs ?? RESUME_RETRY_MS,
+        retry_at: state.retryAt,
+        retry_phase: state.resumeRetry?.phase ?? "contention",
       });
       return;
     }
@@ -1123,7 +1306,7 @@ export function createService({
       if (outcome === "delivered") {
         ourActivityAt.set(binding.alias, Date.now());
         recordRolloutBaseline(binding);
-        lastActivityAt = Date.now();
+        lastActivityAt = now();
         state.state = liveSession.turnActive ? "turn_active" : "idle";
       } else if (outcome === "deferred") {
         state.state = liveSession.turnActive ? "turn_active" : "waiting";
@@ -1140,12 +1323,14 @@ export function createService({
 
   async function maybeIdleClose() {
     if (!client || client.closed) return;
-    const anyQueued = Array.from(deliveries.values()).some((d) => d.hasQueued());
+    const anyQueued = Array.from(deliveries.values()).some((d) => d.hasQueued()
+      && now() >= (aliasRuntime(d.alias).retryAt ?? 0));
     const anyActiveTurn = Array.from(sessions.values()).some((s) => s.turnActive);
     if (anyQueued || anyActiveTurn) return;
-    if (Date.now() - lastActivityAt < idleCloseMs) return;
+    const idleMs = now() - lastActivityAt;
+    if (idleMs < idleCloseMs) return;
     log("info", "codex.appserver_idle_close", "Closing idle app-server connection", {
-      idle_ms: Date.now() - lastActivityAt,
+      idle_ms: idleMs,
     });
     let allReleased = true;
     for (const alias of Array.from(sessions.keys())) {
@@ -1233,6 +1418,7 @@ export function createService({
 
 export async function runService({ env = process.env, mirror = null } = {}) {
   const log = makeEventLogger({ env, mirror });
+  recoverTeardownPoisonIfSafe({ env, logEvent: log });
   const startupPoison = readTeardownPoison(env);
   if (startupPoison) {
     log("error", "codex.service_start_blocked_teardown_poison",
@@ -1418,12 +1604,14 @@ export async function ensureService({
   spawnImpl = null,
   logEvent = null,
   readinessImpl = waitForSpawnedDaemonReady,
+  teardownProbeKill = process.kill.bind(process),
 } = {}) {
   if (String(env.AGENT_BRIDGE_CODEX_NO_ENSURE ?? "") === "1") {
     const current = readLease(env);
     return { spawned: false, skipped: true, pid: leaseFresh(current) ? current.pid : null };
   }
   const log = logEvent ?? makeEventLogger({ env });
+  recoverTeardownPoisonIfSafe({ env, processKill: teardownProbeKill, logEvent: log });
   const poison = readTeardownPoison(env);
   if (poison) {
     log("error", "codex.service_ensure_blocked_teardown_poison",
@@ -1528,7 +1716,7 @@ export function describeEnsureResult(result) {
     return {
       ok: false,
       message: `codex-channel startup is blocked by an unverified prior App Server teardown at `
-        + `${result?.poison?.path ?? "locks/codex-channel.teardown-poison.json"}; verify the old process tree is gone and clear the poison explicitly`,
+        + `${result?.poison?.path ?? "locks/codex-channel.teardown-poison.json"}; the daemon will recover an owned Unix group only after ESRCH, otherwise verify/reboot before explicit recovery`,
     };
   }
   if (result?.staleVersion) {

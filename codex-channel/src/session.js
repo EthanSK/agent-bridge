@@ -296,11 +296,12 @@ export class ThreadSession {
     try {
       response = await this.client.request("thread/resume", {
         threadId: this.threadId,
-        // Resume needs turn ids and status, not full messages or tool output.
-        // Large histories otherwise exceed the transport's bounded frame size
-        // before we can discover an active turn. Summary view preserves that
-        // ownership check without loading unrelated private conversation text.
-        initialTurnsPage: { limit: 20, sortDirection: "desc", itemsView: "summary" },
+        // Codex 0.145 rejoins RUNNING threads: the newest turn's id/status are
+        // enough to hydrate an in-progress turn. `notLoaded` is the schema's
+        // metadata-only view; even one display `summary` exceeded the bounded
+        // JSON-RPC frame on a 113 MB persisted task. If an active status lacks
+        // a recoverable turn id, the existing unknown-active guard fails busy.
+        initialTurnsPage: { limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
       }, { timeoutMs, dispatchFence: this.dispatchFence });
       resumeRpcCompleted = true;
       returned = readThreadIdFromResponse(response);

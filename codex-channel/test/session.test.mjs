@@ -63,9 +63,9 @@ test("resume subscribes the exact thread, captures original settings, and releas
   assert.equal(session.subscribed, true);
   const resumeReq = fake.requestsFor("thread/resume")[0];
   assert.equal(resumeReq.params.threadId, THREAD);
-  // Exact 0.145 shape: recent summary page requested so in-progress turns can
-  // be hydrated before declaring idle.
-  assert.deepEqual(resumeReq.params.initialTurnsPage, { limit: 20, sortDirection: "desc", itemsView: "summary" });
+  // Exact 0.145 shape: notLoaded carries turn status/id without replaying any
+  // item bodies or potentially-large display summary into one bounded frame.
+  assert.deepEqual(resumeReq.params.initialTurnsPage, { limit: 1, sortDirection: "desc", itemsView: "notLoaded" });
   assert.equal(session.turnActive, false, "idle thread resumes idle");
   // Original settings captured from the resume response for later restore.
   assert.equal(session.originalSettings.cwd, "/original/cwd");
@@ -73,6 +73,62 @@ test("resume subscribes the exact thread, captures original settings, and releas
   assert.equal(session.originalSettings.sandboxPolicy.networkAccess, true);
   await session.release();
   assert.equal(fake.requestsFor("thread/unsubscribe").length, 1);
+  await client.close();
+});
+
+test("resume requests one metadata-only turn because full and summary views can exceed 1 MiB", async () => {
+  const hugeBody = "x".repeat(1_000_100);
+  const fullResponse = {
+    id: 2,
+    result: {
+      thread: { id: THREAD, status: { type: "idle" } },
+      initialTurnsPage: {
+        data: [{ id: "turn-large", status: "completed", items: [{ type: "agentMessage", text: hugeBody }] }],
+        nextCursor: null,
+      },
+    },
+  };
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(fullResponse), "utf8") > 1_000_000,
+    "fixture reproduces the prior transport rejection boundary",
+  );
+  const twentyLargeSummaries = {
+    id: 2,
+    result: {
+      thread: { id: THREAD, status: { type: "idle" } },
+      initialTurnsPage: {
+        data: Array.from({ length: 20 }, (_, index) => ({
+          id: `turn-summary-${index}`,
+          status: "completed",
+          summary: "s".repeat(60_000),
+        })),
+        nextCursor: null,
+      },
+    },
+  };
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(twentyLargeSummaries), "utf8") > 1_000_000,
+    "summary mode alone does not bound a 20-turn response on a long task",
+  );
+
+  const { fake, client, session } = await makeSession({
+    resumeResult: (params) => {
+      assert.equal(params.initialTurnsPage.itemsView, "notLoaded");
+      assert.equal(params.initialTurnsPage.limit, 1);
+      return {
+        thread: { id: params.threadId, status: { type: "idle" } },
+        initialTurnsPage: {
+          data: [{ id: "turn-large", status: "completed", itemsView: "notLoaded", items: [] }],
+          nextCursor: null,
+        },
+      };
+    },
+  });
+  await session.resume();
+  assert.equal(session.subscribed, true);
+  assert.equal(client.closed, false);
+  assert.equal(fake.requestsFor("thread/resume").length, 1);
+  await session.release();
   await client.close();
 });
 
