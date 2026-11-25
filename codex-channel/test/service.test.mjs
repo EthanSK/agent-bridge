@@ -1,3 +1,4 @@
+/** Exercises the Codex-channel service with isolated state and a fake App Server; run with node --test. — GPT-6.1 Sol */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
@@ -875,6 +876,66 @@ test("thread_not_found classification when resume fails", async () => {
   assert.equal(alias.runtime.state, "thread_not_found");
   assert.equal(fakes[0].requestsFor("turn/start").length, 0);
   await service.shutdown("test");
+});
+
+test("active-writer resume contention keeps a fixed retry and delivers only after release", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, env });
+  const msg = writeInbound(env, "review");
+  const fakes = [];
+  let clock = Date.now();
+  let writerActive = true;
+  const service = createService({
+    env, logEvent: noop, machineName: "MBP", now: () => clock,
+    clientFactory: fakeClientFactory(fakes, { resumeResult: (params) => {
+      if (writerActive) throw new Error(`thread ${params.threadId} already has an active writer`);
+      return { thread: { id: params.threadId, status: { type: "idle" } }, cwd: realpathSync(process.cwd()), approvalPolicy: "on-request", sandbox: { type: "readOnly" } };
+    } }),
+  });
+  const resumes = () => fakes.reduce((sum, fake) => sum + fake.requestsFor("thread/resume").length, 0);
+  try {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await service.tick();
+      const alias = service.statusSnapshot().aliases[0];
+      assert.equal(alias.runtime.state, "ownership_conflict");
+      assert.equal(alias.runtime.retryAt, clock + 30_000);
+      assert.equal(readResumeRetry("review", env), null, "contention does not spend the history-open retry budget");
+      assert.equal(alias.entries[0].id, msg.id);
+      assert.equal(alias.entries[0].attempts, 0);
+      assert.equal(resumes(), attempt);
+      assert.ok(fakes.every((fake) => fake.requestsFor("turn/start").length === 0));
+      clock = alias.runtime.retryAt - 1;
+      await service.tick();
+      assert.equal(resumes(), attempt, "no busy retry before the existing contention interval");
+      clock += 1;
+    }
+    writerActive = false;
+    await service.tick();
+    assert.equal(resumes(), 6);
+    assert.equal(service.statusSnapshot().aliases[0].queued, 0);
+    assert.equal(readResumeRetry("review", env), null);
+    assert.equal(fakes.reduce((sum, fake) => sum + fake.requestsFor("turn/start").length, 0), 1);
+  } finally {
+    await service.shutdown("test");
+  }
+});
+
+test("an active-writer phrase outside thread resume remains a session error", async () => {
+  const env = makeEnv();
+  bindAlias({ alias: "review", threadId: THREAD, env });
+  writeInbound(env, "review");
+  const service = createService({
+    env, logEvent: noop, machineName: "MBP",
+    clientFactory: async () => { throw new Error(`thread ${THREAD} already has an active writer`); },
+  });
+  try {
+    await service.tick();
+    const alias = service.statusSnapshot().aliases[0];
+    assert.equal(alias.runtime.state, "session_error");
+    assert.equal(alias.entries[0].attempts, 0);
+  } finally {
+    await service.shutdown("test");
+  }
 });
 
 test("unsupported Codex version is classified and blocks with a retry window", async () => {

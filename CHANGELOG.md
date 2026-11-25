@@ -1,5 +1,11 @@
 # Changelog
 
+## agent-bridge 4.10.2 — 2026-11-25
+
+- Treat Codex's `thread <uuid> already has an active writer` resume error as ownership contention, using the existing 30-second retry instead of escalating to a history-open cooldown.
+- Keep queued messages, delivery attempts, ownership checks, message expiry and Telegram routing unchanged. Delivery still waits for the owning Codex client to release the thread.
+- Add regression coverage for repeated contention, delivery after release and the same error wording outside thread resume.
+
 ## agent-bridge 4.10.1 — 2026-11-07
 
 - **Large saved Codex chats resume reliably.** Request turn summaries rather than full message/tool bodies while retaining active-turn ownership checks.

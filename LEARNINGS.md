@@ -24,6 +24,15 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-11-25
+**Trigger:** Bridge replies reached a bound Codex staging queue but no Codex turn started.
+**Symptom:** Repeated `thread/resume` failures reported `thread <uuid> already has an active writer`, while the service escalated to a 30-minute history-open cooldown.
+**Root cause:** The ownership-error classifier omitted this exact Codex wording. A staged transport receipt did not prove a visible Codex turn.
+**Fix:** Recognize the phrase only for an actual `ThreadResumeFailure`, reusing the existing 30-second ownership-contention retry. This does not release a desktop writer, inject into its open viewport, alter Telegram routing or clear retained cooldowns.
+**Guard:** The regression failed before the patch. Five repeated conflicts retain zero delivery attempts and a fixed retry interval; no send occurs before release, then exactly one turn starts. The same phrase outside thread resume remains a session error.
+---
+
+---
 **Date:** 2026-11-07T00:29:04Z
 **Trigger:** Approved M1 saved-history repair
 **Symptom:** Long-lived bound Codex tasks failed during thread/resume with stdout line exceeded 1000000 bytes.

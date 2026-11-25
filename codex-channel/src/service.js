@@ -718,7 +718,7 @@ export function createService({
     const rpcMessage = detail.replace(/^thread\/resume failed: /, "");
     const notFound = resumeFailed && /^(?:no such thread|unknown thread|thread not found|thread [\w-]+ not found)\b/i.test(rpcMessage);
     const locked = detail.startsWith("shared Codex App Server ")
-      || (resumeFailed && /^(?:thread (?:is )?(?:locked|in use|owned by another)|another (?:client|process) owns (?:the|this) thread)\b/i.test(rpcMessage));
+      || (resumeFailed && /^(?:thread (?:is )?(?:locked|in use|owned by another)|thread [\w-]+ already has an active writer|another (?:client|process) owns (?:the|this) thread)\b/i.test(rpcMessage));
     state.state = err instanceof CodexVersionError || detail.startsWith("codex app-server version unsupported ")
       ? "codex_unsupported"
       : notFound ? "thread_not_found"
