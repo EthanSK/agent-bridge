@@ -389,3 +389,9 @@ Each entry looks like:
 **Commit:** 79a348d
 **Guard:** Pinned commissioning passcode/discriminator = stable pairing code; robust build/inbox.js path resolution (env -> repo-relative -> Mini path -> /Users/ethansk symlink); inject failures logged not fatal; README documents finite-vocabulary ceiling
 ---
+
+## Pages artifact upload and deployment, 25 November 2026
+
+A successful upload can still be absent from the Pages action's immediate artifact listing. A retry of the old combined job then uploaded another artifact, which made the deployment fail with multiple matching artifacts. Keep upload in the build job and put deployment in a dependent job, so retrying only a failed deployment reuses the existing artifact. Re-running every job can still produce duplicates, and the default artifact expires after one day.
+
+Commit fa3fda726d391e5d4a31b610d7726f7e21445315 passed build and deployment in run45622888708. It produced one artifact, the Pages deployment referenced that commit, and the live HTML matched site/index.html byte for byte. The initial empty listing's underlying service cause remains unproven. If an empty listing recurs across jobs, investigate the artifact service instead of adding sleeps.
