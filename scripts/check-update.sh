@@ -65,6 +65,13 @@ case "${AGENT_BRIDGE_AUTO_UPDATE_CHECK:-1}" in
     ;;
 esac
 
+# A file gate is visible to already-running MCP parents, unlike changing their
+# inherited environment. Nightly-only operators can pause daytime probes without
+# restarting an active agent. Public defaults stay unchanged. — GPT-6.1 Sol
+if [[ -e "$HOME/.agent-bridge/auto-update-check.disabled" ]]; then
+  exit 0
+fi
+
 # ---------- Args -------------------------------------------------------------
 
 VERBOSE=0
