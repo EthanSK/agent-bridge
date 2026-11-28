@@ -1,5 +1,11 @@
 # Changelog
 
+## agent-bridge 4.10.3 — 2026-11-28
+
+- Prefer the Codex executable bundled with ChatGPT on macOS so Agent Bridge uses the desktop app's current model catalogue.
+- Keep explicit executable overrides and the existing standalone CLI lookup when the bundled app is absent.
+- Cover macOS executable priority and the Linux default with a regression test.
+
 ## agent-bridge 4.10.2 — 2026-11-25
 
 - Treat Codex's `thread <uuid> already has an active writer` resume error as ownership contention, using the existing 30-second retry instead of escalating to a history-open cooldown.

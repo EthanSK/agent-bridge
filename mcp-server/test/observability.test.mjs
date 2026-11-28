@@ -322,15 +322,15 @@ test('process.epitaph event fires on clean SIGTERM shutdown', { timeout: 20_000 
   child.stderr.resume();
   child.stdout.resume();
   try {
-    // Wait for server.starting before signalling.
+    // Wait for signal handlers before signalling. The server.starting event is logged earlier.
     const deadline = Date.now() + 8_000;
     let started = false;
     while (Date.now() < deadline) {
       const events = readEvents(home);
-      if (events.some((e) => e.event === 'server.starting')) { started = true; break; }
+      if (events.some((e) => e.event === 'server.signal_handlers_ready')) { started = true; break; }
       await sleep(100);
     }
-    assert.ok(started, 'server should have started before SIGTERM');
+    assert.ok(started, 'server signal handlers should be ready before SIGTERM');
 
     child.kill('SIGTERM');
     await new Promise((resolve) => child.once('exit', resolve));

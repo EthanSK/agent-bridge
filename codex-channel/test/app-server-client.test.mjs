@@ -548,6 +548,13 @@ test("binary candidate resolution: pinned binaries are EXCLUSIVE, fallbacks only
   assert.ok(plain.length >= 2, "unpinned resolution keeps platform fallbacks");
 });
 
+test("macOS App Server clients prefer the bundled desktop build over an older shell install", () => {
+  const candidates = codexBinaryCandidates({ env: {}, platform: "darwin" });
+  assert.match(candidates[0], /^\/Applications\/ChatGPT\.app\/.+\/codex$/);
+  assert.equal(candidates[1], "codex");
+  assert.equal(codexBinaryCandidates({ env: {}, platform: "linux" })[0], "codex");
+});
+
 test("CodexAppServerClient.spawn errors helpfully when the pinned binary is missing", async () => {
   // Hermetic BY CONSTRUCTION: a pinned AGENT_BRIDGE_CODEX_BIN is the only
   // candidate, so this can never fall through to a real codex install on

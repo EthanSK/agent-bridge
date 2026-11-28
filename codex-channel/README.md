@@ -31,6 +31,12 @@ wire format is the canonical `BridgeMessage` envelope, unchanged.
 
 ---
 
+## Codex executable selection
+
+On macOS, the receiver prefers the executable bundled with ChatGPT. Updating the app supplies the executable used on the next Codex process launch. Explicit executable overrides remain authoritative. When the bundled app is absent, the receiver uses the installed CLI.
+
+This keeps the receiver's model catalogue aligned with the desktop app. Saved thread creation and sidebar placement are separate from executable selection.
+
 ## Opting the current Codex task in (the 10-second version)
 
 From **inside the Codex task** (the task's own shell — Codex exports

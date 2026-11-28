@@ -31,10 +31,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { MCP_SERVER_VERSION } from '../build/config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const indexPath = join(__dirname, '..', 'build', 'index.js');
-const EXPECTED_VERSION = '4.10.0';
+const EXPECTED_VERSION = MCP_SERVER_VERSION;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -124,8 +125,8 @@ test('source-level: Patches F, G, H wired into unified plugin', async () => {
   assert.ok(indexSrc.includes('signal.evidence'), 'signal.evidence event wired');
   assert.ok(indexSrc.includes('last_notification_at_ms'), 'last_notification_at_ms tracked');
   assert.ok(indexSrc.includes('tool_calls_received_count'), 'tool_calls_received_count tracked');
-  // Version constant, sourced from config.ts. Pinned to EXPECTED_VERSION so a
-  // version bump only needs the single constant at the top of this file updated.
+  // Version constant, sourced from config.ts. Compare it with the built value
+  // so a release bump needs no separate version copy in this test.
   const versionRe = new RegExp(
     `MCP_SERVER_VERSION\\s*=\\s*['"]${EXPECTED_VERSION.replace(/\./g, '\\.')}['"]`,
   );

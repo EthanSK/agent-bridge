@@ -48,6 +48,7 @@ import { codexStateDir } from "./paths.js";
  */
 export const MIN_CODEX_VERSION = "0.145.0";
 const DEFAULT_LINE_BUFFER_MAX = 1_000_000;
+const MACOS_DESKTOP_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
 const ABSOLUTE_LINE_BUFFER_MAX = 64 * 1024 * 1024;
 // The private runtime setting survives normal service restarts. It belongs
 // outside the source checkout so updates do not erase an operator's limit.
@@ -149,10 +150,10 @@ export function compareVersions(left, right) {
 
 /**
  * Resolve the codex executable candidates in priority order. Not
- * Homebrew-specific: env override, channel config, PATH lookup (platform
- * spellings), then well-known absolute locations.
+ * Homebrew-specific: explicit overrides, the bundled Mac desktop CLI, PATH
+ * lookup (platform spellings), then well-known absolute locations.
  */
-export function codexBinaryCandidates({ env = process.env, configuredBin = null } = {}) {
+export function codexBinaryCandidates({ env = process.env, configuredBin = null, platform = process.platform } = {}) {
   const candidates = [];
   const push = (v) => {
     if (typeof v === "string" && v.trim() && !candidates.includes(v.trim())) candidates.push(v.trim());
@@ -166,7 +167,10 @@ export function codexBinaryCandidates({ env = process.env, configuredBin = null 
   if (candidates.length > 0) return candidates;
   push(configuredBin);
   if (candidates.length > 0) return candidates;
-  if (process.platform === "win32") {
+  // Chat creation validates its model before the receiver runs the first turn.
+  // Both clients need the same build because their model catalogues can differ.
+  if (platform === "darwin") push(MACOS_DESKTOP_CODEX);
+  if (platform === "win32") {
     // .exe first: npm shims are .cmd and require shell-mode spawning on
     // Node >= 18.20 (EINVAL otherwise) — handled by the spawn fallback below.
     push("codex.exe");
